@@ -1,0 +1,25 @@
+name: Feature request
+description: Something leeway should be able to do and cannot
+labels: [enhancement]
+body:
+  - type: textarea
+    id: claim
+    attributes:
+      label: What should leeway detect or report?
+    validations:
+      required: true
+
+  - type: textarea
+    id: action
+    attributes:
+      label: What does an operator or agent do with this finding?
+    validations:
+      required: true
+
+  - type: textarea
+    id: silence
+    attributes:
+      label: When is it silent?
+      description: >-
+        On a normally-configured cluster, how often does this fire? Is there a
+        legitimate configuration that resembles the defect and must be excluded?

@@ -1,0 +1,44 @@
+---
+title: leeway
+description: Kubernetes topology placement-drift and ComputeClass priority-rank analyzer — one-shot multi-cluster JSON reports (leeway report) and a continuous incident daemon with HTTP webhook callbacks (leeway watch).
+template: doc
+tableOfContents: false
+---
+
+`leeway` analyzes and monitors **where Kubernetes workloads actually land** compared to where they were meant to run.
+
+Most Kubernetes monitoring answers whether pods are `Running` and `Ready`. `leeway` answers the two placement questions that admission-time controls cannot:
+1. **Topology Placement Drift (`topology-drift`)**: Are a workload's pods spread across zones, regions, or custom failure domains the way its `TopologySpreadConstraints`, pod anti-affinity, or `LeewayPolicy` intended — and if not, *why* (`capacity_shortfall`, `affinity_conflict`, `taint_mismatch`, `volume_topology_lock`, `domain_cordoned`, `rollout_bias`, `descheduler_absent`)?
+2. **ComputeClass Priority Rank Occupancy (`compute-class`)**: Are workloads bound to a GKE `ComputeClass` (`cloud.google.com/v1`) running on their preferred node-pool priority tier, or are they degraded onto fallback tiers (`leeway.rank_degraded`), wedged on unsatisfiable nodes (`leeway.rank_wedged`), or failing to scale back (`leeway.rank_no_migration`)?
+
+## Two execution modes, one binary
+
+`leeway` ships as a single static binary (`leeway`) designed to run in two ways:
+
+- **One-shot multi-cluster report (`leeway report`)** — An external process, CLI workflow, or AI agent passes a list of target clusters (`--clusters`, `--clusters-from`, `--profiles-dir`, or `--kubeconfig`). `leeway` connects to all clusters in parallel, takes a point-in-time snapshot, evaluates every subject with dwell timers bypassed, and outputs a structured JSON report (`leeway.report/v1alpha1`) containing fleet rollups, domain availability census, topology skews, and ComputeClass rank findings.
+- **Continuous incident daemon (`leeway watch`)** — Runs continuously in-cluster or across a fleet of clusters, maintaining informer caches, dwell/hysteresis timers, EWMA baseline learners, and SQLite state (`--store`). Exports Prometheus `/metrics`, `/healthz`, and `/readyz`, and dispatches structured incident and resolution payloads over an HTTP webhook callback (`--webhook-url`).
+
+## Quick taste
+
+Run a one-shot placement report across two clusters:
+
+```sh
+leeway report --clusters=gke-prod-us-east1=https://10.0.0.1:6443,gke-prod-us-west1=https://10.0.0.2:6443
+```
+
+Run `leeway watch` as a daemon reporting incidents to a webhook receiver:
+
+```sh
+leeway watch \
+  --cluster=gke-prod-us-east1 \
+  --webhook-url=http://localhost:8080/webhook \
+  --listen-addr=:9090
+```
+
+## Where next
+
+- **Want to install `leeway` and run your first report?** → [Getting started](/getting-started/)
+- **Are you an AI agent invoking `leeway`?** → [For AI agents](/agents/)
+- **Want to understand Confidence Tiers (A, B, C), scoring, and root-cause attribution?** → [Concepts](/concepts/)
+- **Want to tune thresholds, author a `LeewayPolicy`, or wire a webhook receiver?** → [Operations](/operations/)
+- **Looking for flags, finding schemas, or Prometheus metrics?** → [Reference](/reference/)

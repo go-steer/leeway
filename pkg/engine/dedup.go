@@ -1,0 +1,1424 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package engine
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+)
+
+// dedupEntry holds the per-incident dedup state cached against an
+// EventKey. Bounded: the sidecar's cache is capped at maxDedupEntries
+// (LRU eviction) so a runaway cluster with tens of thousands of
+// distinct incidents doesn't OOM the sidecar.
+type dedupEntry struct {
+	// SessionID is the daemon-side session created by the first
+	// event in this window. Follow-up events for the same key
+	// route to this session via POST /sessions/<sid>/inject.
+	SessionID string `json:"session_id"`
+	// FirstSeen is when the sidecar first observed this key.
+	// Rolls forward when the window expires + a new event arrives.
+	FirstSeen time.Time `json:"first_seen"`
+	// LastSeen is the wall-clock time we last recorded REAL new
+	// activity for this key (replays do NOT advance it — see
+	// Observe). Used to compute retry-cooldown: the entry ages
+	// out when LastSeen + window < now.
+	LastSeen time.Time `json:"last_seen"`
+	// EventLastTS is the k8s Event's own LastTimestamp we last
+	// processed for this key. Enables idempotent replay handling:
+	// client-go informers periodically re-List all Events on
+	// watch-connection rotation (~15-25min in practice), which
+	// used to trigger spurious "new incident" fires. Comparing
+	// incoming event.LastTimestamp against this field lets us
+	// distinguish replay of already-seen activity (dedup) from
+	// genuinely new activity (real new events k8s aggregated
+	// into the same Event object since we last saw it).
+	EventLastTS time.Time `json:"event_last_ts"`
+	// Count is how many events the sidecar has seen for this key
+	// in the current window (the first event that created the
+	// session counts as 1). Reset when the window rolls.
+	Count int `json:"count"`
+	// Incident, when non-nil, is the identity of the incident bound
+	// to SessionID — enough for the RecoveryTracker (§7.4) to resume
+	// clearance watching and compose the resolved payload after a
+	// sentinel restart. Set by BindIncident. Version tolerance both
+	// ways: snapshots written before this field existed simply load
+	// with a nil Incident (the binding still routes followups; only
+	// recovery tracking is lost), and older binaries reading a newer
+	// snapshot ignore the unknown key per encoding/json.
+	Incident *IncidentRef `json:"incident,omitempty"`
+	// Storm, when non-empty, records that this incident was folded
+	// into a §7.5 storm: the value is the storm's fingerprint and
+	// SessionID is the storm's session, so followups and recovery
+	// outcomes route there instead of a per-incident session. Same
+	// version tolerance as Incident (older snapshots simply lack it).
+	Storm string `json:"storm,omitempty"`
+	// SourceKind is the signal kind that opened the current window
+	// entry (stamped via NoteIncidentKind), the reference point for
+	// cross-source join visibility (M4 drill observation 4): a
+	// duplicate whose kind comes from a DIFFERENT source family is a
+	// leading↔reactive join the bound session should hear about.
+	// Version tolerance both ways like Incident/Storm: older
+	// snapshots load with it empty (joins simply stay suppressed for
+	// that window — the pre-M4 behavior).
+	SourceKind string `json:"source_kind,omitempty"`
+	// FollowupSources are the source families that already emitted a
+	// cross-source join followup in this window — the "max 1 per
+	// source per incident per window" bound. Reset when the window
+	// rolls (a fresh entry is created).
+	//
+	// SHARED with the §7.7 ancestor reattachment bound
+	// (SessionForAncestors): both mechanisms answer the same question
+	// — "has this source family already spoken into this incident's
+	// session this window?" — and one budget per family is the
+	// intended semantics, not an accident of reuse.
+	FollowupSources []string `json:"followup_sources,omitempty"`
+	// AncestorKeys are the §7.5 blast-radius keys this incident's
+	// object resolved to when it was bound (Ancestor.Key() values,
+	// best-priority first). They make the cache answer the REVERSE
+	// question SessionForAncestors needs: not "where is this key
+	// bound?" but "is any live incident bound under this ancestor?" —
+	// the join that lets a watchboard warning reattach to the
+	// per-incident session already working the same workload
+	// (issue #220).
+	//
+	// Version tolerance both ways like Incident/Storm/SourceKind: a
+	// snapshot written before this field existed loads with it empty,
+	// and that entry simply never matches a reattachment until its
+	// window rolls — degrading to the pre-#220 digest behavior rather
+	// than mis-binding.
+	AncestorKeys []string `json:"ancestor_keys,omitempty"`
+
+	repeatState
+
+	// Parent points a sibling-folded entry (§7.7 SessionForSibling) to
+	// the root entry whose per-incident session it folded into, so all
+	// sibling pods of a rolling deployment share one repeat schedule
+	// and one coalesced recovery lifecycle (#641).
+	Parent *EventKey `json:"parent,omitempty"`
+}
+
+// repeatState encapsulates the per-entry repeat/backoff schedule state
+// (issue #599 / #644, DESIGN.md §7.4 "Repeats of an open incident").
+// Embedded anonymously in dedupEntry so JSON snapshot serialization stays
+// flat and 100% wire-compatible with pre-existing snapshots.
+type repeatState struct {
+	SessionClass  bool      `json:"session_class,omitempty"`
+	Resolved      bool      `json:"resolved,omitempty"`
+	RepeatCount   int       `json:"repeat_count,omitempty"`
+	Step          int       `json:"step,omitempty"`
+	LastInjectAt  time.Time `json:"last_inject_at,omitzero"`
+	InjectCount   int       `json:"inject_count,omitempty"`
+	RatePerHour   float64   `json:"rate_per_hour,omitempty"`
+	Classes       []string  `json:"classes,omitempty"`
+	PendingChange bool      `json:"pending_change,omitempty"`
+	Undelivered   bool      `json:"undelivered,omitempty"`
+	LastChange    string    `json:"last_change,omitempty"`
+}
+
+func newRepeatState(now time.Time, repeatable bool, class string) repeatState {
+	return repeatState{
+		SessionClass: repeatable,
+		LastInjectAt: now,
+		InjectCount:  1,
+		LastChange:   RepeatChangeOpen,
+		Classes:      []string{class},
+	}
+}
+
+func (r *repeatState) clone() repeatState {
+	out := *r
+	out.Classes = slices.Clone(r.Classes)
+	return out
+}
+
+func (r *repeatState) markUndelivered(change string) {
+	r.Undelivered = true
+	r.LastChange = change
+}
+
+func (r *repeatState) markResolved() {
+	r.Resolved = true
+}
+
+func (r *repeatState) resetForUnbind(now time.Time, count int) {
+	r.RepeatCount = 0
+	r.Step = 0
+	r.RatePerHour = 0
+	r.PendingChange = false
+	r.Undelivered = false
+	r.LastChange = RepeatChangeOpen
+	r.LastInjectAt = now
+	r.InjectCount = count
+}
+
+func (r *repeatState) recordRateJump(now time.Time, count int, rate float64) {
+	r.RatePerHour = rate
+	r.RepeatCount = 0
+	r.Step = 0
+	r.LastChange = RepeatChangeRate
+	r.LastInjectAt = now
+	r.InjectCount = count
+	r.PendingChange = false
+}
+
+func (r *repeatState) recordClassChange(now time.Time, count int) {
+	r.RepeatCount = 0
+	r.Step++
+	r.LastChange = RepeatChangeClass
+	r.LastInjectAt = now
+	r.InjectCount = count
+	r.PendingChange = false
+}
+
+func (r *repeatState) recordReminder(now time.Time, count int, rate float64) int {
+	r.RatePerHour = rate
+	r.RepeatCount++
+	r.Step++
+	r.LastChange = ""
+	r.LastInjectAt = now
+	r.InjectCount = count
+	r.PendingChange = false
+	return r.RepeatCount
+}
+
+// clone deep-copies the entry, for Snapshot to encode outside the lock
+// while repeat keeps mutating the live one.
+func (e *dedupEntry) clone() *dedupEntry {
+	out := *e
+	out.repeatState = e.repeatState.clone()
+	if e.Incident != nil {
+		ref := *e.Incident
+		out.Incident = &ref
+	}
+	if e.Parent != nil {
+		parent := *e.Parent
+		out.Parent = &parent
+	}
+	out.FollowupSources = slices.Clone(e.FollowupSources)
+	out.AncestorKeys = slices.Clone(e.AncestorKeys)
+	return &out
+}
+
+// DedupResult tells the caller what to do with the event that just
+// came in: kind==firstInWindow means create a session + inject;
+// kind==duplicate means suppress; kind==newIncident means the prior
+// window expired and this is a fresh incident (create new session).
+type DedupResult struct {
+	Kind      DedupResultKind
+	SessionID string // set when Kind==duplicate or Kind==repeat; the bound session
+	// Count is the window count: 1 for a new incident, N for
+	// duplicates. For an open incident past its first window (repeats
+	// and absorbed duplicates) the window no longer rolls, so it keeps
+	// counting every occurrence since the open.
+	Count int
+	// Storm, when non-empty, is the fingerprint of the §7.5 storm this
+	// key was folded into (AttachToStorm). Set on DedupDuplicate results
+	// so the dispatcher's #96 unbound-retry guard can tell a storm-
+	// claimed but session-less member (retry the STORM open / suppress
+	// as a member) from genuine #84 open residue (retry the per-incident
+	// open) — the two compose only if the guard consults it (issue #104).
+	Storm string
+	// RepeatCount is set on DedupRepeat results: N > 0 means this is
+	// the N-th pure reminder since the open or the last material
+	// change; 0 means the signal changed materially (Change says how)
+	// and the session should look again. It rides the wire unchanged
+	// as the payload's repeat_count.
+	RepeatCount int
+	// Change names the material change on a DedupRepeat with
+	// RepeatCount 0: RepeatChangeClass or RepeatChangeRate.
+	Change string
+	// Absorbed marks a DedupDuplicate that belongs to an open incident
+	// past its first window: an occurrence between two reminders,
+	// counted and suppressed. The dispatcher uses it to keep a storm
+	// that owns the incident alive (§7.5 idle TTL), which the
+	// pre-#599 reopen used to do as a side effect.
+	Absorbed bool
+}
+
+// RepeatChange* name what made a repeat material (DedupResult.Change).
+const (
+	// RepeatChangeClass: a signal class the incident had not shown
+	// before — a new message shape, a severity change, or a different
+	// source kind on the same key.
+	RepeatChangeClass = "class"
+	// RepeatChangeRate: the occurrence rate since the last inject
+	// reached repeatJumpFactor times the reference rate, over at least
+	// repeatJumpMin occurrences.
+	RepeatChangeRate = "rate"
+	// RepeatChangeOpen: the incident's open created the session but
+	// its initial delivery failed, so this re-sends the full open
+	// payload (kind and shape of the open, no repeat_count) — the
+	// agent has not seen the incident yet.
+	RepeatChangeOpen = "open"
+)
+
+type DedupResultKind int
+
+const (
+	// DedupNewIncident: no prior entry (or the prior window
+	// expired). Caller must create a new session and inject.
+	DedupNewIncident DedupResultKind = iota
+	// DedupDuplicate: an entry exists within the window. Caller
+	// suppresses this event; the count is bumped and available
+	// via DedupResult.Count.
+	DedupDuplicate
+	// DedupRepeat: the window lapsed (or a reminder came due) while the
+	// incident is still open (issue #599). Caller injects a followup
+	// into DedupResult.SessionID — never opens a session — carrying
+	// DedupResult.RepeatCount.
+	DedupRepeat
+)
+
+// DedupCache is the rolling-window dedup store. Backed by a map +
+// a mutex; bounded by LRU eviction at maxDedupEntries.
+type DedupCache struct {
+	mu      sync.Mutex
+	entries map[EventKey]*dedupEntry
+	window  time.Duration
+	max     int
+	// persistPath, when non-empty, causes Snapshot+Restore calls
+	// to read/write JSON at that path so the cache survives
+	// sidecar restart. Optional (nil disables persistence).
+	persistPath string
+	// now overrides time.Now for testing. nil = real clock.
+	now func() time.Time
+	// isOpen, when non-nil, answers whether the recovery tracker
+	// (§7.4) still holds key's incident as unresolved (SetOpenCheck).
+	// Nil when recovery tracking is off: no incident is ever known to
+	// be open, so every lapse reopens as it did before #599.
+	isOpen func(EventKey) bool
+	// lastSweep records when sweepExpiredLocked last pruned expired
+	// unbound/resolved entries (#643).
+	lastSweep time.Time
+}
+
+// maxDedupEntries caps the sidecar's cache size. 10k is plenty for
+// any realistic single-cluster deployment (unique events per 5-min
+// window). LRU eviction beyond this bound.
+const maxDedupEntries = 10_000
+
+// NewDedupCache constructs a cache with the supplied rolling window
+// duration. window must be > 0. persistPath is optional; empty
+// disables the on-disk cache.
+func NewDedupCache(window time.Duration, persistPath string) (*DedupCache, error) {
+	if window <= 0 {
+		return nil, fmt.Errorf("dedup: window must be > 0 (got %s)", window)
+	}
+	c := &DedupCache{
+		entries:     make(map[EventKey]*dedupEntry),
+		window:      window,
+		max:         maxDedupEntries,
+		persistPath: persistPath,
+	}
+	if persistPath != "" {
+		if err := c.restore(); err != nil {
+			return nil, fmt.Errorf("dedup: restore from %s: %w", persistPath, err)
+		}
+	}
+	return c, nil
+}
+
+// SetOpenCheck installs the "is this incident still open?" predicate
+// the repeat schedule consults (issue #599) — the recovery tracker's
+// Open. Wire it once at startup, before events flow; nil restores the
+// pre-#599 behavior (every lapse is a new incident).
+func (c *DedupCache) SetOpenCheck(open func(EventKey) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.isOpen = open
+}
+
+// SetClock overrides the cache's clock. For tests and simulations
+// outside this package that need to step through hours of dedup
+// windows without sleeping; nil restores the real clock.
+func (c *DedupCache) SetClock(now func() time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = now
+}
+
+// clock returns the current time. Overridable for tests.
+func (c *DedupCache) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// reasonCanonical maps well-known secondary Event.Reason values to
+// their canonical primary reason for dedup-key computation. Two
+// events for the same target whose reasons are in the same family
+// collapse into one dedup entry — e.g. an ImagePullBackOff event
+// and an ErrImagePull event for the same pod count as ONE incident,
+// not two parallel sessions.
+//
+// The mapping is deliberately narrow — only well-known equivalences
+// where a single underlying failure emits multiple reason variants
+// from kubelet's retry cycle. Reasons not in this map are their
+// own canonical value.
+//
+// Rationale for each entry:
+//
+//   - ErrImagePull → ImagePullBackOff: kubelet emits ErrImagePull
+//     on the first failed pull attempt, then ImagePullBackOff once
+//     the exponential backoff kicks in. Same failure, two reason
+//     values within seconds.
+//   - BackOff → CrashLoopBackOff: BackOff accompanies both crash-
+//     loop and image-pull cycles; without a message only the
+//     crash-loop guess is available (it is by far the more common
+//     cycle). Event-shaped callers — every path that HAS the event
+//     message — use CanonicalReasonForEvent instead, which reads
+//     the message and files pull-shaped BackOff (and Failed) under
+//     ImagePullBackOff. This messageless row deliberately keeps the
+//     old best-guess for reason-only callers (restored keys,
+//     reason-only lookups).
+//
+// Observed live during v2.6 GKE-troubleshoot demo drive: one
+// paymentservice ImagePullBackOff spawned 4 parallel sessions
+// (one per reason variant) at $0.28/session, 4× baseline spend
+// per incident. See go-steer/core-agent#219.
+var reasonCanonical = map[string]string{
+	"ErrImagePull": "ImagePullBackOff",
+	"BackOff":      "CrashLoopBackOff",
+
+	// APPEND-ONLY additions for the object-state source (M2): a
+	// leading transition signal and its reactive k8s-event
+	// counterpart describe the same incident on the same object UID,
+	// so they share a dedup family — whichever fires first (usually
+	// the leading one; that's the point) opens the session, and the
+	// other attaches as a followup. The dedup collapse IS the
+	// claim-and-attach flow; no extra machinery.
+	//
+	//   - node_notready (objectstate.node_notready, Node UID) joins
+	//     the node controller's NodeNotReady events on the Node.
+	//   - restart_burst (objectstate.restart_burst, Pod UID) joins
+	//     the kubelet's BackOff → CrashLoopBackOff family on the Pod.
+	//
+	// The remaining object-state reasons (node_flapping,
+	// progress_deadline, endpoints_empty, pdb_gridlocked) have no
+	// k8s-event counterpart on the same UID and map to themselves.
+	"node_notready": "NodeNotReady",
+	"restart_burst": "CrashLoopBackOff",
+
+	// APPEND-ONLY additions for the capacity source (M4), same M2
+	// leading/reactive pattern: a pod the autoscaler cannot place is
+	// ONE incident however many angles observe it. capacity.pending
+	// (the NotTriggerScaleUp event, Pod UID) and
+	// capacity.pending-aged (the resident aging sweep, Pod UID) join
+	// the scheduler's FailedScheduling events on the same pod —
+	// whichever fires first opens the session, the rest attach as
+	// followups. The nodegroup-keyed capacity reasons (scaleup_gap,
+	// stockout, ip_exhausted) have no k8s-event counterpart on their
+	// synthetic UID and map to themselves; quota_blocked joined the
+	// QuotaExhausted family below when the quota source landed.
+	"pending":      "FailedScheduling",
+	"pending-aged": "FailedScheduling",
+
+	// APPEND-ONLY additions for the quota source (M4, §10.3), same
+	// leading/reactive pattern one tier up: "scaleup failed
+	// (GCE_QUOTA_EXCEEDED)" and "CPUS at 98%, exhausted in ~6 days"
+	// are ONE diagnosed incident, not two alerts a human joins. The
+	// quota source's quota_forecast (leading) and the capacity
+	// source's quota_blocked (reactive) collapse into the
+	// QuotaExhausted family; the join lands when the two signals
+	// also share a UID, which is the canonical quota identity
+	// "quota:<NAME>/<SCOPE>" (pkg/sources/quota.UID — the quota, not
+	// the nodegroup, is the incident at project scope). The capacity
+	// source re-keys quota_blocked decisions to that UID when the
+	// provider's decision message names the quota; when it does not,
+	// the signal stays nodegroup-keyed and only the reason family is
+	// shared (documented limitation — no false joins).
+	"quota_blocked":  "QuotaExhausted",
+	"quota_forecast": "QuotaExhausted",
+}
+
+// CanonicalReason returns the canonical reason for a given
+// Event.Reason value — the dedup-key reason, and the "reason-class"
+// input to Fingerprint (§8): fingerprints must collapse the same
+// reason families dedup does, or the same underlying failure would
+// carry different fingerprints across clusters depending on which
+// kubelet retry-cycle variant each sentinel saw first. Reasons not in
+// reasonCanonical map to themselves (no change).
+//
+// MESSAGELESS callers only: when the event's message is in hand, use
+// CanonicalReasonForEvent instead — the generic BackOff and Failed
+// reasons are ambiguous without it (see below), and this function
+// keeps the messageless best-guess (BackOff → CrashLoopBackOff)
+// unchanged for callers that genuinely have no message (restored
+// incident keys, reason-only lookups).
+func CanonicalReason(reason string) string {
+	if canonical, ok := reasonCanonical[reason]; ok {
+		return canonical
+	}
+	return reason
+}
+
+// CanonicalReasonForEvent is the message-aware CanonicalReason for
+// event-shaped callers: kubelet emits the GENERIC reasons "BackOff"
+// and "Failed" for both crash-loop and image-pull cycles, and only
+// the message disambiguates them. Without it, one ImagePullBackOff
+// incident fans out into parallel dedup slots (and sessions) per
+// reason variant — the failure mode kube-agents observed live and
+// fixed in their watcher fork.
+//
+// HONESTY NOTE — this is a dependency on kubelet MESSAGE STRINGS,
+// which are not API: the matchers pin the shapes kubelet has emitted
+// for years (pkg/kubelet/images: `Back-off pulling image "…"`,
+// `Failed to pull image "…"`; sync-result errors surface as
+// `Error: ErrImagePull` / `Error: ImagePullBackOff`). If kubelet ever
+// rewords them, the match falls through to the messageless mapping —
+// degraded grouping (BackOff → CrashLoopBackOff), never a crash or a
+// missed event. The tests in dedup_test.go pin the real shapes so a
+// deliberate matcher change is visible.
+//
+// Reasons other than BackOff/Failed defer to CanonicalReason: the
+// message adds nothing for them, and the append-only family map stays
+// the single source of truth.
+func CanonicalReasonForEvent(reason, message string) string {
+	switch reason {
+	case "BackOff":
+		// Kubelet's image-pull backoff: `Back-off pulling image "…"`.
+		// Every other BackOff shape (`Back-off restarting failed
+		// container …`) is the crash-loop cycle.
+		if strings.Contains(message, "pulling image") {
+			return "ImagePullBackOff"
+		}
+		return "CrashLoopBackOff"
+	case "Failed":
+		// Kubelet's pull failures under the generic Failed reason:
+		// `Failed to pull image "…": …` plus the sync-result error
+		// strings `Error: ErrImagePull` / `Error: ImagePullBackOff`.
+		if strings.Contains(message, "Failed to pull image") ||
+			strings.Contains(message, "ErrImagePull") ||
+			strings.Contains(message, "ImagePullBackOff") {
+			return "ImagePullBackOff"
+		}
+		return reason
+	}
+	return CanonicalReason(reason)
+}
+
+// ReasonClass is the wire `reason_class` (issue #574): the reason
+// family lookout already filed a signal under, handed to the reader
+// so it does not have to redo the classification. kubelet says
+// `BackOff` for a crash loop AND for an image-pull retry, and
+// `Failed` for a pull failure; a consumer that routes on the raw
+// reason sends both to the wrong place. The payload's `reason` still
+// carries exactly what the cluster said; this sits beside it.
+//
+// The rule differs by kind, on purpose:
+//
+//   - Event-shaped kinds (k8s-event, k8s-event-followup; "" is the
+//     filter's alias for k8s-event): always set, to
+//     CanonicalReasonForEvent(reason, message), EVEN WHEN it equals
+//     reason — so a consumer routes on reason_class alone and never
+//     needs a fallback. This is the same value the dedup key, the
+//     fingerprint and the store's canonical_reason use.
+//   - Every other kind: CanonicalReason(reason) when a canonical
+//     mapping applies (it differs from reason — capacity.pending's
+//     `pending` → `FailedScheduling`, objectstate's `restart_burst` →
+//     `CrashLoopBackOff`), otherwise empty. Source-namespaced reasons
+//     are lookout's own vocabulary and already name their class;
+//     repeating them would add bytes, not information, and the empty
+//     value keeps every such payload byte-identical to before.
+func ReasonClass(kind, reason, message string) string {
+	switch kind {
+	case KindK8sEvent, KindK8sEventFollowup, "":
+		return CanonicalReasonForEvent(reason, message)
+	}
+	if canonical := CanonicalReason(reason); canonical != reason {
+		return canonical
+	}
+	return ""
+}
+
+// Observe is ObserveSignal for a caller that knows only the event's
+// LastTimestamp: the observation is not repeatable, so the result is
+// exactly the pre-#599 verdict (cases 1, 3 and 4 below). Kept for the
+// callers and tests that predate the repeat schedule.
+func (c *DedupCache) Observe(key EventKey, eventLastTS time.Time) DedupResult {
+	return c.ObserveSignal(key, Observation{LastTS: eventLastTS})
+}
+
+// Observation is what ObserveSignal needs to know about one event
+// beyond its key.
+type Observation struct {
+	// LastTS is the k8s Event's own LastTimestamp (the signal's
+	// LastSeen): the replay test compares it with the entry's.
+	LastTS time.Time
+	// Kind, Severity and Message make up the signal's class for the
+	// material-change test (repeatClass). Only a hash of the message's
+	// shape is kept, never the text.
+	Kind     string
+	Severity Severity
+	Message  string
+	// Repeatable reports that this signal routes to a session of its
+	// own (the dispatcher's opensSessions): only then can a lapse on a
+	// still-open incident become a reminder instead of a new incident.
+	Repeatable bool
+	// Downgraded reports that a §9.4 triage-status record lowered this
+	// signal's class. A downgraded signal on an open incident takes the
+	// legacy lapse (to the store or watchboard) instead of being
+	// absorbed: the agent asked for exactly that.
+	Downgraded bool
+}
+
+// ObserveSignal records that key was just seen and returns a
+// DedupResult telling the caller whether this is a fresh incident
+// (start a new session), a duplicate within the current window
+// (suppress), or a repeat of an incident that is still open (issue
+// #599: a followup into its bound session).
+//
+// The key's Reason is canonicalized (see reasonCanonical) so events
+// from the same underlying failure with different reason variants
+// (e.g. ImagePullBackOff vs ErrImagePull) collapse into one dedup
+// slot. The wire event's original Reason is preserved on the
+// inject payload — canonicalization is a dedup-only mechanism.
+//
+// Four cases, checked in order:
+//
+//  1. **Replay** — LastTS is not later than the recorded
+//     EventLastTS. This is the k8s Event object being re-delivered
+//     (informer watch-rotation triggers a re-List; kube-apiserver
+//     rotates watch connections every ~15-25min in practice). The
+//     activity is one we've already processed — dedup, do NOT
+//     advance LastSeen (retry cooldown continues to age from real
+//     activity time). Bump count so metrics stay accurate. A replay
+//     never reaches the repeat schedule either.
+//
+//  2. **Still open** — LastTS is later, the entry is bound to a
+//     session by a session-class signal, this signal is session-class
+//     too, the incident has not been resolved (MarkResolved) and the
+//     recovery tracker still holds it (SetOpenCheck). Inside the
+//     first window that is a plain duplicate; once the window has
+//     lapsed it is handed to repeat, which returns a reminder, a
+//     material-change followup, or an absorbed duplicate.
+//
+//  3. **New activity past cooldown** — LastTS is later AND wall-clock
+//     now is more than `window` past LastSeen, and the incident is
+//     not known to be open (recovery off, untracked, resolved, or
+//     never session-bound). Create a new session (retry safety net:
+//     if the previous agent-run failed to resolve the incident, the
+//     fresh reporting gives it another chance). Before #599 this was
+//     the only lapse path.
+//
+//  4. **New activity within cooldown** — LastTS is later, within the
+//     window. Real new k8s aggregation on top of an ongoing incident
+//     — dedup to the existing session, advance both LastSeen and
+//     EventLastTS.
+//
+// Contract: the caller MUST call BindSession after a successful
+// CreateSession call to attach the SessionID to the newly-created
+// entry, so subsequent duplicates can route to the same session.
+//
+// Lock order: the open-check predicate (the recovery tracker's Open)
+// is called with the cache lock held, so it must never call back into
+// the cache. The tracker's Open takes only its own lock.
+func (c *DedupCache) ObserveSignal(key EventKey, obs Observation) DedupResult {
+	key.Reason = CanonicalReason(key.Reason)
+	class := repeatClass(obs.Kind, obs.Severity, obs.Message)
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.maybeSweepLocked(now)
+	entry, ok := c.entries[key]
+	if !ok {
+		// First sighting for this key.
+		c.evictIfFull(now)
+		c.entries[key] = newDedupEntry(now, obs, class)
+		return DedupResult{Kind: DedupNewIncident, Count: 1}
+	}
+	if !obs.LastTS.After(entry.EventLastTS) {
+		// Case 1: replay. Same activity we already processed;
+		// don't advance LastSeen (retry cooldown untouched).
+		entry.Count++
+		return DedupResult{Kind: DedupDuplicate, SessionID: entry.SessionID, Count: entry.Count, Storm: entry.Storm}
+	}
+	// Sibling-folded pods (§7.7, issue #641): delegate repeat cadence
+	// and count tracking onto the shared root entry so N crashing pods
+	// in a rolling deployment emit ONE doubling schedule, not N.
+	if entry.Parent != nil {
+		rootKey, root := c.resolveParentLocked(entry)
+		if root != nil && root.Storm == "" && !root.Resolved &&
+			root.SessionID != "" && root.SessionID == entry.SessionID &&
+			c.isGroupOpenLocked(rootKey, root) {
+			entry.Count++
+			entry.LastSeen = now
+			entry.EventLastTS = obs.LastTS
+			parentLapsed := now.Sub(root.LastSeen) > c.window
+			if obs.Repeatable {
+				lastInject := root.LastInjectAt
+				if lastInject.IsZero() {
+					lastInject = root.FirstSeen
+				}
+				step := max(root.Step, root.RepeatCount)
+				due := root.Undelivered || now.Sub(lastInject) > repeatInterval(c.window, step+1)
+				if due {
+					return c.repeat(root, now, obs.LastTS, class, parentLapsed)
+				}
+				root.Count++
+				root.InjectCount++
+				root.LastSeen = now
+				root.EventLastTS = obs.LastTS
+				if root.noteClass(class) && now.Sub(root.FirstSeen) > c.window {
+					root.PendingChange = true
+				}
+				return DedupResult{
+					Kind:      DedupDuplicate,
+					SessionID: root.SessionID,
+					Count:     root.Count,
+					Storm:     root.Storm,
+					Absorbed:  lastInject.After(root.FirstSeen) || parentLapsed,
+				}
+			}
+			if !obs.Downgraded && obs.Kind != root.SourceKind {
+				root.Count++
+				root.InjectCount++
+				root.LastSeen = now
+				root.EventLastTS = obs.LastTS
+				return DedupResult{Kind: DedupDuplicate, SessionID: root.SessionID, Count: root.Count, Storm: root.Storm, Absorbed: true}
+			}
+		}
+	}
+	lapsed := now.Sub(entry.LastSeen) > c.window
+	if entry.SessionClass && !entry.Resolved &&
+		entry.SessionID != "" && entry.Incident != nil &&
+		c.isGroupOpenLocked(key, entry) {
+		// Case 2: the incident is still open.
+		if obs.Repeatable {
+			return c.repeat(entry, now, obs.LastTS, class, lapsed)
+		}
+		if !obs.Downgraded && obs.Kind != entry.SourceKind {
+			// Another source's lower-class angle on the same key —
+			// capacity.pending (warning) on a FailedScheduling
+			// incident, objectstate.restart_burst (warning) on a
+			// CrashLoopBackOff one. It is evidence the incident is
+			// still going, never a reason to unbind it: letting it
+			// fall to case 3 would replace the bound entry with an
+			// unbound one, and the next session-class occurrence would
+			// open a second session through the #84 retry. Absorbed.
+			// Only a §9.4 downgrade, or the opener's own kind
+			// re-classed, takes the legacy lapse below.
+			entry.Count++
+			entry.LastSeen = now
+			entry.EventLastTS = obs.LastTS
+			return DedupResult{Kind: DedupDuplicate, SessionID: entry.SessionID, Count: entry.Count, Storm: entry.Storm, Absorbed: true}
+		}
+	}
+	if lapsed {
+		// Case 3: retry safety net. Prior session's cooldown
+		// elapsed AND k8s is still reporting new activity, and
+		// nothing says the incident is still open — spin up a
+		// fresh session so an agent that failed to resolve the
+		// last one gets another attempt.
+		c.evictIfFull(now)
+		c.entries[key] = newDedupEntry(now, obs, class)
+		return DedupResult{Kind: DedupNewIncident, Count: 1}
+	}
+	// Case 4: new activity within cooldown → dedup + advance.
+	entry.Count++
+	entry.LastSeen = now
+	entry.EventLastTS = obs.LastTS
+	if entry.noteClass(class) && now.Sub(entry.FirstSeen) > c.window {
+		// Recorded for the repeat schedule, under the same rule as
+		// repeat: only a class first seen after the open's window.
+		entry.PendingChange = true
+	}
+	return DedupResult{Kind: DedupDuplicate, SessionID: entry.SessionID, Count: entry.Count, Storm: entry.Storm}
+}
+
+// newDedupEntry is the entry a new incident opens: the open is the
+// first inject, and its class the first the incident has shown.
+func newDedupEntry(now time.Time, obs Observation, class string) *dedupEntry {
+	return &dedupEntry{
+		FirstSeen:   now,
+		LastSeen:    now,
+		EventLastTS: obs.LastTS,
+		Count:       1,
+		repeatState: newRepeatState(now, obs.Repeatable, class),
+	}
+}
+
+// MarkUndelivered records that the inject the cache last decided for
+// key — an open (change = RepeatChangeOpen), a reminder ("") or a
+// material change — did not reach the bound session, so the next
+// occurrence of the still-open incident re-sends it whatever the
+// schedule says (issue #599).
+func (c *DedupCache) MarkUndelivered(key EventKey, change string) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.markUndelivered(change)
+	}
+}
+
+// Unbind detaches key's entry from a session the sink reports gone
+// (HTTP 404/410) and restarts its repeat schedule as if freshly opened.
+func (c *DedupCache) Unbind(key EventKey) {
+	key.Reason = CanonicalReason(key.Reason)
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[key]
+	if !ok {
+		return
+	}
+	e.SessionID = ""
+	e.Parent = nil
+	e.FirstSeen = now
+	e.resetForUnbind(now, e.Count)
+}
+
+// MarkResolved records that key's incident was resolved (§7.4).
+func (c *DedupCache) MarkResolved(key EventKey) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.markResolved()
+	}
+}
+
+// BindSession attaches the SessionID from a successful CreateSession
+// call to the entry created by the preceding Observe. No-op if the
+// entry has since been evicted (window elapsed AND the LRU sweep
+// dropped it), which is a possible but harmless race.
+//
+// Applies the same reason canonicalization Observe does so a caller
+// that saw a `dedupNewIncident` result on one reason variant can
+// bind the session using the wire-level reason without having to
+// know about the family mapping.
+func (c *DedupCache) BindSession(key EventKey, sessionID string) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.SessionID = sessionID
+	}
+}
+
+// BindIncident is BindSession plus the incident identity the §7.4
+// recovery tracker needs to survive a restart: the ref rides on the
+// entry through Snapshot/restore, so a rebooted sentinel can resume
+// watching for clearance and still route the outcome to the original
+// session. Same no-op-on-evicted-entry semantics as BindSession.
+func (c *DedupCache) BindIncident(key EventKey, sessionID string, ref IncidentRef) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.SessionID = sessionID
+		r := ref
+		entry.Incident = &r
+		if entry.Parent != nil {
+			parent, ok := c.entries[*entry.Parent]
+			if !ok || parent.SessionID != sessionID {
+				entry.Parent = nil
+			}
+		}
+	}
+}
+
+// AttachToStorm rebinds key to a §7.5 storm: SessionID becomes the
+// storm's session (followups and §7.4 outcomes now route there) and
+// the storm's fingerprint is recorded on the entry. ref supplies the
+// incident identity when the entry has none yet (the storm's trigger
+// incident never went through BindIncident — its per-incident session
+// was suppressed); an existing richer ref is kept. Same
+// no-op-on-evicted-entry semantics as BindSession.
+func (c *DedupCache) AttachToStorm(key EventKey, sessionID, stormFingerprint string, ref IncidentRef) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok {
+		return
+	}
+	entry.SessionID = sessionID
+	entry.Storm = stormFingerprint
+	entry.Parent = nil
+	if entry.Incident == nil {
+		r := ref
+		entry.Incident = &r
+	}
+}
+
+// LookupBinding returns the full bound incident for key (session +
+// identity ref), if the entry is bound and carries a ref. The storm
+// path uses it to supersede a member's per-incident session with the
+// member's complete identity.
+func (c *DedupCache) LookupBinding(key EventKey) (BoundIncident, bool) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || entry.SessionID == "" || entry.Incident == nil {
+		return BoundIncident{}, false
+	}
+	return BoundIncident{
+		Key:       key,
+		SessionID: entry.SessionID,
+		FirstSeen: entry.FirstSeen,
+		Ref:       *entry.Incident,
+	}, true
+}
+
+// LookupSession returns the session currently bound to key, if any.
+// The §7.4 routing primitive: a resolved signal is a followup into
+// the incident's own session, and this lookup — not tracker-local
+// state — is authoritative, so a re-fired incident (dedup retry
+// safety net) routes its outcome to the NEWEST session for the key.
+func (c *DedupCache) LookupSession(key EventKey) (string, bool) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[key]
+	if !ok || entry.SessionID == "" {
+		return "", false
+	}
+	return entry.SessionID, true
+}
+
+// SourceFamily buckets a signal kind by the source implementation
+// that emits it — the prefix before the first "." for the
+// source-namespaced kinds ("capacity.quota_blocked" → "capacity",
+// "quota.forecast" → "quota", "objectstate.restart_burst" →
+// "objectstate"), the whole kind for the frozen un-namespaced ones
+// ("k8s-event"). This is the granularity of the §7.2 source table,
+// which is what "a different observation angle" means for the
+// cross-source join followups (M4 observation 4).
+func SourceFamily(kind string) string {
+	if i := strings.IndexByte(kind, '.'); i > 0 {
+		return kind[:i]
+	}
+	return kind
+}
+
+// NoteIncidentKind stamps the signal kind that opened the current
+// window entry for key. Called by the dispatcher on every
+// DedupNewIncident result, before any routing branch, so the entry
+// knows which source family the incident's ORIGINAL observation came
+// from. No-op when the entry is missing (evicted — harmless race,
+// like BindSession).
+func (c *DedupCache) NoteIncidentKind(key EventKey, kind string) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.SourceKind = kind
+		entry.FollowupSources = nil
+	}
+}
+
+// NoteAncestors stamps the §7.5 blast-radius keys key's object
+// resolved to, so SessionForAncestors can find this incident's
+// session from a RELATED object's ancestors later (issue #220).
+// Called by the dispatcher alongside BindIncident — an unbound
+// incident is never a reattachment target, so there is nothing to
+// index until the session exists. No-op when the entry is missing
+// (evicted — harmless race, like BindSession) or when keys is empty
+// (no resolver, or a topology index that has not synced: the
+// reattachment stage is simply inert, never a gate on delivery).
+func (c *DedupCache) NoteAncestors(key EventKey, keys []string) {
+	if len(keys) == 0 {
+		return
+	}
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if entry, ok := c.entries[key]; ok {
+		entry.AncestorKeys = slices.Clone(keys)
+	}
+}
+
+// SessionForAncestors answers the §7.7 reattachment question (issue
+// #220): does any LIVE incident, other than self, sit under one of
+// these blast-radius keys with a session of its own? candidates are
+// Ancestor.Key() values in priority order (nearest/strongest first —
+// the order graphfeed.Ancestors returns), and the first candidate
+// with a match wins, so a shared Node or owner chain beats a weaker
+// key.
+//
+// family bounds the answer exactly as CrossSourceJoin does: at most
+// one positive per source family per target incident per window,
+// marked on the TARGET's entry (the shared FollowupSources budget).
+// A flapping warning stream therefore cannot spray followups into a
+// live incident — beyond the bound it digests normally.
+//
+// Storm-claimed incidents are never targets. A storm exists to
+// collapse member chatter into ONE session (§7.5); fanning
+// reattachment followups into it re-creates the very fan-out it
+// prevents.
+//
+// Ties within one candidate key resolve to the most recently active
+// incident, then by UID — the incident a related warning is most
+// likely about, and deterministic for the wire pins either way.
+func (c *DedupCache) SessionForAncestors(self EventKey, candidates []string, family string) (sessionID, matched string, ok bool) {
+	if len(candidates) == 0 {
+		return "", "", false
+	}
+	self.Reason = CanonicalReason(self.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, cand := range candidates {
+		var bestKey EventKey
+		var best *dedupEntry
+		for k, entry := range c.entries {
+			if k == self || entry.SessionID == "" || entry.Storm != "" {
+				continue
+			}
+			if !slices.Contains(entry.AncestorKeys, cand) {
+				continue
+			}
+			if best == nil || entry.LastSeen.After(best.LastSeen) ||
+				(entry.LastSeen.Equal(best.LastSeen) && k.UID < bestKey.UID) {
+				bestKey, best = k, entry
+			}
+		}
+		if best == nil {
+			continue
+		}
+		if slices.Contains(best.FollowupSources, family) {
+			// This family already spoke into that incident this
+			// window. Weaker candidates are not a way around the
+			// bound — the incident is found, the budget is spent.
+			return "", "", false
+		}
+		best.FollowupSources = append(best.FollowupSources, family)
+		return best.SessionID, cand, true
+	}
+	return "", "", false
+}
+
+// SessionForSibling answers the sibling-fold question (DESIGN.md §7.7
+// amendment 2026-10-08): is a LIVE incident of the same class — same
+// signal kind, same canonical reason — already bound to a session of
+// its own under one of these workload-owner keys? It is how a crash
+// loop seen on the old ReplicaSet's pod and again on the new one's
+// during a rollout stays ONE incident: the two pods have different
+// UIDs (two dedup keys) but the same Deployment ancestor.
+//
+// candidates are Ancestor.Key() values in priority order; the caller
+// restricts them to the owner chain, so a shared Node, ConfigMap or
+// namespace never folds two workloads together. Unlike
+// SessionForAncestors there is no per-family budget: each sibling key
+// folds at most once (the caller binds it to the returned session, so
+// its later events are plain duplicates), and the FollowupSources
+// budget stays untouched for the warnings §7.7 reattaches.
+//
+// A target must be within the dedup window (LastSeen), bound, and not
+// storm-claimed — the storm stage runs first and owns aggregate
+// grouping (§7.5). Ties within one candidate resolve to the most
+// recently active incident, then by UID.
+func (c *DedupCache) SessionForSibling(self EventKey, kind string, candidates []string) (sessionID, matched string, ok bool) {
+	if len(candidates) == 0 {
+		return "", "", false
+	}
+	self.Reason = CanonicalReason(self.Reason)
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, cand := range candidates {
+		var bestKey EventKey
+		var best *dedupEntry
+		for k, entry := range c.entries {
+			if k == self || k.Reason != self.Reason || entry.SourceKind != kind ||
+				entry.SessionID == "" || entry.Storm != "" || now.Sub(entry.LastSeen) > c.window {
+				continue
+			}
+			if !slices.Contains(entry.AncestorKeys, cand) {
+				continue
+			}
+			if best == nil || entry.LastSeen.After(best.LastSeen) ||
+				(entry.LastSeen.Equal(best.LastSeen) && k.UID < bestKey.UID) {
+				bestKey, best = k, entry
+			}
+		}
+		if best != nil {
+			rootKey := bestKey
+			if best.Parent != nil {
+				rootKey = *best.Parent
+			}
+			if selfEntry, exists := c.entries[self]; exists {
+				rk := rootKey
+				selfEntry.Parent = &rk
+			}
+			if root := c.entries[rootKey]; root != nil {
+				root.Count++
+				root.InjectCount++
+			}
+			return best.SessionID, cand, true
+		}
+	}
+	return "", "", false
+}
+
+// resolveParentLocked walks entry.Parent to the root entry of a
+// sibling group. Caller holds mu.
+func (c *DedupCache) resolveParentLocked(entry *dedupEntry) (EventKey, *dedupEntry) {
+	if entry == nil || entry.Parent == nil {
+		return EventKey{}, nil
+	}
+	curKey := *entry.Parent
+	cur, ok := c.entries[curKey]
+	if !ok {
+		return EventKey{}, nil
+	}
+	for steps := 0; steps < 8 && cur.Parent != nil; steps++ {
+		nextKey := *cur.Parent
+		next, ok := c.entries[nextKey]
+		if !ok {
+			break
+		}
+		curKey, cur = nextKey, next
+	}
+	return curKey, cur
+}
+
+// isGroupOpenLocked reports whether rootKey or any unresolved sibling
+// child folded onto rootKey is still open in c.isOpen. Caller holds mu.
+func (c *DedupCache) isGroupOpenLocked(rootKey EventKey, root *dedupEntry) bool {
+	if c.isOpen == nil {
+		return false
+	}
+	if c.isOpen(rootKey) {
+		return true
+	}
+	for k, e := range c.entries {
+		if k != rootKey && e.Parent != nil && *e.Parent == rootKey && !e.Resolved && e.SessionID == root.SessionID {
+			if c.isOpen(k) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SiblingGroup returns the root key and all member keys sharing key's
+// non-storm sibling-fold group (§7.7, issue #641). Returns ok=false
+// when key is standalone, unbound, or storm-owned.
+func (c *DedupCache) SiblingGroup(key EventKey) (parent EventKey, keys []EventKey, ok bool) {
+	key.Reason = CanonicalReason(key.Reason)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, exists := c.entries[key]
+	if !exists || entry.SessionID == "" || entry.Storm != "" {
+		return EventKey{}, nil, false
+	}
+	rootKey := key
+	if entry.Parent != nil {
+		rk, r := c.resolveParentLocked(entry)
+		if r == nil || r.SessionID != entry.SessionID || r.Storm != "" {
+			return EventKey{}, nil, false
+		}
+		rootKey = rk
+	}
+	var group []EventKey
+	group = append(group, rootKey)
+	for k, e := range c.entries {
+		if k != rootKey && e.Parent != nil && *e.Parent == rootKey && e.SessionID == entry.SessionID && e.Storm == "" {
+			group = append(group, k)
+		}
+	}
+	if len(group) < 2 {
+		return EventKey{}, nil, false
+	}
+	return rootKey, group, true
+}
+
+// CrossSourceJoin reports whether a duplicate signal of the given
+// kind is a cross-SOURCE join of the current window entry — a signal
+// from a different source family than the one that opened the
+// incident (leading↔reactive: quota_blocked joining a quota.forecast
+// session, capacity.pending joining a FailedScheduling session) —
+// and, when it is, marks the family as announced so the answer is
+// positive AT MOST ONCE per source family per incident per window
+// (M4 observation 4's bound). openedBy is the source family that
+// opened the incident. Same-family duplicates, unstamped entries
+// (pre-M4 snapshots), and repeat joins all answer false: plain
+// dedup suppression.
+func (c *DedupCache) CrossSourceJoin(key EventKey, kind string) (openedBy string, ok bool) {
+	key.Reason = CanonicalReason(key.Reason)
+	family := SourceFamily(kind)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, found := c.entries[key]
+	if !found || entry.SourceKind == "" || SourceFamily(entry.SourceKind) == family {
+		return "", false
+	}
+	if slices.Contains(entry.FollowupSources, family) {
+		return "", false
+	}
+	entry.FollowupSources = append(entry.FollowupSources, family)
+	return SourceFamily(entry.SourceKind), true
+}
+
+// BoundIncident is one session binding with full incident identity,
+// as returned by Bindings for restart seeding of the recovery
+// tracker.
+type BoundIncident struct {
+	Key       EventKey
+	SessionID string
+	FirstSeen time.Time
+	Ref       IncidentRef
+}
+
+// Bindings returns every entry that is bound to a session AND carries
+// an incident ref — i.e. everything the recovery tracker can resume
+// after a restart. Entries bound by the pre-recovery BindSession (or
+// restored from an older snapshot) lack the ref and are skipped.
+func (c *DedupCache) Bindings() []BoundIncident {
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]BoundIncident, 0, len(c.entries))
+	for key, entry := range c.entries {
+		if entry.Resolved {
+			if c.window > 0 && now.Sub(entry.LastSeen) > c.window {
+				delete(c.entries, key)
+			}
+			continue
+		}
+		if entry.SessionID == "" || entry.Incident == nil {
+			continue
+		}
+		out = append(out, BoundIncident{
+			Key:       key,
+			SessionID: entry.SessionID,
+			FirstSeen: entry.FirstSeen,
+			Ref:       *entry.Incident,
+		})
+	}
+	return out
+}
+
+// Sweep removes expired entries that are either resolved or not kept
+// open by recovery tracking (#643). Safe to call from any goroutine.
+func (c *DedupCache) Sweep() int {
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sweepExpiredLocked(now)
+}
+
+func (c *DedupCache) maybeSweepLocked(now time.Time) {
+	if c.window <= 0 {
+		return
+	}
+	if !c.lastSweep.IsZero() && now.Sub(c.lastSweep) < c.window {
+		return
+	}
+	c.sweepExpiredLocked(now)
+}
+
+func (c *DedupCache) sweepExpiredLocked(now time.Time) int {
+	c.lastSweep = now
+	if c.window <= 0 {
+		return 0
+	}
+	replayTTL := max(time.Hour, 4*c.window)
+	removed := 0
+	for k, e := range c.entries {
+		age := now.Sub(e.LastSeen)
+		if age <= c.window {
+			continue
+		}
+		if e.Resolved {
+			delete(c.entries, k)
+			removed++
+			continue
+		}
+		if e.SessionClass && e.SessionID != "" && e.Incident != nil && c.isGroupOpenLocked(k, e) {
+			continue
+		}
+		if age > replayTTL {
+			delete(c.entries, k)
+			removed++
+		}
+	}
+	return removed
+}
+
+func (c *DedupCache) evictionTierLocked(k EventKey, e *dedupEntry, now time.Time) int {
+	expired := c.window > 0 && now.Sub(e.LastSeen) > c.window
+	switch {
+	case e.Resolved || expired:
+		return 0
+	case e.SessionID == "" || !e.SessionClass:
+		return 1
+	case c.isOpen == nil || !c.isOpen(k):
+		return 2
+	default:
+		return 3
+	}
+}
+
+// evictIfFull is called under lock. If the cache is at capacity, it
+// first sweeps expired/resolved entries; if still full, it evicts the
+// lowest-priority (resolved/expired → unbound → closed → oldest live
+// bound) entry with the oldest LastSeen (#643).
+func (c *DedupCache) evictIfFull(now time.Time) {
+	if len(c.entries) < c.max {
+		return
+	}
+	c.sweepExpiredLocked(now)
+	if len(c.entries) < c.max {
+		return
+	}
+	var victimKey EventKey
+	var victimTs time.Time
+	victimTier := 99
+	for k, e := range c.entries {
+		tier := c.evictionTierLocked(k, e, now)
+		if tier < victimTier || (tier == victimTier && e.LastSeen.Before(victimTs)) {
+			victimKey = k
+			victimTs = e.LastSeen
+			victimTier = tier
+		}
+	}
+	delete(c.entries, victimKey)
+}
+
+// ActiveBoundCount returns the number of live unresolved entries in
+// the cache (entries still within their dedup window or kept open by
+// recovery tracking, excluding resolved or stale expired entries) —
+// the true live value for lookout_active_incidents (#643).
+func (c *DedupCache) ActiveBoundCount() int {
+	now := c.clock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	count := 0
+	for k, e := range c.entries {
+		if e.Resolved {
+			continue
+		}
+		if c.window <= 0 || now.Sub(e.LastSeen) <= c.window {
+			count++
+			continue
+		}
+		if e.SessionClass && e.SessionID != "" && e.Incident != nil && c.isGroupOpenLocked(k, e) {
+			count++
+		}
+	}
+	return count
+}
+
+// Len returns the current cache size. Test / metrics helper.
+func (c *DedupCache) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}
+
+// Snapshot writes the current cache state to persistPath. Idempotent;
+// no-op when persistPath is empty. Callers should call this on
+// graceful shutdown (SIGTERM handler in main.go) and periodically
+// while running (e.g., every 30s ticker) so a crash doesn't lose
+// more than 30s of dedup state.
+//
+// Format: pretty-printed JSON — small enough that a human can
+// inspect it during incident debugging, and simple enough that the
+// on-disk shape doesn't need its own migration story.
+func (c *DedupCache) Snapshot() error {
+	if c.persistPath == "" {
+		return nil
+	}
+	c.mu.Lock()
+	// Copy under lock; encode outside so we don't hold the mutex
+	// during I/O.
+	snapshot := make(map[string]*dedupEntry, len(c.entries))
+	for k, v := range c.entries {
+		snapshot[serializeKey(k)] = v.clone() // deep copy: repeat mutates live entries (Classes) concurrently
+	}
+	c.mu.Unlock()
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return fmt.Errorf("dedup: marshal snapshot: %w", err)
+	}
+	// Atomic write: temp file + rename so an interrupted write
+	// doesn't corrupt the persisted state.
+	tmp := c.persistPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("dedup: write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, c.persistPath); err != nil {
+		return fmt.Errorf("dedup: rename %s → %s: %w", tmp, c.persistPath, err)
+	}
+	return nil
+}
+
+// restore reads persistPath (if it exists) and hydrates the cache.
+// Missing file is not an error — first-time startup has nothing to
+// restore. Called by NewDedupCache during construction.
+func (c *DedupCache) restore() error {
+	data, err := os.ReadFile(c.persistPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // first startup; nothing to restore
+		}
+		return fmt.Errorf("dedup: read %s: %w", c.persistPath, err)
+	}
+	var snapshot map[string]*dedupEntry
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		// Corrupt persist file: log and start fresh with an empty
+		// cache. Better than refusing to boot the sentinel — dedup
+		// state is an optimization (worst case: one duplicate session
+		// per active incident), while a crash-looping sentinel misses
+		// every new incident. The file stays on disk untouched until
+		// the next Snapshot for operators who want to inspect it.
+		// (Fixed: this path used to return the error, which failed
+		// NewDedupCache and errored out the whole sentinel — the
+		// comment above promised "start fresh" but the code refused
+		// to boot. Behavior now matches kube-agents' watcher.)
+		log.Printf("dedup: unmarshal snapshot %s (starting fresh with an empty cache): %v", c.persistPath, err)
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for keyStr, entry := range snapshot {
+		key, ok := deserializeKey(keyStr)
+		if !ok {
+			continue // silently skip malformed keys
+		}
+		c.entries[key] = entry
+	}
+	return nil
+}
+
+// serializeKey / deserializeKey encode an EventKey for use as a
+// JSON map key (which must be a string). Using a delimiter that
+// can't appear in a k8s UID (which is hex + hyphens) or an Event
+// reason (which is CamelCase alphanumeric).
+func serializeKey(k EventKey) string {
+	return k.UID + "|" + k.Reason
+}
+
+func deserializeKey(s string) (EventKey, bool) {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '|' {
+			return EventKey{UID: s[:i], Reason: s[i+1:]}, true
+		}
+	}
+	return EventKey{}, false
+}

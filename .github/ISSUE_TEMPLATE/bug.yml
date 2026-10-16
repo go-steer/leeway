@@ -1,0 +1,54 @@
+name: Bug report
+description: Something leeway did that it should not have
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Not for security issues: report those
+        [privately](https://github.com/go-steer/leeway/security/advisories/new).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >-
+        The command you ran (`leeway report` or `leeway watch`) and the output you got.
+      render: console
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: >-
+        `leeway version` — prints the version, commit and build date.
+      placeholder: v0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which mode
+      options:
+        - CLI report (leeway report)
+        - Daemon watcher (leeway watch)
+      validations:
+        required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        Ideally the cluster state (Nodes, Pods, TopologySpreadConstraints,
+        LeewayPolicy, or ComputeClass) that triggers it.

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+set -euo pipefail
+
+LATEST_RELEASE="${VERIFY_VERSION_FALLBACK_TAG:-$(git tag --list 'v*.*.*' --sort=-v:refname \
+                  | grep -v '-' | head -1 || true)}"
+
+ACTUAL="${VERIFY_VERSION_FALLBACK_ACTUAL:-$(grep -oE 'Version = "[^"]+"' internal/version/version.go \
+         | head -1 | grep -oE '"[^"]+"' | tr -d '"')}"
+
+if [[ -z "$LATEST_RELEASE" ]]; then
+    if [[ "$ACTUAL" == "v0.1.0-dev" ]]; then
+        echo "verify-version-fallback: OK (no release tags yet; fallback is ${ACTUAL})"
+        exit 0
+    fi
+    echo "verify-version-fallback: no release tags found and fallback is ${ACTUAL} (expected v0.1.0-dev)" >&2
+    exit 1
+fi
+
+if [[ ! "$LATEST_RELEASE" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    echo "verify-version-fallback: latest release tag '${LATEST_RELEASE}'" >&2
+    echo "  doesn't parse as vX.Y.Z" >&2
+    exit 1
+fi
+MAJOR="${BASH_REMATCH[1]}"
+MINOR="${BASH_REMATCH[2]}"
+PATCH="${BASH_REMATCH[3]}"
+EXPECTED_MINOR="v${MAJOR}.$((MINOR + 1)).0-dev"
+EXPECTED_PATCH="v${MAJOR}.${MINOR}.$((PATCH + 1))-dev"
+
+if [[ "$ACTUAL" != "$EXPECTED_MINOR" && "$ACTUAL" != "$EXPECTED_PATCH" ]]; then
+    cat >&2 <<EOF
+verify-version-fallback: internal/version/version.go's Version
+fallback is out of sync with the release history.
+
+  Latest release tag: ${LATEST_RELEASE}
+  Expected fallback:  ${EXPECTED_MINOR} (next minor) or ${EXPECTED_PATCH} (next patch)
+  Actual fallback:    ${ACTUAL}
+
+Bump the constant in internal/version/version.go:
+  Version = "${EXPECTED_MINOR}"
+EOF
+    exit 1
+fi
+
+echo "verify-version-fallback: OK (${ACTUAL} matches next-target after ${LATEST_RELEASE})"

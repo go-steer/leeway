@@ -1,0 +1,16 @@
+# Review routing.
+*                               @mastersingh24
+
+# Frozen contracts.
+/docs/leeway-design.md          @mastersingh24
+/pkg/engine/fingerprint.go      @mastersingh24
+/pkg/leeway/finding.go          @mastersingh24
+/pkg/leeway/rank.go             @mastersingh24
+
+# Security boundaries and deployment manifests.
+/deploy/                        @mastersingh24
+/SECURITY.md                    @mastersingh24
+
+# Release and supply chain.
+/.github/workflows/             @mastersingh24
+/dev/release/                   @mastersingh24
