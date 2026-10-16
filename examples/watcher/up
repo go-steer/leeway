@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Deploy `leeway watch` + the capture stub webhook into the current cluster,
+# using the shipped deploy/ manifests unmodified for RBAC and Deployment shape:
+#
+#   1. namespace agent-triage
+#   2. LeewayPolicy CRDs (deploy/crds/leewaypolicies.yaml)
+#   3. stub-webhook (dev/drills/stub-webhook.py) as Service stub-webhook:7777
+#   4. kubectl apply -k deploy/ (RBAC + watcher Deployment)
+#   5. patch the leeway image ($LEEWAY_IMAGE, default ghcr.io/go-steer/leeway:latest)
+#      and drill-speed args.
+
+. "$(dirname "$0")/../lib.sh"
+require_examples_context
+
+image="${LEEWAY_IMAGE:-ghcr.io/go-steer/leeway:latest}"
+root="$(repo_root)"
+
+echo "▸ namespace + CRDs"
+kubectl create namespace "$SENTINEL_NS" --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f "$root/deploy/crds/leewaypolicies.yaml"
+
+echo "▸ stub webhook (Service stub-webhook:7777 — the wire capture)"
+kubectl -n "$SENTINEL_NS" create configmap stub-webhook \
+  --from-file=stub-webhook.py="$root/dev/drills/stub-webhook.py" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl apply -f "$(examples_root)/watcher/10-stub-webhook.yaml"
+
+echo "▸ shipped deploy/ manifests (RBAC unmodified)"
+kubectl apply -k "$root/deploy/"
+
+if is_kind_context; then
+  pin_node="${CLUSTER_NAME}-worker"
+  if kubectl get node "$pin_node" >/dev/null 2>&1; then
+    echo "▸ pinning leeway + stub-webhook to $pin_node"
+    for d in stub-webhook leeway; do
+      kubectl -n "$SENTINEL_NS" patch deployment "$d" --type=merge -p \
+        "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/hostname\":\"$pin_node\"}}}}}"
+    done
+  fi
+fi
+
+sources="topology-drift"
+if kubectl get crd computeclasses.cloud.google.com >/dev/null 2>&1; then
+  sources="topology-drift,compute-class"
+fi
+
+echo "▸ patching leeway: image=$image sources=$sources"
+args=(
+  "watch"
+  "--in-cluster"
+  "--cluster-name=$CLUSTER_NAME"
+  "--metrics-addr=:9090"
+  "--store=/var/lib/leeway/leeway.db"
+  "--sources=$sources"
+  "--webhook-url=http://stub-webhook.agent-triage.svc.cluster.local:7777"
+  "--dedup-window=5m"
+  "--recovery-stable-for=20s"
+  "--topology-keys=topology.kubernetes.io/zone,topology.kubernetes.io/region,$LEEWAY_ZONE_KEY"
+  "--topology-domain-unavailable-keys=topology.kubernetes.io/zone,topology.kubernetes.io/region,$LEEWAY_ZONE_KEY"
+  "--topology-dwell=30s"
+  "--compute-class-window=30s"
+  "--compute-class-dwell=20s"
+)
+args_json="$(printf '"%s",' "${args[@]}")"
+args_json="[${args_json%,}]"
+kubectl -n "$SENTINEL_NS" patch deployment leeway --type=json -p "[
+  {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/image\",\"value\":\"$image\"},
+  {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/args\",\"value\":$args_json}
+]"
+
+echo "▸ waiting for rollouts"
+kubectl -n "$SENTINEL_NS" rollout status deploy/stub-webhook --timeout=180s
+kubectl -n "$SENTINEL_NS" rollout status deploy/leeway --timeout=180s
+
+echo
+echo "▸ leeway startup log:"
+sleep 3
+kubectl -n "$SENTINEL_NS" logs deploy/leeway --tail=30 | sed 's/^/    /'
+echo
+echo "Wire capture: kubectl -n $SENTINEL_NS logs deploy/stub-webhook -f"
+echo "Next: examples/e2e"

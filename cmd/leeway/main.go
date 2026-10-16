@@ -78,11 +78,17 @@ type options struct {
 	sourcesNamed  bool
 	accessRecheck time.Duration
 
-	topologyKeys      string
-	topologyDefaults  string
-	topologyPerDomain bool
-	topologyTierC     bool
-	computeClassTierC bool
+	topologyKeys         string
+	topologyDomainKeys   string
+	topologyDefaults     string
+	topologyPerDomain    bool
+	topologyDwell        time.Duration
+	topologyTierC        bool
+	computeClassWindow   time.Duration
+	computeClassDwell    time.Duration
+	computeClassRank0    float64
+	computeClassLastRank float64
+	computeClassTierC    bool
 
 	webhookURL        string
 	sinkKind          string
@@ -141,9 +147,15 @@ func runWatchCmd(args []string, stdout, stderr *os.File) int {
 	fs.DurationVar(&o.accessRecheck, "access-recheck", sources.DefaultAccessRecheck, "How often to re-run the SelfSubjectAccessReview probe over enabled sources; 0 disables runtime re-checking.")
 
 	fs.StringVar(&o.topologyKeys, "topology-keys", strings.Join(defaultTopologyKeys(), ","), "Comma-separated node labels to treat as topology axes, in precedence order.")
+	fs.StringVar(&o.topologyDomainKeys, "topology-domain-unavailable-keys", strings.Join(defaultDomainUnavailableKeys(), ","), "Comma-separated topology axes on which a domain with no usable node raises leeway.domain_unavailable (pass empty string to disable).")
 	fs.StringVar(&o.topologyDefaults, "topology-cluster-defaults", "", "Cluster kube-scheduler PodTopologySpread defaultConstraints as `key=maxSkew[:DoNotSchedule|ScheduleAnyway]` comma-separated, or `none`.")
 	fs.BoolVar(&o.topologyPerDomain, "topology-per-domain-series", false, "Export the per-domain breakdown for EVERY tracked subject rather than only the drifting ones.")
+	fs.DurationVar(&o.topologyDwell, "topology-dwell", leeway.DefaultDwell().For, "How long a placement breach must persist before the topology-drift source raises a finding.")
 	fs.BoolVar(&o.topologyTierC, "topology-tier-c-signals", false, "Emit Tier C topology-drift findings to the signals counter and configured sink.")
+	fs.DurationVar(&o.computeClassWindow, "compute-class-window", computeclass.DefaultWindow, "How much recent history a compute class's rank shares are computed over.")
+	fs.DurationVar(&o.computeClassDwell, "compute-class-dwell", leeway.DefaultDwell().For, "How long a compute class's rank verdict must persist before the source raises a finding.")
+	fs.Float64Var(&o.computeClassRank0, "compute-class-rank0-floor", leeway.DefaultRankThresholds().Rank0ShareFloor, "Raise leeway.rank_degraded when less than this fraction of a class's windowed pod-time ran at rank 0 (0 disables).")
+	fs.Float64Var(&o.computeClassLastRank, "compute-class-last-rank-ceiling", leeway.DefaultRankThresholds().LastRankShareCeiling, "Raise leeway.rank_degraded when more than this fraction of a class's windowed pod-time ran at its least-preferred priority (0 disables).")
 	fs.BoolVar(&o.computeClassTierC, "compute-class-tier-c-signals", false, "Emit Tier C compute-class findings (`leeway.rank_tier_unused`) to the signals counter and configured sink.")
 
 	fs.StringVar(&o.webhookURL, "webhook-url", "", "HTTP webhook receiver base URL (shorthand for --sink=webhook --sink-url=<url>).")
@@ -197,6 +209,18 @@ func runWatchCmd(args []string, stdout, stderr *os.File) int {
 		fmt.Fprintf(stderr, "leeway: --recovery-stable-for must be > 0 (got %v)\n", o.recoveryStableFor)
 		return 2
 	}
+	if o.topologyDwell <= 0 {
+		fmt.Fprintf(stderr, "leeway: --topology-dwell must be > 0 (got %v)\n", o.topologyDwell)
+		return 2
+	}
+	if o.computeClassWindow <= 0 {
+		fmt.Fprintf(stderr, "leeway: --compute-class-window must be > 0 (got %v)\n", o.computeClassWindow)
+		return 2
+	}
+	if o.computeClassDwell <= 0 {
+		fmt.Fprintf(stderr, "leeway: --compute-class-dwell must be > 0 (got %v)\n", o.computeClassDwell)
+		return 2
+	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "sources" {
 			o.sourcesNamed = true
@@ -222,6 +246,14 @@ var defaultSources = []string{topologydrift.Name, computeclass.Name}
 func defaultTopologyKeys() []string {
 	out := make([]string, 0, len(topologydrift.DefaultTopologyKeys))
 	for _, k := range topologydrift.DefaultTopologyKeys {
+		out = append(out, string(k))
+	}
+	return out
+}
+
+func defaultDomainUnavailableKeys() []string {
+	out := make([]string, 0, len(topologydrift.DefaultDomainUnavailableKeys))
+	for _, k := range topologydrift.DefaultDomainUnavailableKeys {
 		out = append(out, string(k))
 	}
 	return out
@@ -376,7 +408,7 @@ func run(ctx context.Context, o options, stderr *os.File) error {
 		serveErr <- serve(ctx, o.metricsAddr, reg, srcs, stderr)
 		cancel()
 	}()
-	go em.runRecoveryLoop(ctx, defaultRecoveryTick)
+	go em.runRecoveryLoop(ctx, recoveryTickFor(o.recoveryStableFor))
 
 	var (
 		revMu  sync.Mutex
@@ -519,7 +551,7 @@ func runMultiClusterWatch(ctx context.Context, o options, sink inject.Sink, stde
 
 		allSources = append(allSources, srcs...)
 		runners = append(runners, func(rctx context.Context) error {
-			go em.runRecoveryLoop(rctx, defaultRecoveryTick)
+			go em.runRecoveryLoop(rctx, recoveryTickFor(o.recoveryStableFor))
 			return sources.RunAll(rctx, srcs, em.emit)
 		})
 	}
@@ -604,9 +636,18 @@ func buildSourcesForClients(o options, client kubernetes.Interface, dyn dynamic.
 			cfg := topologydrift.Config{
 				Cluster:                   o.cluster,
 				TopologyKeys:              topoKeys,
+				DomainUnavailableKeys:     topologyKeysFrom(o.topologyDomainKeys),
+				Dwell:                     leeway.Dwell{For: o.topologyDwell},
 				ClusterDefaultConstraints: parsed,
 				PerDomainSeries:           o.topologyPerDomain,
 				TierCSignals:              o.topologyTierC,
+			}
+			if o.topologyDwell > 0 && o.topologyDwell < topologydrift.DefaultAlertInterval {
+				tick := max(100*time.Millisecond, o.topologyDwell/2)
+				cfg.AlertInterval = tick
+				cfg.ReadySampleInterval = tick
+				cfg.CoalesceWindow = min(topologydrift.DefaultCoalesceWindow, tick)
+				cfg.RolloutCoalesceWindow = min(topologydrift.DefaultRolloutCoalesceWindow, tick)
 			}
 			src := topologydrift.New(client, cfg)
 			src.WithFactory(factory)
@@ -624,7 +665,16 @@ func buildSourcesForClients(o options, client kubernetes.Interface, dyn dynamic.
 			}
 			cfg := computeclass.DefaultConfig()
 			cfg.Cluster = o.cluster
+			cfg.Window = o.computeClassWindow
+			cfg.Dwell = leeway.Dwell{For: o.computeClassDwell}
+			cfg.Rank0ShareFloor = &o.computeClassRank0
+			cfg.LastRankShareCeiling = &o.computeClassLastRank
 			cfg.TierCSignals = o.computeClassTierC
+			if minD := min(o.computeClassDwell, o.computeClassWindow); minD > 0 && minD < computeclass.DefaultAlertInterval {
+				tick := max(100*time.Millisecond, minD/2)
+				cfg.AlertInterval = tick
+				cfg.FlushInterval = min(computeclass.DefaultFlushInterval, tick)
+			}
 			src, cerr := computeclass.New(client, dyn, cfg)
 			if cerr != nil {
 				return nil, nil, cerr

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+. "$(dirname "$0")/../../lib.sh"
+require_examples_context
+
+echo "▸ verify placement-drift (1/2: leeway report CLI)"
+report_json="$(run_leeway report \
+  --sources=topology-drift \
+  --namespace=leeway-drift \
+  --topology-keys="topology.kubernetes.io/zone,topology.kubernetes.io/region,$LEEWAY_ZONE_KEY" \
+  --topology-domain-unavailable-keys="topology.kubernetes.io/zone,topology.kubernetes.io/region,$LEEWAY_ZONE_KEY")"
+
+grep -Eq '"kind": *"leeway\.contract_violated"' <<<"$report_json" || {
+  echo "  ✗ leeway report missing leeway.contract_violated" >&2
+  echo "$report_json" >&2
+  exit 1
+}
+grep -Eq '"kind": *"leeway\.placement_drift"' <<<"$report_json" || {
+  echo "  ✗ leeway report missing leeway.placement_drift" >&2
+  echo "$report_json" >&2
+  exit 1
+}
+grep -Eq '"severityFromPolicy": *true' <<<"$report_json" || {
+  echo "  ✗ leeway report missing severityFromPolicy: true on spread-soft" >&2
+  echo "$report_json" >&2
+  exit 1
+}
+echo "  ✓ leeway report returned leeway.contract_violated (spread-hard) and leeway.placement_drift (spread-soft, severityFromPolicy=true)"
+
+echo "▸ verify placement-drift (2/2: leeway watch webhook)"
+await_inject placement-drift 180 'INCIDENT-OPEN' 'leeway\.contract_violated' 'spread-hard'
+await_inject placement-drift 180 'INCIDENT-OPEN' 'leeway\.placement_drift' 'spread-soft' 'severityFromPolicy'
+
+n="$(leeway_wire_count placement-drift 'leeway\.domain_unavailable')"
+if ((n > 0)); then
+  echo "  ✗ $n leeway.domain_unavailable line(s) on the wire — a taint emptied a domain" >&2
+  stub_since placement-drift | grep -E 'leeway\.domain_unavailable' | cut -c1-200 | sed 's/^/    wire: /' >&2
+  exit 1
+fi
+echo "  ✓ no leeway.domain_unavailable: the hold never read as a lost zone"

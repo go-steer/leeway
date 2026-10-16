@@ -1,0 +1,93 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: leeway-cc
+  labels:
+    app.kubernetes.io/part-of: leeway-examples
+---
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: gold-ccc
+spec:
+  whenUnsatisfiable: DoNotScaleUp
+  priorities:
+    - machineFamily: n4
+    - machineFamily: n2
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-running-rank1
+  namespace: leeway-cc
+  labels:
+    app.kubernetes.io/name: cc-running
+spec:
+  nodeSelector:
+    cloud.google.com/compute-class: gold-ccc
+    cloud.google.com/machine-family: n2
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: idle
+      image: python:3.12-alpine
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-c", "import time; time.sleep(10**9)"]
+      resources:
+        requests: { cpu: 10m, memory: 16Mi }
+        limits: { cpu: 50m, memory: 32Mi }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-wedged
+  namespace: leeway-cc
+  labels:
+    app.kubernetes.io/name: cc-wedged
+spec:
+  nodeSelector:
+    cloud.google.com/compute-class: gold-ccc
+    cloud.google.com/machine-family: n4-unavailable
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: idle
+      image: python:3.12-alpine
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-c", "import time; time.sleep(10**9)"]
+      resources:
+        requests: { cpu: 10m, memory: 16Mi }
+        limits: { cpu: 50m, memory: 32Mi }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-provisioning
+  namespace: leeway-cc
+  labels:
+    app.kubernetes.io/name: cc-provisioning
+spec:
+  nodeSelector:
+    cloud.google.com/compute-class: gold-ccc
+    cloud.google.com/machine-family: n4-provisioning
+  terminationGracePeriodSeconds: 1
+  containers:
+    - name: idle
+      image: python:3.12-alpine
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-c", "import time; time.sleep(10**9)"]
+      resources:
+        requests: { cpu: 10m, memory: 16Mi }
+        limits: { cpu: 50m, memory: 32Mi }

@@ -1,0 +1,113 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: leeway-drift
+  labels:
+    app.kubernetes.io/part-of: leeway-examples
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spread-hard
+  namespace: leeway-drift
+  labels:
+    app.kubernetes.io/name: spread-hard
+    app.kubernetes.io/part-of: leeway-examples
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spread-hard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spread-hard
+    spec:
+      topologySpreadConstraints:
+        - topologyKey: lookout-examples/zone
+          maxSkew: 1
+          whenUnsatisfiable: DoNotSchedule
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: spread-hard
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: idle
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-c", "import time; time.sleep(10**9)"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 50m, memory: 32Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spread-soft
+  namespace: leeway-drift
+  labels:
+    app.kubernetes.io/name: spread-soft
+    app.kubernetes.io/part-of: leeway-examples
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spread-soft
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spread-soft
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - { key: lookout-examples/zone, operator: Exists }
+      topologySpreadConstraints:
+        - topologyKey: lookout-examples/zone
+          maxSkew: 1
+          whenUnsatisfiable: ScheduleAnyway
+          nodeTaintsPolicy: Honor
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: spread-soft
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: idle
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-c", "import time; time.sleep(10**9)"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 50m, memory: 32Mi }
+---
+apiVersion: leeway.lookout.go-steer.io/v1alpha1
+kind: LeewayPolicy
+metadata:
+  name: spread-soft-pages
+  namespace: leeway-drift
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spread-soft
+  topologyKeys:
+    - key: lookout-examples/zone
+      mode: Spread
+      thresholds:
+        severity: critical

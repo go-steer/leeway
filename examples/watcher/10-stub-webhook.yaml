@@ -1,0 +1,76 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Capture stub standing in for an HTTP webhook receiver: runs
+# dev/drills/stub-webhook.py on port 7777 and logs every
+# POST /incidents and POST /incidents/<id>/events body to stdout.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stub-webhook
+  namespace: agent-triage
+  labels:
+    app.kubernetes.io/name: stub-webhook
+    app.kubernetes.io/component: capture-stub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: stub-webhook
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: stub-webhook
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: stub
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/app/stub-webhook.py", "7777"]
+          ports:
+            - name: http
+              containerPort: 7777
+          volumeMounts:
+            - name: script
+              mountPath: /app
+              readOnly: true
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+      volumes:
+        - name: script
+          configMap:
+            name: stub-webhook
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stub-webhook
+  namespace: agent-triage
+  labels:
+    app.kubernetes.io/name: stub-webhook
+spec:
+  selector:
+    app.kubernetes.io/name: stub-webhook
+  ports:
+    - name: http
+      port: 7777
+      targetPort: http

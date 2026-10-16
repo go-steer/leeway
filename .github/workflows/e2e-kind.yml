@@ -1,0 +1,72 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: E2E (kind)
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-kind:
+    name: kind cluster + leeway e2e scenarios
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      LEEWAY_E2E_TIMEOUT_SCALE: '2'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install kind
+        run: |
+          curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x /tmp/kind
+          sudo mv /tmp/kind /usr/local/bin/kind
+          kind version
+
+      - name: Cluster up + side-load leeway image from HEAD
+        run: examples/kind/up --build
+
+      - name: Deploy leeway watcher + stub webhook
+        env:
+          LEEWAY_IMAGE: leeway:examples-dev
+        run: examples/watcher/up
+
+      - name: Run e2e scenarios (placement-drift, zone-unavailable, compute-class-fallback)
+        run: examples/e2e
+
+      - name: Dump cluster forensics on failure
+        if: failure()
+        run: |
+          echo "=== stub-webhook wire capture ==="
+          kubectl -n agent-triage logs deploy/stub-webhook --tail=-1 || true
+          echo "=== leeway watcher logs ==="
+          kubectl -n agent-triage logs deploy/leeway --tail=200 || true
+          echo "=== all pods ==="
+          kubectl get pods -A -o wide || true
+          echo "=== nodes ==="
+          kubectl get nodes -o wide || true

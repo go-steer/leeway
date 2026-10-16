@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+. "$(dirname "$0")/../../lib.sh"
+require_examples_context
+
+echo "▸ verify compute-class-fallback (1/3: leeway report CLI)"
+report_json="$(run_leeway report --sources=compute-class --namespace=leeway-cc)"
+
+grep -Eq '"kind": *"leeway\.rank_wedged"' <<<"$report_json" || {
+  echo "  ✗ leeway report missing leeway.rank_wedged" >&2
+  echo "$report_json" >&2
+  exit 1
+}
+grep -Eq '"kind": *"leeway\.rank_degraded"' <<<"$report_json" || {
+  echo "  ✗ leeway report missing leeway.rank_degraded" >&2
+  echo "$report_json" >&2
+  exit 1
+}
+grep -Eq '"pendingDeclined": *1' <<<"$report_json" || {
+  echo "  ✗ leeway report expected pendingDeclined: 1" >&2
+  echo "$report_json" >&2
+  exit 1
+}
+grep -Eq '"pendingProvisioning": *1' <<<"$report_json" || {
+  echo "  ✗ leeway report expected pendingProvisioning: 1" >&2
+  echo "$report_json" >&2
+  exit 1
+}
+echo "  ✓ leeway report returned leeway.rank_wedged and leeway.rank_degraded (pendingDeclined=1, pendingProvisioning=1)"
+
+echo "▸ verify compute-class-fallback (2/3: leeway watch webhook open)"
+await_inject compute-class-fallback 180 'INCIDENT-OPEN' 'leeway\.rank_wedged' 'gold-ccc'
+await_inject compute-class-fallback 180 'INCIDENT-OPEN' 'leeway\.rank_degraded' 'gold-ccc' 'last-rank'
+
+echo "▸ verify compute-class-fallback (3/3: deleting pod-wedged resolves leeway.rank_wedged while pod-provisioning stays Pending)"
+kubectl -n leeway-cc delete pod pod-wedged --wait=true >/dev/null
+await_inject compute-class-fallback 180 'INCIDENT-EVENT' 'kind=resolved' '"resolution":"recovered"'

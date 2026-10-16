@@ -54,8 +54,8 @@ spec:
               type: RuntimeDefault
           args:
             - "--in-cluster"
-            - "--cluster=local"
-            - "--listen-addr=:9090"
+            - "--cluster-name=local"
+            - "--metrics-addr=:9090"
             - "--store=/var/lib/leeway/leeway.db"
           volumeMounts:
             - name: leeway-data

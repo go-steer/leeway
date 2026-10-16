@@ -326,5 +326,9 @@ func (s *Source) thresholds() leeway.RankThresholds {
 	if s.cfg.MigrationGrace > 0 {
 		t.MigrationGrace = s.cfg.MigrationGrace
 	}
-	return t.Normalized()
+	t = t.Normalized()
+	if s.cfg.Window > 0 && s.cfg.Window < t.MinWindow {
+		t.MinWindow = s.cfg.Window
+	}
+	return t
 }

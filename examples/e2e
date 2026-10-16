@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# End-to-end scenario driver: inject -> verify -> revert, per scenario,
+# against the current (examples) cluster. Verification is two-surface:
+#   1. `leeway report` (one-shot CLI JSON evaluation)
+#   2. `leeway watch` (webhook wire capture in stub-webhook logs)
+#
+# Usage:
+#   examples/e2e                 # all default scenarios, ordered
+#   examples/e2e placement-drift
+
+. "$(dirname "$0")/lib.sh"
+require_examples_context
+
+DEFAULT_SCENARIOS=(
+  placement-drift
+  zone-unavailable
+  compute-class-fallback
+)
+
+scenarios=("$@")
+if ((${#scenarios[@]} == 0)); then
+  scenarios=("${DEFAULT_SCENARIOS[@]}")
+fi
+for s in "${scenarios[@]}"; do
+  if [[ ! -x "$(examples_root)/scenarios/$s/inject" ]]; then
+    echo "ERROR: unknown scenario '$s'. Available:" >&2
+    ls "$(examples_root)/scenarios" | sed 's/^/  /' >&2
+    exit 2
+  fi
+done
+
+echo "▸ preflight"
+kubectl -n "$SENTINEL_NS" rollout status deploy/leeway --timeout=30s >/dev/null || {
+  echo "ERROR: leeway watcher not running — examples/watcher/up first" >&2
+  exit 1
+}
+kubectl -n "$SENTINEL_NS" rollout status deploy/stub-webhook --timeout=30s >/dev/null || {
+  echo "ERROR: stub-webhook not running — examples/watcher/up first" >&2
+  exit 1
+}
+echo "  ✓ leeway watcher and stub-webhook ready"
+echo "  ✓ leeway binary: $(leeway_bin)"
+
+declare -A results
+failed=0
+for s in "${scenarios[@]}"; do
+  dir="$(examples_root)/scenarios/$s"
+  printf '\n\033[1m════ scenario: %s ════\033[0m\n' "$s"
+  ok=true
+  if ! "$dir/inject"; then
+    ok=false
+    echo "✗ $s: inject failed" >&2
+  elif ! "$dir/verify"; then
+    ok=false
+    echo "✗ $s: verify failed" >&2
+  fi
+  if ! "$dir/revert"; then
+    ok=false
+    echo "✗ $s: revert failed — cluster may need manual cleanup" >&2
+  fi
+  if $ok; then
+    results[$s]=PASS
+  else
+    results[$s]=FAIL
+    failed=$((failed + 1))
+  fi
+  sleep 5
+done
+
+printf '\n\033[1m════ e2e summary ════\033[0m\n'
+for s in "${scenarios[@]}"; do
+  printf '  %-24s %s\n' "$s" "${results[$s]}"
+done
+if ((failed > 0)); then
+  echo
+  echo "$failed scenario(s) failed. Wire capture for forensics:" >&2
+  echo "  kubectl -n $SENTINEL_NS logs deploy/stub-webhook" >&2
+  exit 1
+fi
+echo
+echo "All ${#scenarios[@]} scenario(s) passed."

@@ -37,6 +37,13 @@ const (
 	defaultRecoveryTick      = 15 * time.Second
 )
 
+func recoveryTickFor(stableFor time.Duration) time.Duration {
+	if stableFor > 0 && stableFor < defaultRecoveryTick {
+		return max(100*time.Millisecond, stableFor/2)
+	}
+	return defaultRecoveryTick
+}
+
 // emitterConfig configures incident dispatch for one watched cluster.
 type emitterConfig struct {
 	Cluster           string

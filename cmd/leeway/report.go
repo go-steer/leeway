@@ -42,12 +42,13 @@ type reportOptions struct {
 	project      string
 	location     string
 
-	namespaces        string
-	sources           string
-	topologyKeys      string
-	topologyDefaults  string
-	topologyTierC     bool
-	computeClassTierC bool
+	namespaces         string
+	sources            string
+	topologyKeys       string
+	topologyDomainKeys string
+	topologyDefaults   string
+	topologyTierC      bool
+	computeClassTierC  bool
 
 	all         bool
 	minDrift    float64
@@ -75,6 +76,7 @@ func runReportCmd(args []string, stdout, stderr *os.File) int {
 	fs.StringVar(&o.namespaces, "namespace", "", "Comma-separated namespaces to scope workload and pod evaluation (empty queries all namespaces).")
 	fs.StringVar(&o.sources, "sources", strings.Join(defaultSources, ","), "Comma-separated sources to evaluate (`topology-drift`, `compute-class`).")
 	fs.StringVar(&o.topologyKeys, "topology-keys", strings.Join(defaultTopologyKeys(), ","), "Comma-separated node labels to treat as topology axes, in precedence order.")
+	fs.StringVar(&o.topologyDomainKeys, "topology-domain-unavailable-keys", strings.Join(defaultDomainUnavailableKeys(), ","), "Comma-separated topology axes on which a domain with no usable node raises leeway.domain_unavailable (pass empty string to disable).")
 	fs.StringVar(&o.topologyDefaults, "topology-cluster-defaults", "", "Cluster kube-scheduler PodTopologySpread defaultConstraints as `key=maxSkew[:DoNotSchedule|ScheduleAnyway]` comma-separated, or `none`.")
 	fs.BoolVar(&o.topologyTierC, "topology-tier-c-signals", false, "Include Tier C topology-drift findings (workloads without declared or assumed spread constraints) in topology_findings.")
 	fs.BoolVar(&o.computeClassTierC, "compute-class-tier-c-signals", false, "Include Tier C compute-class findings (`leeway.rank_tier_unused`) in rank_findings.")
@@ -160,6 +162,7 @@ func runReportCmd(args []string, stdout, stderr *os.File) int {
 		Namespaces:                splitCSV(o.namespaces),
 		Sources:                   srcs,
 		TopologyKeys:              topoKeys,
+		DomainUnavailableKeys:     topologyKeysFrom(o.topologyDomainKeys),
 		ClusterDefaultConstraints: parsedDefaults,
 		TopologyTierC:             o.topologyTierC,
 		ComputeClassTierC:         o.computeClassTierC,

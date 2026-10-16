@@ -61,6 +61,12 @@ type Options struct {
 	// topologydrift.DefaultTopologyKeys.
 	TopologyKeys []leeway.TopologyKey
 
+	// DomainUnavailableKeys overrides the topology axes on which a domain with
+	// no usable node raises leeway.domain_unavailable. Nil uses
+	// topologydrift.DefaultDomainUnavailableKeys; a non-nil empty slice disables
+	// the detector.
+	DomainUnavailableKeys []leeway.TopologyKey
+
 	// ClusterDefaultConstraints configures kube-scheduler default spread
 	// constraints (nil = assumed system defaults, &[] = none, non-empty = declared).
 	ClusterDefaultConstraints *[]corev1.TopologySpreadConstraint
@@ -235,6 +241,7 @@ func collectCluster(ctx context.Context, target clusters.Cluster, opts Options, 
 		tcfg := topologydrift.Config{
 			Cluster:                   target.Name(),
 			TopologyKeys:              keys,
+			DomainUnavailableKeys:     opts.DomainUnavailableKeys,
 			ClusterDefaultConstraints: opts.ClusterDefaultConstraints,
 			TierCSignals:              opts.TopologyTierC,
 			Now:                       func() time.Time { return now },

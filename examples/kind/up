@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Create the examples kind cluster (`leeway-examples`, control-plane + 2 workers)
+# and pre-pull demo images.
+#
+# Flags:
+#   --build   build the leeway image from HEAD (tag leeway:examples-dev)
+#             and side-load it into kind.
+
+. "$(dirname "$0")/../lib.sh"
+
+build_image=false
+[[ "${1:-}" == "--build" ]] && build_image=true
+
+for tool in kind kubectl docker; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "ERROR: $tool not found on PATH" >&2
+    exit 1
+  }
+done
+
+if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
+  echo "▸ kind cluster '$CLUSTER_NAME' already exists — reusing"
+else
+  echo "▸ creating kind cluster '$CLUSTER_NAME'"
+  kind create cluster --name "$CLUSTER_NAME" --config "$(examples_root)/kind/cluster.yaml"
+fi
+
+cap_kind_nodes
+kubectl config use-context "$EXAMPLES_CONTEXT" >/dev/null
+
+echo "▸ waiting for nodes Ready"
+kubectl wait --for=condition=Ready nodes --all --timeout=180s
+
+echo "▸ pre-pulling demo images into the kind nodes"
+for img in python:3.12-alpine; do
+  docker pull "$img"
+  kind load docker-image "$img" --name "$CLUSTER_NAME"
+done
+
+if $build_image; then
+  echo "▸ building leeway:examples-dev from HEAD"
+  (cd "$(repo_root)" && docker build -t leeway:examples-dev --build-arg VERSION=examples-dev .)
+  kind load docker-image leeway:examples-dev --name "$CLUSTER_NAME"
+  echo
+  echo "Side-loaded. Deploy leeway + stub webhook with:"
+  echo "  LEEWAY_IMAGE=leeway:examples-dev examples/watcher/up"
+else
+  echo
+  echo "Next: examples/watcher/up   (uses ghcr.io/go-steer/leeway:latest;"
+  echo "      re-run this script with --build to use a from-HEAD image)"
+fi
