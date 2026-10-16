@@ -47,4 +47,4 @@ await_inject compute-class-fallback 180 'INCIDENT-OPEN' 'leeway\.rank_degraded' 
 
 echo "▸ verify compute-class-fallback (3/3: deleting pod-wedged resolves leeway.rank_wedged while pod-provisioning stays Pending)"
 kubectl -n leeway-cc delete pod pod-wedged --wait=true >/dev/null
-await_inject compute-class-fallback 180 'INCIDENT-EVENT' 'kind=resolved' '"resolution":"recovered"'
+await_inject compute-class-fallback 180 'INCIDENT-EVENT' 'kind=resolved' 'wedged' 'gold-ccc' '"resolution":"recovered"'
