@@ -4,6 +4,20 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-16
+
+### Added
+
+- **Drill & E2E Tunability Flags (`cmd/leeway`)**: Added `--topology-domain-unavailable-keys`, `--topology-dwell`, `--compute-class-window`, `--compute-class-dwell`, `--compute-class-rank0-floor`, and `--compute-class-last-rank-ceiling` to `leeway watch` and `leeway report`, automatically scaling evaluation/coalesce intervals when short drill dwells are configured.
+- **3-Tier End-to-End & Scale Suite (`test/e2e`, `examples/`, `dev/drills/`)**:
+  - In-repo Go binary E2E suite (`test/e2e/e2e_test.go`) exercising `leeway report` and `leeway watch` subprocesses against live mock Kubernetes API servers, HTTP webhook receivers, and SQLite `--store`.
+  - Hermetic multi-zone `kind` E2E harness (`examples/kind/`, `examples/watcher/`, `examples/scenarios/`, `examples/e2e`, `.github/workflows/e2e-kind.yml`) covering `placement-drift`, `zone-unavailable`, and `compute-class-fallback`.
+  - KWOK synthetic 5,000-pod scale and memory regression guard (`examples/kwok/`, `.github/workflows/scale-kwok.yml`) and live GKE NAP drill runbook (`dev/drills/compute-class-fallback.md`).
+
+### Fixed
+
+- **Kustomize Watcher Deployment Flags (`deploy/51-deployment-watcher.yaml`)**: Updated default container args (`--cluster-name=local`, `--metrics-addr=:9090`) to match `cmd/leeway`.
+
 ## [0.1.0] - 2026-10-16
 
 Initial standalone release of `leeway` (`github.com/go-steer/leeway`), extracted from `k8s-lookout` as a dedicated Kubernetes topology placement-drift and ComputeClass priority-rank analyzer and incident daemon.
