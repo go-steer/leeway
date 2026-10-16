@@ -30,8 +30,10 @@ kubectl label node "$target" \
   --overwrite >/dev/null
 kubectl annotate node "$target" ccc_priority_index="1" --overwrite >/dev/null
 
-echo "▸ ensuring leeway watcher has compute-class enabled"
-"$(examples_root)/watcher/up" >/dev/null
+if ! kubectl -n "$SENTINEL_NS" get deploy leeway -o jsonpath='{.spec.template.spec.containers[0].args}' 2>/dev/null | grep -q 'compute-class'; then
+  echo "▸ ensuring leeway watcher has compute-class enabled"
+  "$(examples_root)/watcher/up" >/dev/null
+fi
 
 stub_mark compute-class-fallback
 echo "▸ deploying gold-ccc ComputeClass, running fallback pod, wedged pod, and provisioning pod"

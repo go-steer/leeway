@@ -33,6 +33,7 @@ jobs:
     timeout-minutes: 25
     env:
       LEEWAY_E2E_TIMEOUT_SCALE: '2'
+      LEEWAY_IMAGE: leeway:examples-dev
     steps:
       - uses: actions/checkout@v4
 

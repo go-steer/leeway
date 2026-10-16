@@ -26,12 +26,19 @@
 . "$(dirname "$0")/../lib.sh"
 require_examples_context
 
-image="${LEEWAY_IMAGE:-ghcr.io/go-steer/leeway:latest}"
+if [[ -z "${LEEWAY_IMAGE:-}" ]] && is_kind_context && docker image inspect leeway:examples-dev >/dev/null 2>&1; then
+  LEEWAY_IMAGE="leeway:examples-dev"
+fi
+image="${LEEWAY_IMAGE:-ghcr.io/go-steer/leeway:v0.1.0}"
 root="$(repo_root)"
 
 echo "▸ namespace + CRDs"
 kubectl create namespace "$SENTINEL_NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f "$root/deploy/crds/leewaypolicies.yaml"
+if is_kind_context && [[ -f "$(examples_root)/scenarios/compute-class-fallback/crd.yaml" ]]; then
+  kubectl apply -f "$(examples_root)/scenarios/compute-class-fallback/crd.yaml"
+  kubectl wait --for=condition=Established crd/computeclasses.cloud.google.com --timeout=60s >/dev/null
+fi
 
 echo "▸ stub webhook (Service stub-webhook:7777 — the wire capture)"
 kubectl -n "$SENTINEL_NS" create configmap stub-webhook \
@@ -59,8 +66,8 @@ if kubectl get crd computeclasses.cloud.google.com >/dev/null 2>&1; then
 fi
 
 echo "▸ patching leeway: image=$image sources=$sources"
+# Note: Dockerfile sets ENTRYPOINT ["/leeway", "watch"], so args splice in after `watch`.
 args=(
-  "watch"
   "--in-cluster"
   "--cluster-name=$CLUSTER_NAME"
   "--metrics-addr=:9090"
@@ -68,12 +75,12 @@ args=(
   "--sources=$sources"
   "--webhook-url=http://stub-webhook.agent-triage.svc.cluster.local:7777"
   "--dedup-window=5m"
-  "--recovery-stable-for=20s"
+  "--recovery-stable-for=10s"
   "--topology-keys=topology.kubernetes.io/zone,topology.kubernetes.io/region,$LEEWAY_ZONE_KEY"
   "--topology-domain-unavailable-keys=topology.kubernetes.io/zone,topology.kubernetes.io/region,$LEEWAY_ZONE_KEY"
-  "--topology-dwell=30s"
-  "--compute-class-window=30s"
-  "--compute-class-dwell=20s"
+  "--topology-dwell=20s"
+  "--compute-class-window=20s"
+  "--compute-class-dwell=10s"
 )
 args_json="$(printf '"%s",' "${args[@]}")"
 args_json="[${args_json%,}]"
