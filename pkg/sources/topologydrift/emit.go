@@ -94,7 +94,7 @@ func scoredHere(kind leeway.SubjectKind) bool {
 // opt-in on.
 func (s *Source) findingFor(sub leeway.SubjectRef, ev *Evaluation, st leeway.AlertState, dist *leeway.Distribution, now time.Time) (leeway.Finding, leeway.Delivery) {
 	evidence := s.evidenceFor(sub, ev.Key, ev.Eligible, dist, st.FirstSeenAt, now)
-	return leeway.NewFinding(leeway.FindingInput{
+	f := leeway.NewFinding(leeway.FindingInput{
 		Subject:     sub,
 		TopologyKey: ev.Key,
 		Scores:      &ev.Scores,
@@ -103,7 +103,80 @@ func (s *Source) findingFor(sub leeway.SubjectRef, ev *Evaluation, st leeway.Ale
 		Attribution: ev.Scores.Attribute(ev.Intent, evidence, now, s.cfg.Cause),
 		Evidence:    evidence,
 		State:       st,
-	}), ev.Verdict.Route(s.cfg.TierCSignals)
+	})
+	if ev.Verdict.Breached {
+		f.Remediation = leeway.SuggestRemediation(f, s.selectorLabelsFor(sub, ev.Key))
+	}
+	return f, ev.Verdict.Route(s.cfg.TierCSignals)
+}
+
+// ephemeralPodLabels are controller-injected per-revision or per-pod labels
+// that should not be copied into a workload-wide topologySpreadConstraint
+// labelSelector.
+var ephemeralPodLabels = map[string]bool{
+	"pod-template-hash":                        true,
+	"controller-revision-hash":                 true,
+	"apps.kubernetes.io/pod-index":             true,
+	"statefulset.kubernetes.io/pod-name":       true,
+	"batch.kubernetes.io/job-completion-index": true,
+	"batch.kubernetes.io/controller-uid":       true,
+	"controller-uid":                           true,
+	"job-name":                                 true,
+}
+
+func copyStableLabels(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		if ephemeralPodLabels[k] {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// selectorLabelsFor extracts stable pod selector labels for sub to populate
+// labelSelector.matchLabels in manifest_patch remediations.
+func (s *Source) selectorLabelsFor(sub leeway.SubjectRef, key leeway.TopologyKey) map[string]string {
+	pod := s.subjectPod(sub)
+	if pod == nil {
+		return nil
+	}
+	for _, c := range pod.Spec.TopologySpreadConstraints {
+		if leeway.TopologyKey(c.TopologyKey) == key && c.LabelSelector != nil {
+			if m := copyStableLabels(c.LabelSelector.MatchLabels); len(m) > 0 {
+				return m
+			}
+		}
+	}
+	for _, c := range pod.Spec.TopologySpreadConstraints {
+		if c.LabelSelector != nil {
+			if m := copyStableLabels(c.LabelSelector.MatchLabels); len(m) > 0 {
+				return m
+			}
+		}
+	}
+	if sub.Kind == leeway.SubjectDeployment {
+		if owner := controllerOf(pod.OwnerReferences); owner != nil && owner.Kind == "ReplicaSet" {
+			s.mu.Lock()
+			rsLister := s.replicaSets
+			s.mu.Unlock()
+			if rsLister != nil {
+				if rs, err := rsLister.ReplicaSets(sub.Namespace).Get(owner.Name); err == nil && rs.Spec.Selector != nil {
+					if m := copyStableLabels(rs.Spec.Selector.MatchLabels); len(m) > 0 {
+						return m
+					}
+				}
+			}
+		}
+	}
+	return copyStableLabels(pod.Labels)
 }
 
 // signalFor converts a finding into the Signal the watch pipeline carries.

@@ -173,6 +173,13 @@ type Finding struct {
 	// `thresholds.severity` rather than derived from Tier (§10.1). Without it
 	// a Tier B at `critical` reads as a bug.
 	SeverityFromPolicy bool `json:"severityFromPolicy,omitempty"`
+
+	// Remediation carries an optional deterministic remediation recommendation
+	// derived from the finding's SuspectedCause, Intent, and Subject. It
+	// distinguishes declarative manifest patches (consumable by a downstream
+	// GitOps step) from operational/infrastructure actions where editing
+	// workload YAML would be ineffective or harmful.
+	Remediation *FindingRemediation `json:"remediation,omitempty"`
 }
 
 // FindingInput is everything NewFinding assembles. A struct rather than eight
@@ -193,6 +200,9 @@ type FindingInput struct {
 
 	// State is the §8.2 dwell state, read only for FirstSeenAt.
 	State AlertState
+
+	// Remediation, when non-nil, is attached to the resulting Finding.
+	Remediation *FindingRemediation
 }
 
 // NewFinding builds the §8.5 payload.
@@ -214,6 +224,7 @@ func NewFinding(in FindingInput) Finding {
 		Transient:           in.Verdict.Transient.String(),
 		Relaxed:             in.Verdict.Relaxed,
 		SeverityFromPolicy:  in.Verdict.SeverityFromPolicy,
+		Remediation:         in.Remediation,
 	}
 	if f.SuspectedCause == "" {
 		f.SuspectedCause = CauseUnknown

@@ -120,7 +120,7 @@ func DomainVerdict() Verdict {
 // applicable", which is why the message for this kind does not print it.
 func NewDomainFinding(a DomainAvailability, key TopologyKey, st AlertState) Finding {
 	v := DomainVerdict()
-	return Finding{
+	f := Finding{
 		Kind:           KindDomainUnavailable,
 		Subject:        SubjectRef{Kind: SubjectDomain, Name: string(a.Domain)},
 		TopologyKey:    key,
@@ -134,6 +134,8 @@ func NewDomainFinding(a DomainAvailability, key TopologyKey, st AlertState) Find
 		}},
 		FirstSeenAt: st.FirstSeenAt.UTC(),
 	}
+	f.Remediation = SuggestRemediation(f, nil)
+	return f
 }
 
 // note is the domain row's one line of evidence: the census that distinguishes

@@ -246,3 +246,22 @@ func TestHeadline(t *testing.T) {
 		}
 	}
 }
+
+func TestFindingFor_PopulatesRemediationWithSelectorLabels(t *testing.T) {
+	s, got := breachingSource(t, leeway.TierB, false)
+	fire(t, s)
+
+	if len(*got) != 1 || (*got)[0].LeewayFinding == nil {
+		t.Fatalf("emitted = %+v, want 1 signal with LeewayFinding", *got)
+	}
+	rem := (*got)[0].LeewayFinding.Remediation
+	if rem == nil {
+		t.Fatal("LeewayFinding.Remediation is nil, want populated FindingRemediation")
+	}
+	if rem.Kind != leeway.RemediationManifestPatch {
+		t.Errorf("Remediation.Kind = %q, want %q", rem.Kind, leeway.RemediationManifestPatch)
+	}
+	if !strings.Contains(rem.YAML, "topologyKey: topology.kubernetes.io/zone") {
+		t.Errorf("Remediation.YAML missing topologyKey:\n%s", rem.YAML)
+	}
+}
