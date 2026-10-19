@@ -139,7 +139,7 @@ func Resolve(ctx context.Context, opts Options) ([]Cluster, error) {
 	}
 
 	// 4. Single-cluster fallback (--in-cluster, --kubeconfig, --context).
-	return resolveSingleCluster(opts)
+	return resolveSingleCluster(opts, disc.Broker)
 }
 
 func resolveFromProfilesDir(ctx context.Context, dir string, filterSpecs []string, opts Options, disc Discoverer) ([]Cluster, error) {
@@ -296,12 +296,16 @@ func resolveFromSource(ctx context.Context, from string, filterSpecs []string, o
 			}
 			continue
 		}
-		out = append(out, Cluster{
+		c := Cluster{
 			Identity:  id,
 			Profile:   "gke:" + id.String(),
 			Config:    cfg,
 			Autopilot: gc.Autopilot != nil && gc.Autopilot.Enabled,
-		})
+		}
+		if disc.Broker != nil && disc.Broker.ShellMode {
+			c.Context = fmt.Sprintf("gke_%s_%s_%s", id.Project, id.Location, id.Cluster)
+		}
+		out = append(out, c)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no reachable GKE clusters found under %s", parent)
@@ -355,6 +359,15 @@ func resolveExplicitSpecs(ctx context.Context, specs []string, opts Options, dis
 			}
 			seen[id.String()] = true
 
+			if disc.Broker != nil && disc.Broker.ShellMode && disc.Describe == nil {
+				out = append(out, Cluster{
+					Identity: id,
+					Profile:  "gke:" + id.String(),
+					Context:  fmt.Sprintf("gke_%s_%s_%s", id.Project, id.Location, id.Cluster),
+				})
+				continue
+			}
+
 			if disc.Broker == nil && ts == nil {
 				var err error
 				ts, err = disc.tokenSource(ctx)
@@ -391,11 +404,24 @@ func resolveExplicitSpecs(ctx context.Context, specs []string, opts Options, dis
 			continue
 		}
 
-		// 3. Kubeconfig context name.
+		// 3. Kubeconfig context name (or gke_<project>_<location>_<cluster> under ShellMode).
 		if seen["ctx:"+spec] {
 			continue
 		}
 		seen["ctx:"+spec] = true
+		if disc.Broker != nil && disc.Broker.ShellMode {
+			id := Identity{Cluster: spec, Project: opts.Project, Location: opts.Location}
+			if gkeID, ok := parseGKEContext(spec); ok {
+				id = gkeID
+			}
+			out = append(out, Cluster{
+				Identity:   id,
+				Profile:    "kubeconfig:" + spec,
+				Kubeconfig: opts.Kubeconfig,
+				Context:    spec,
+			})
+			continue
+		}
 		cfg, err := kube.ConfigForContext(opts.Kubeconfig, spec)
 		if err != nil {
 			if opts.OnSkip != nil {
@@ -421,7 +447,31 @@ func resolveExplicitSpecs(ctx context.Context, specs []string, opts Options, dis
 	return out, nil
 }
 
-func resolveSingleCluster(opts Options) ([]Cluster, error) {
+func resolveSingleCluster(opts Options, broker *Broker) ([]Cluster, error) {
+	if broker != nil && broker.ShellMode && opts.BuildDirect == nil && !opts.InCluster {
+		id := Identity{
+			Cluster:  defaultClusterName(opts.ClusterName, opts.Context),
+			Project:  opts.Project,
+			Location: opts.Location,
+		}
+		if gkeID, ok := parseGKEContext(opts.Context); ok {
+			if strings.TrimSpace(opts.ClusterName) == "" {
+				id.Cluster = gkeID.Cluster
+			}
+			if id.Project == "" {
+				id.Project = gkeID.Project
+			}
+			if id.Location == "" {
+				id.Location = gkeID.Location
+			}
+		}
+		return []Cluster{{
+			Identity:   id,
+			Profile:    DirectProfile,
+			Kubeconfig: opts.Kubeconfig,
+			Context:    opts.Context,
+		}}, nil
+	}
 	cfg, err := buildDirectConfig(opts)
 	if err != nil {
 		return nil, err
@@ -436,6 +486,18 @@ func resolveSingleCluster(opts Options) ([]Cluster, error) {
 		Profile: DirectProfile,
 		Config:  cfg,
 	}}, nil
+}
+
+func parseGKEContext(s string) (Identity, bool) {
+	parts := strings.Split(strings.TrimSpace(s), "_")
+	if len(parts) != 4 || parts[0] != "gke" || parts[1] == "" || parts[2] == "" || parts[3] == "" {
+		return Identity{}, false
+	}
+	return Identity{
+		Project:  parts[1],
+		Location: parts[2],
+		Cluster:  parts[3],
+	}, true
 }
 
 func buildDirectConfig(opts Options) (*rest.Config, error) {

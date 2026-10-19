@@ -94,6 +94,12 @@ type Cluster struct {
 	// per-cluster filename, where the bare cluster name would collide.
 	Profile string
 	Config  *rest.Config
+	// Kubeconfig and Context, when set alongside a nil Config (e.g. inside the
+	// kube-agents shell sandbox where CREDENTIAL_PROXY_URL is set), instruct
+	// `leeway report` to collect the cluster's snapshot via the `kubectl`
+	// credential-proxy wrapper rather than a direct client-go connection.
+	Kubeconfig string
+	Context    string
 	// Autopilot is the describe call's Autopilot.Enabled, carried out of
 	// Discover because the GKE API was already asked. It separates the two
 	// clusters that look identical from inside — both report zero nodes and
@@ -192,6 +198,9 @@ func (d Discoverer) describedBy() string {
 // usable endpoint is skipped here, and counted as a discovery error, rather
 // than becoming an informer that is refused for the life of the process.
 func (d Discoverer) clientConfig(id Identity, described *container.Cluster, ts oauth2.TokenSource) (*rest.Config, error) {
+	if d.Broker != nil && d.Broker.ShellMode {
+		return nil, nil
+	}
 	cfg, err := ClientConfigForIdentity(described)
 	if d.Broker != nil {
 		if err != nil {
@@ -448,12 +457,16 @@ func (d Discoverer) Discover(ctx context.Context, dir string) ([]Cluster, error)
 		}
 
 		seen[identity.String()] = e.Name()
-		clusters = append(clusters, Cluster{
+		c := Cluster{
 			Identity:  *identity,
 			Profile:   e.Name(),
 			Config:    cfg,
-			Autopilot: described.Autopilot != nil && described.Autopilot.Enabled,
-		})
+			Autopilot: described != nil && described.Autopilot != nil && described.Autopilot.Enabled,
+		}
+		if d.Broker != nil && d.Broker.ShellMode {
+			c.Context = fmt.Sprintf("gke_%s_%s_%s", identity.Project, identity.Location, identity.Cluster)
+		}
+		clusters = append(clusters, c)
 	}
 	return clusters, nil
 }

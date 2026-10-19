@@ -37,12 +37,20 @@ const (
 	BrokerURLEnv       = "WATCHER_BROKER_URL"
 	BrokerTokenFileEnv = "WATCHER_BROKER_TOKEN_FILE"
 
+	// CredentialProxyURLEnv and CredentialProxyTokenFileEnv are the variables
+	// set inside the agent-sandbox container (CALLER_ROLE_SHELL). When present,
+	// Google REST API reads route through /v1/gcp/<host>/ and Kubernetes object
+	// reads route through the sandbox's `kubectl` credential-proxy wrapper.
+	CredentialProxyURLEnv       = "CREDENTIAL_PROXY_URL"
+	CredentialProxyTokenFileEnv = "CREDENTIAL_PROXY_TOKEN_FILE"
+
 	// brokerGCPPathFormat is the proxy's route for a Google REST API, taking
 	// the proxy's base URL and the API's host. The trailing slash is
 	// load-bearing: the generated clients resolve their "v1/..." paths against
 	// it as a base, and without the slash the host segment would be replaced
 	// rather than extended.
-	brokerGCPPathFormat = "%s/v1/watcher/gcp/%s/"
+	brokerGCPPathFormat      = "%s/v1/watcher/gcp/%s/"
+	shellBrokerGCPPathFormat = "%s/v1/gcp/%s/"
 
 	// brokerK8sPathFormat is the proxy's route for one fleet cluster's
 	// Kubernetes API, taking the base URL, project, location and cluster.
@@ -82,21 +90,40 @@ type Broker struct {
 	// TokenFile is the projected ServiceAccount token. The kubelet rotates it
 	// in place, so it is read per request rather than once.
 	TokenFile string
+	// ShellMode is true when the broker was configured from CREDENTIAL_PROXY_URL
+	// (the agent-sandbox shell role) rather than WATCHER_BROKER_URL. In ShellMode,
+	// Google REST APIs route through /v1/gcp/<host>/ and Kubernetes cluster reads
+	// route through the `kubectl` credential-proxy shim on PATH.
+	ShellMode bool
 }
 
 // BrokerFromEnv returns the proxy BrokerURLEnv and BrokerTokenFileEnv name, or
-// nil when neither is set -- the Workload Identity path, unchanged.
+// nil when neither is set -- the Workload Identity path, unchanged. When
+// WATCHER_BROKER_URL is unset but CREDENTIAL_PROXY_URL is set (inside the
+// agent-sandbox container), it returns a ShellMode Broker.
 //
-// Exactly one set is an error rather than a fall back to Workload Identity:
-// the operator sets them as a pair, so half a pair is a broken install, and
-// quietly reaching Google with the pod's own identity is the behaviour the
-// variables exist to turn off.
+// Exactly one of WATCHER_BROKER_URL / WATCHER_BROKER_TOKEN_FILE set is an error
+// rather than a fall back to Workload Identity: the operator sets them as a
+// pair, so half a pair is a broken install, and quietly reaching Google with
+// the pod's own identity is the behaviour the variables exist to turn off.
 func BrokerFromEnv() (*Broker, error) {
 	base := strings.TrimRight(os.Getenv(BrokerURLEnv), "/")
 	tokenFile := os.Getenv(BrokerTokenFileEnv)
 	switch {
 	case base == "" && tokenFile == "":
-		return nil, nil
+		shellBase := strings.TrimRight(os.Getenv(CredentialProxyURLEnv), "/")
+		if shellBase == "" {
+			return nil, nil
+		}
+		u, err := url.Parse(shellBase)
+		if err != nil || !brokerSchemes[u.Scheme] || u.Host == "" {
+			return nil, fmt.Errorf("%s=%q is not an http(s) URL", CredentialProxyURLEnv, shellBase)
+		}
+		return &Broker{
+			URL:       shellBase,
+			TokenFile: strings.TrimSpace(os.Getenv(CredentialProxyTokenFileEnv)),
+			ShellMode: true,
+		}, nil
 	case base == "" || tokenFile == "":
 		return nil, fmt.Errorf("%s and %s are set together or not at all; got %s=%q %s=%q",
 			BrokerURLEnv, BrokerTokenFileEnv, BrokerURLEnv, base, BrokerTokenFileEnv, tokenFile)
@@ -111,7 +138,11 @@ func BrokerFromEnv() (*Broker, error) {
 // HTTPClient returns a client that sends the current projected token on every
 // request.
 func (b *Broker) HTTPClient() *http.Client {
-	return &http.Client{Transport: &bearerFileTransport{path: b.TokenFile, base: http.DefaultTransport}}
+	return &http.Client{Transport: &bearerFileTransport{
+		path:     b.TokenFile,
+		optional: b.ShellMode && b.TokenFile == "",
+		base:     http.DefaultTransport,
+	}}
 }
 
 // GoogleAPIOptions points a google.golang.org/api client at the proxy's route
@@ -119,8 +150,12 @@ func (b *Broker) HTTPClient() *http.Client {
 // Credentials (transport/http.NewClient returns the supplied client as is);
 // WithoutAuthentication states it, so a later option cannot bring ADC back.
 func (b *Broker) GoogleAPIOptions(apiHost string) []option.ClientOption {
+	format := brokerGCPPathFormat
+	if b.ShellMode {
+		format = shellBrokerGCPPathFormat
+	}
 	return []option.ClientOption{
-		option.WithEndpoint(fmt.Sprintf(brokerGCPPathFormat, b.URL, apiHost)),
+		option.WithEndpoint(fmt.Sprintf(format, b.URL, apiHost)),
 		option.WithHTTPClient(b.HTTPClient()),
 		option.WithoutAuthentication(),
 	}
@@ -175,11 +210,15 @@ func (i Identity) brokerSafe() error {
 // make at most a few requests a second, so a stale token after rotation is not
 // worth a cache to avoid.
 type bearerFileTransport struct {
-	path string
-	base http.RoundTripper
+	path     string
+	optional bool
+	base     http.RoundTripper
 }
 
 func (t *bearerFileTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.optional && t.path == "" {
+		return t.base.RoundTrip(req)
+	}
 	raw, err := os.ReadFile(t.path) // #nosec G304 -- the operator-set BrokerTokenFileEnv, not request data
 	if err == nil && strings.TrimSpace(string(raw)) == "" {
 		err = errors.New("file is empty")

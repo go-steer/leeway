@@ -12,6 +12,7 @@ All notable changes to `leeway` are documented in this file.
 - **Conflicting `nodeAffinity` / `nodeSelector` Detection on Spread Axes (`pkg/sources/topologydrift/predicate.go`, `pkg/sources/topologydrift/resolve.go`, `pkg/leeway/remediation.go`)**: Detected workloads that declare a `Spread` `topologySpreadConstraint` on an axis while simultaneously pinning placement to a single domain on that same axis via `nodeSelector` or required `nodeAffinity`, emitting `manifest_patch` remediation.
 - **Cloud CSI Volume Topology Label Aliases (`pkg/sources/topologydrift/pinning.go`)**: Recognised provider-specific CSI volume node-affinity keys (`topology.gke.io/zone`, `topology.ebs.csi.aws.com/zone`, `topology.disk.csi.azure.com/zone`, `topology.gke.io/region`) when scoring standard zone/region axes.
 - **Unschedulable Shortfall Scoring for `DoNotSchedule` Spread Constraints (`pkg/sources/topologydrift/score.go`)**: Accounted for `Pending` (`Unschedulable`) pods blocked by a `DoNotSchedule` spread constraint and single-zone capacity starvation when only 1–2 replicas are `Running`.
+- **Credential Proxy Shell Sandbox (`CREDENTIAL_PROXY_URL`) Support (`pkg/clusters`, `pkg/report`)**: Added `ShellMode` broker discovery and `kubectl`-backed snapshot collection so `leeway report` operates credential-free inside `kube-agents`'s `agent-sandbox` container via the `/opt/credential-proxy/bin/kubectl` shim.
 
 ## [0.1.2] - 2026-10-19
 

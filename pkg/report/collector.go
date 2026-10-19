@@ -15,9 +15,13 @@
 package report
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os/exec"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -189,51 +193,95 @@ func collectCluster(ctx context.Context, target clusters.Cluster, opts Options, 
 		Status:  StatusOK,
 	}
 
-	client, dyn, err := buildClients(target, opts)
-	if err != nil {
-		cr.Status = StatusError
-		cr.Error = fmt.Sprintf("build client: %v", err)
-		return cr
-	}
-
 	runTopo := sourceEnabled(opts.Sources, topologydrift.Name)
 	runCC := sourceEnabled(opts.Sources, computeclass.Name)
-
-	nodes, err := listNodes(ctx, client)
-	if err != nil {
-		cr.Status = StatusError
-		cr.Error = fmt.Sprintf("list nodes: %v", err)
-		return cr
-	}
 
 	namespaces := opts.Namespaces
 	if len(namespaces) == 0 {
 		namespaces = []string{metav1.NamespaceAll}
 	}
 
-	pods, err := listPods(ctx, client, namespaces)
-	if err != nil {
-		cr.Status = StatusError
-		cr.Error = fmt.Sprintf("list pods: %v", err)
-		return cr
-	}
+	var (
+		nodes           []*corev1.Node
+		pods            []*corev1.Pod
+		events          []*corev1.Event
+		rs              []*appsv1.ReplicaSet
+		deps            []*appsv1.Deployment
+		stss            []*appsv1.StatefulSet
+		pvcs            []*corev1.PersistentVolumeClaim
+		pvs             []*corev1.PersistentVolume
+		policies        []*unstructured.Unstructured
+		clusterPolicies []*unstructured.Unstructured
+		classes         []*unstructured.Unstructured
+		ccServed        bool
+	)
 
-	// Events are best-effort: a forbidden or failed event list must not fail the
-	// cluster report.
-	events, _ := listEvents(ctx, client, namespaces)
-
-	if runTopo {
-		rs, err := listReplicaSets(ctx, client, namespaces)
+	if opts.ClientBuilder == nil && target.Config == nil {
+		snapData, err := fetchViaKubectl(ctx, target, namespaces, runTopo, runCC)
 		if err != nil {
 			cr.Status = StatusError
-			cr.Error = fmt.Sprintf("list replicasets: %v", err)
+			cr.Error = err.Error()
 			return cr
 		}
-		deps, _ := listDeployments(ctx, client, namespaces)
-		stss, _ := listStatefulSets(ctx, client, namespaces)
-		pvcs, _ := listPVCs(ctx, client, namespaces)
-		pvs, _ := listPVs(ctx, client)
-		policies, clusterPolicies := listPolicies(ctx, client, dyn, namespaces)
+		nodes = snapData.nodes
+		pods = snapData.pods
+		events = snapData.events
+		rs = snapData.rs
+		deps = snapData.deps
+		stss = snapData.stss
+		pvcs = snapData.pvcs
+		pvs = snapData.pvs
+		classes = snapData.classes
+		ccServed = len(classes) > 0
+	} else {
+		client, dyn, err := buildClients(target, opts)
+		if err != nil {
+			cr.Status = StatusError
+			cr.Error = fmt.Sprintf("build client: %v", err)
+			return cr
+		}
+
+		nodes, err = listNodes(ctx, client)
+		if err != nil {
+			cr.Status = StatusError
+			cr.Error = fmt.Sprintf("list nodes: %v", err)
+			return cr
+		}
+
+		pods, err = listPods(ctx, client, namespaces)
+		if err != nil {
+			cr.Status = StatusError
+			cr.Error = fmt.Sprintf("list pods: %v", err)
+			return cr
+		}
+
+		// Events are best-effort: a forbidden or failed event list must not fail the
+		// cluster report.
+		events, _ = listEvents(ctx, client, namespaces)
+
+		if runTopo {
+			rs, err = listReplicaSets(ctx, client, namespaces)
+			if err != nil {
+				cr.Status = StatusError
+				cr.Error = fmt.Sprintf("list replicasets: %v", err)
+				return cr
+			}
+			deps, _ = listDeployments(ctx, client, namespaces)
+			stss, _ = listStatefulSets(ctx, client, namespaces)
+			pvcs, _ = listPVCs(ctx, client, namespaces)
+			pvs, _ = listPVs(ctx, client)
+			policies, clusterPolicies = listPolicies(ctx, client, dyn, namespaces)
+		}
+
+		if runCC && dyn != nil && computeclass.ComputeClassesServed(client) {
+			if list, err := listComputeClasses(ctx, dyn); err == nil && len(list) > 0 {
+				classes = list
+				ccServed = true
+			}
+		}
+	}
+
+	if runTopo {
 
 		keys := opts.TopologyKeys
 		if len(keys) == 0 {
@@ -300,27 +348,24 @@ func collectCluster(ctx context.Context, target clusters.Cluster, opts Options, 
 		}
 	}
 
-	if runCC && dyn != nil && computeclass.ComputeClassesServed(client) {
-		classes, err := listComputeClasses(ctx, dyn)
-		if err == nil && len(classes) > 0 {
-			ccfg := computeclass.DefaultConfig()
-			ccfg.Cluster = target.Name()
-			ccfg.TierCSignals = opts.ComputeClassTierC
-			ccSnap, err := computeclass.EvaluateSnapshot(ccfg, computeclass.SnapshotInput{
-				Classes: classes,
-				Nodes:   nodes,
-				Pods:    pods,
-				Events:  events,
-				Now:     now,
-			})
-			if err != nil {
-				cr.Status = StatusError
-				cr.Error = fmt.Sprintf("evaluate compute-class: %v", err)
-				return cr
-			}
-			cr.ComputeClasses = ccSnap.Classes
-			cr.RankFindings = ccSnap.Findings
+	if runCC && ccServed {
+		ccfg := computeclass.DefaultConfig()
+		ccfg.Cluster = target.Name()
+		ccfg.TierCSignals = opts.ComputeClassTierC
+		ccSnap, err := computeclass.EvaluateSnapshot(ccfg, computeclass.SnapshotInput{
+			Classes: classes,
+			Nodes:   nodes,
+			Pods:    pods,
+			Events:  events,
+			Now:     now,
+		})
+		if err != nil {
+			cr.Status = StatusError
+			cr.Error = fmt.Sprintf("evaluate compute-class: %v", err)
+			return cr
 		}
+		cr.ComputeClasses = ccSnap.Classes
+		cr.RankFindings = ccSnap.Findings
 	}
 
 	return cr
@@ -505,4 +550,142 @@ func listComputeClasses(ctx context.Context, dyn dynamic.Interface) ([]*unstruct
 		out[i] = &list.Items[i]
 	}
 	return out, nil
+}
+
+type kubectlSnapshot struct {
+	nodes   []*corev1.Node
+	pods    []*corev1.Pod
+	events  []*corev1.Event
+	rs      []*appsv1.ReplicaSet
+	deps    []*appsv1.Deployment
+	stss    []*appsv1.StatefulSet
+	pvcs    []*corev1.PersistentVolumeClaim
+	pvs     []*corev1.PersistentVolume
+	classes []*unstructured.Unstructured
+}
+
+func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []string, runTopo, runCC bool) (*kubectlSnapshot, error) {
+	var baseArgs []string
+	if strings.TrimSpace(target.Kubeconfig) != "" {
+		baseArgs = append(baseArgs, "--kubeconfig="+strings.TrimSpace(target.Kubeconfig))
+	}
+	if strings.TrimSpace(target.Context) != "" {
+		baseArgs = append(baseArgs, "--context="+strings.TrimSpace(target.Context))
+	}
+
+	var out kubectlSnapshot
+
+	var nodeList corev1.NodeList
+	if err := kubectlGetJSON(ctx, baseArgs, "nodes", "", &nodeList); err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+	for i := range nodeList.Items {
+		n := &nodeList.Items[i]
+		_, _ = kube.Transform(n)
+		out.nodes = append(out.nodes, n)
+	}
+
+	for _, ns := range namespaces {
+		var podList corev1.PodList
+		if err := kubectlGetJSON(ctx, baseArgs, "pods", ns, &podList); err != nil {
+			return nil, fmt.Errorf("list pods: %w", err)
+		}
+		for i := range podList.Items {
+			p := &podList.Items[i]
+			_, _ = kube.Transform(p)
+			out.pods = append(out.pods, p)
+		}
+
+		var evList corev1.EventList
+		if err := kubectlGetJSON(ctx, baseArgs, "events", ns, &evList); err == nil {
+			for i := range evList.Items {
+				out.events = append(out.events, &evList.Items[i])
+			}
+		}
+
+		if runTopo {
+			var rsList appsv1.ReplicaSetList
+			if err := kubectlGetJSON(ctx, baseArgs, "replicasets", ns, &rsList); err != nil {
+				return nil, fmt.Errorf("list replicasets: %w", err)
+			}
+			for i := range rsList.Items {
+				r := &rsList.Items[i]
+				_, _ = kube.Transform(r)
+				out.rs = append(out.rs, r)
+			}
+
+			var depList appsv1.DeploymentList
+			if err := kubectlGetJSON(ctx, baseArgs, "deployments", ns, &depList); err == nil {
+				for i := range depList.Items {
+					d := &depList.Items[i]
+					_, _ = kube.Transform(d)
+					out.deps = append(out.deps, d)
+				}
+			}
+
+			var stsList appsv1.StatefulSetList
+			if err := kubectlGetJSON(ctx, baseArgs, "statefulsets", ns, &stsList); err == nil {
+				for i := range stsList.Items {
+					s := &stsList.Items[i]
+					_, _ = kube.Transform(s)
+					out.stss = append(out.stss, s)
+				}
+			}
+
+			var pvcList corev1.PersistentVolumeClaimList
+			if err := kubectlGetJSON(ctx, baseArgs, "persistentvolumeclaims", ns, &pvcList); err == nil {
+				for i := range pvcList.Items {
+					out.pvcs = append(out.pvcs, &pvcList.Items[i])
+				}
+			}
+		}
+	}
+
+	if runTopo {
+		var pvList corev1.PersistentVolumeList
+		if err := kubectlGetJSON(ctx, baseArgs, "persistentvolumes", "", &pvList); err == nil {
+			for i := range pvList.Items {
+				out.pvs = append(out.pvs, &pvList.Items[i])
+			}
+		}
+	}
+
+	if runCC {
+		var ccList unstructured.UnstructuredList
+		if err := kubectlGetJSON(ctx, baseArgs, "computeclasses.cloud.google.com", "", &ccList); err == nil {
+			for i := range ccList.Items {
+				out.classes = append(out.classes, &ccList.Items[i])
+			}
+		}
+	}
+
+	return &out, nil
+}
+
+func kubectlGetJSON(ctx context.Context, baseArgs []string, resource, ns string, into any) error {
+	args := make([]string, 0, len(baseArgs)+5)
+	args = append(args, baseArgs...)
+	args = append(args, "get", resource)
+	if ns == metav1.NamespaceAll {
+		args = append(args, "-A")
+	} else if ns != "" {
+		args = append(args, "-n", ns)
+	}
+	args = append(args, "-o", "json")
+
+	cmd := exec.CommandContext(ctx, "kubectl", args...) // #nosec G204 -- args are fixed resource nouns and validated kubeconfig/context flags
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return fmt.Errorf("kubectl get %s: %s", resource, msg)
+		}
+		return fmt.Errorf("kubectl get %s: %w", resource, err)
+	}
+	if err := json.Unmarshal(stdout.Bytes(), into); err != nil {
+		return fmt.Errorf("decode kubectl get %s: %w", resource, err)
+	}
+	return nil
 }
