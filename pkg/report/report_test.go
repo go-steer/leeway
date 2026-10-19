@@ -145,6 +145,334 @@ func TestCollect_MultiCluster(t *testing.T) {
 	}
 }
 
+func TestCollect_SeededD(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	client := buildSeededDCluster()
+
+	targets := []clusters.Cluster{
+		{Identity: clusters.Identity{Cluster: "seeded-d"}, Profile: "flag"},
+	}
+
+	rep, err := Collect(context.Background(), targets, Options{
+		Now:     now,
+		Timeout: 10 * time.Second,
+		ClientBuilder: func(c clusters.Cluster) (kubernetes.Interface, dynamic.Interface, error) {
+			return client, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(rep.Clusters) != 1 || rep.Clusters[0].Status != StatusOK {
+		t.Fatalf("Clusters = %+v, want 1 OK cluster", rep.Clusters)
+	}
+
+	byWorkload := make(map[string]leeway.Finding)
+	for _, f := range rep.Clusters[0].TopologyFindings {
+		if f.TopologyKey == corev1.LabelTopologyZone {
+			byWorkload[f.Subject.Name] = f
+		}
+	}
+
+	if _, bad := byWorkload["first-zone-sponge"]; bad {
+		t.Errorf("first-zone-sponge should not be flagged as topology drift (intentionally pinned to default-pool)")
+	}
+
+	// 1. zone-pinned-api (zonal-skew-scheduling)
+	apiFinding, ok := byWorkload["zone-pinned-api"]
+	if !ok {
+		t.Fatalf("expected topology finding for zone-pinned-api, got findings: %+v", byWorkload)
+	}
+	if apiFinding.SuspectedCause != leeway.CauseConstraintIgnored {
+		t.Errorf("zone-pinned-api SuspectedCause = %q, want %q", apiFinding.SuspectedCause, leeway.CauseConstraintIgnored)
+	}
+	if apiFinding.Remediation == nil || apiFinding.Remediation.Kind != leeway.RemediationManifestPatch {
+		t.Errorf("zone-pinned-api Remediation = %+v, want %q", apiFinding.Remediation, leeway.RemediationManifestPatch)
+	}
+
+	// 2. zone-bound-store (zonal-skew-volume)
+	storeFinding, ok := byWorkload["zone-bound-store"]
+	if !ok {
+		t.Fatalf("expected topology finding for zone-bound-store, got findings: %+v", byWorkload)
+	}
+	if storeFinding.SuspectedCause != leeway.CauseVolumePinning {
+		t.Errorf("zone-bound-store SuspectedCause = %q, want %q", storeFinding.SuspectedCause, leeway.CauseVolumePinning)
+	}
+	if storeFinding.Remediation == nil || storeFinding.Remediation.Kind != leeway.RemediationStorageTopology {
+		t.Errorf("zone-bound-store Remediation = %+v, want %q", storeFinding.Remediation, leeway.RemediationStorageTopology)
+	}
+
+	// 3. capacity-starved-worker (zonal-skew-capacity)
+	workerFinding, ok := byWorkload["capacity-starved-worker"]
+	if !ok {
+		t.Fatalf("expected topology finding for capacity-starved-worker, got findings: %+v", byWorkload)
+	}
+	if workerFinding.SuspectedCause != leeway.CauseCapacityShortfall {
+		t.Errorf("capacity-starved-worker SuspectedCause = %q, want %q", workerFinding.SuspectedCause, leeway.CauseCapacityShortfall)
+	}
+	if workerFinding.Remediation == nil || workerFinding.Remediation.Kind != leeway.RemediationClusterCapacity {
+		t.Errorf("capacity-starved-worker Remediation = %+v, want %q", workerFinding.Remediation, leeway.RemediationClusterCapacity)
+	}
+}
+
+func buildSeededDCluster() kubernetes.Interface {
+	nodeA := makeReadyNode("gke-seeded-d-default-pool-1", "us-central1-a", "us-central1", "", "", "e2-small")
+	nodeA.Labels["cloud.google.com/gke-nodepool"] = "default-pool"
+	nodeA.Labels["topology.gke.io/zone"] = "us-central1-a"
+	nodeA.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("940m")
+
+	nodeB := makeReadyNode("gke-seeded-d-second-zone-pool-1", "us-central1-b", "us-central1", "", "", "e2-standard-2")
+	nodeB.Labels["cloud.google.com/gke-nodepool"] = "second-zone-pool"
+	nodeB.Labels["topology.gke.io/zone"] = "us-central1-b"
+	nodeB.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("1930m")
+
+	isController := true
+	ns := "seeded-topology"
+
+	spongeRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "first-zone-sponge-rs",
+			Namespace: ns,
+			UID:       types.UID("rs-sponge"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "first-zone-sponge",
+				UID:        types.UID("dep-sponge"),
+				Controller: &isController,
+			}},
+		},
+	}
+	apiRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "zone-pinned-api-rs",
+			Namespace: ns,
+			UID:       types.UID("rs-api"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "zone-pinned-api",
+				UID:        types.UID("dep-api"),
+				Controller: &isController,
+			}},
+		},
+	}
+	workerRS := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "capacity-starved-worker-rs",
+			Namespace: ns,
+			UID:       types.UID("rs-worker"),
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "capacity-starved-worker",
+				UID:        types.UID("dep-worker"),
+				Controller: &isController,
+			}},
+		},
+	}
+
+	var objs []runtime.Object
+	objs = append(objs, nodeA, nodeB, spongeRS, apiRS, workerRS)
+
+	// 1. first-zone-sponge: 6 pods in us-central1-a via nodeSelector on gke-nodepool
+	for i := 0; i < 6; i++ {
+		objs = append(objs, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "first-zone-sponge-" + string(rune('a'+i)),
+				Namespace: ns,
+				UID:       types.UID("sponge-" + string(rune('a'+i))),
+				Labels:    map[string]string{"app": "first-zone-sponge"},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "first-zone-sponge-rs",
+					UID:        types.UID("rs-sponge"),
+					Controller: &isController,
+				}},
+			},
+			Spec: corev1.PodSpec{
+				NodeName:     nodeA.Name,
+				NodeSelector: map[string]string{"cloud.google.com/gke-nodepool": "default-pool"},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		})
+	}
+
+	// 2. zone-pinned-api: 2 pods in us-central1-a with conflicting zone nodeAffinity + zone TSC
+	for i := 0; i < 2; i++ {
+		objs = append(objs, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "zone-pinned-api-" + string(rune('a'+i)),
+				Namespace: ns,
+				UID:       types.UID("api-" + string(rune('a'+i))),
+				Labels:    map[string]string{"app": "zone-pinned-api"},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "zone-pinned-api-rs",
+					UID:        types.UID("rs-api"),
+					Controller: &isController,
+				}},
+			},
+			Spec: corev1.PodSpec{
+				NodeName: nodeA.Name,
+				Affinity: &corev1.Affinity{
+					NodeAffinity: &corev1.NodeAffinity{
+						RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+								MatchExpressions: []corev1.NodeSelectorRequirement{{
+									Key:      corev1.LabelTopologyZone,
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"us-central1-a"},
+								}},
+							}},
+						},
+					},
+				},
+				TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+					MaxSkew:           1,
+					TopologyKey:       corev1.LabelTopologyZone,
+					WhenUnsatisfiable: corev1.ScheduleAnyway,
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "zone-pinned-api"},
+					},
+				}},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		})
+	}
+
+	// 3. zone-bound-store: StatefulSet with 2 pods bound to GKE PD CSI zonal PVs (topology.gke.io/zone)
+	for i := 0; i < 2; i++ {
+		suffix := string(rune('0' + i))
+		pvcName := "data-zone-bound-store-" + suffix
+		pvName := "pv-zone-bound-store-" + suffix
+		objs = append(objs,
+			&corev1.PersistentVolumeClaim{
+				ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: ns},
+				Spec:       corev1.PersistentVolumeClaimSpec{VolumeName: pvName},
+			},
+			&corev1.PersistentVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: pvName},
+				Spec: corev1.PersistentVolumeSpec{
+					NodeAffinity: &corev1.VolumeNodeAffinity{
+						Required: &corev1.NodeSelector{
+							NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+								MatchExpressions: []corev1.NodeSelectorRequirement{{
+									Key:      "topology.gke.io/zone",
+									Operator: corev1.NodeSelectorOpIn,
+									Values:   []string{"us-central1-a"},
+								}},
+							}},
+						},
+					},
+				},
+			},
+			&corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "zone-bound-store-" + suffix,
+					Namespace: ns,
+					UID:       types.UID("store-" + suffix),
+					Labels:    map[string]string{"app": "zone-bound-store"},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "apps/v1",
+						Kind:       "StatefulSet",
+						Name:       "zone-bound-store",
+						UID:        types.UID("sts-store"),
+						Controller: &isController,
+					}},
+				},
+				Spec: corev1.PodSpec{
+					NodeName: nodeA.Name,
+					Volumes: []corev1.Volume{{
+						Name: "data",
+						VolumeSource: corev1.VolumeSource{
+							PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: pvcName},
+						},
+					}},
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+						MaxSkew:           1,
+						TopologyKey:       corev1.LabelHostname,
+						WhenUnsatisfiable: corev1.ScheduleAnyway,
+						LabelSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"app": "zone-bound-store"},
+						},
+					}},
+				},
+				Status: corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+		)
+	}
+
+	// 4. capacity-starved-worker: 1 Running pod in us-central1-b + 3 Pending Unschedulable pods
+	objs = append(objs, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "capacity-starved-worker-running",
+			Namespace: ns,
+			UID:       types.UID("worker-run-0"),
+			Labels:    map[string]string{"app": "capacity-starved-worker"},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "ReplicaSet",
+				Name:       "capacity-starved-worker-rs",
+				UID:        types.UID("rs-worker"),
+				Controller: &isController,
+			}},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeB.Name,
+			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+				MaxSkew:           1,
+				TopologyKey:       corev1.LabelTopologyZone,
+				WhenUnsatisfiable: corev1.DoNotSchedule,
+				LabelSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{"app": "capacity-starved-worker"},
+				},
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	})
+	for i := 0; i < 3; i++ {
+		objs = append(objs, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "capacity-starved-worker-pending-" + string(rune('a'+i)),
+				Namespace: ns,
+				UID:       types.UID("worker-pend-" + string(rune('a'+i))),
+				Labels:    map[string]string{"app": "capacity-starved-worker"},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       "capacity-starved-worker-rs",
+					UID:        types.UID("rs-worker"),
+					Controller: &isController,
+				}},
+			},
+			Spec: corev1.PodSpec{
+				TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+					MaxSkew:           1,
+					TopologyKey:       corev1.LabelTopologyZone,
+					WhenUnsatisfiable: corev1.DoNotSchedule,
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "capacity-starved-worker"},
+					},
+				}},
+			},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodPending,
+				Conditions: []corev1.PodCondition{{
+					Type:    corev1.PodScheduled,
+					Status:  corev1.ConditionFalse,
+					Reason:  corev1.PodReasonUnschedulable,
+					Message: "0/2 nodes are available: 1 Insufficient cpu, 1 node(s) didn't match pod topology spread constraints.",
+				}},
+			},
+		})
+	}
+
+	return kubefake.NewSimpleClientset(objs...)
+}
+
 func buildSkewedCluster() (kubernetes.Interface, dynamic.Interface) {
 	nodes := []runtime.Object{
 		makeReadyNode("node-a1", "us-east1-a", "us-east1", "gold", "0", "n2-standard-4"),

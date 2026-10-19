@@ -18,6 +18,8 @@ import (
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/go-steer/leeway/pkg/leeway"
 )
 
 // Constraints is the placement half of a subject's intent: the fields of an
@@ -255,6 +257,83 @@ func compareInt(req *corev1.NodeSelectorRequirement, value string, present bool)
 func contains(values []string, v string) bool {
 	for _, s := range values {
 		if s == v {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutKey returns a copy of c with any NodeSelector or RequiredNodeAffinity
+// requirements on key (or its zone/region aliases) removed, and reports whether
+// anything was removed.
+func (c Constraints) withoutKey(key leeway.TopologyKey) (Constraints, bool) {
+	out := c
+	changed := false
+
+	if len(c.NodeSelector) > 0 {
+		for k := range c.NodeSelector {
+			if sameTopologyAxis(k, key) {
+				if !changed {
+					cloned := make(map[string]string, len(c.NodeSelector))
+					for mk, mv := range c.NodeSelector {
+						cloned[mk] = mv
+					}
+					out.NodeSelector = cloned
+				}
+				delete(out.NodeSelector, k)
+				changed = true
+			}
+		}
+	}
+
+	if c.RequiredNodeAffinity != nil {
+		var keptTerms []corev1.NodeSelectorTerm
+		affinityChanged := false
+		unconstrainedTerm := false
+		for _, term := range c.RequiredNodeAffinity.NodeSelectorTerms {
+			if len(term.MatchExpressions) == 0 {
+				keptTerms = append(keptTerms, term)
+				continue
+			}
+			var keptReqs []corev1.NodeSelectorRequirement
+			removedFromTerm := false
+			for _, req := range term.MatchExpressions {
+				if sameTopologyAxis(req.Key, key) {
+					removedFromTerm = true
+					affinityChanged = true
+				} else {
+					keptReqs = append(keptReqs, req)
+				}
+			}
+			if removedFromTerm && len(keptReqs) == 0 && len(term.MatchFields) == 0 {
+				unconstrainedTerm = true
+			} else {
+				tCopy := term
+				tCopy.MatchExpressions = keptReqs
+				keptTerms = append(keptTerms, tCopy)
+			}
+		}
+		if affinityChanged {
+			changed = true
+			if unconstrainedTerm || len(keptTerms) == 0 {
+				out.RequiredNodeAffinity = nil
+			} else {
+				out.RequiredNodeAffinity = &corev1.NodeSelector{
+					NodeSelectorTerms: keptTerms,
+				}
+			}
+		}
+	}
+
+	return out, changed
+}
+
+func sameTopologyAxis(labelKey string, axis leeway.TopologyKey) bool {
+	if labelKey == string(axis) {
+		return true
+	}
+	for _, alias := range volumePinningAliases(axis) {
+		if labelKey == alias {
 			return true
 		}
 	}

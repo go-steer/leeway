@@ -332,3 +332,25 @@ func TestResolve_EveryLearnedAxisLandsAndAHoleIsSkipped(t *testing.T) {
 		}
 	}
 }
+
+func TestResolve_ConflictingNodeAffinityOnSpreadAxisWidensEligibleDomains(t *testing.T) {
+	pod := tscPod(zoneSpread(1, corev1.ScheduleAnyway))
+	pod.Spec.Affinity = &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      string(zoneKey),
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{"zone-a"},
+					}},
+				}},
+			},
+		},
+	}
+
+	res := Resolve(pod, threeZones(t), ResolveConfig{ClusterDefaults: noClusterDefaults})
+	if got, want := domains(res.Eligible[zoneKey]), []string{"zone-a", "zone-b", "zone-c"}; !slices.Equal(got, want) {
+		t.Errorf("eligible zones = %v, want %v when required nodeAffinity on the spread axis contradicts the spread constraint", got, want)
+	}
+}

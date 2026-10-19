@@ -135,10 +135,60 @@ func ScoreAxis(key leeway.TopologyKey, intent *leeway.Intent, eligible leeway.El
 	// parameterising it, and reading the weighting straight off the intent
 	// would apportion a declared 40/40/20 as even thirds and then report the
 	// difference as drift.
-	ev.Apportionment = leeway.Apportion(n, eligible.WeightsFor(intent), capsFor(intent, eligible))
+	unsched := unschedulableCount(dist)
+	targetN := n
+	if unsched > 0 && n > 0 && len(eligible.Domains) >= 2 && hasEmptyDomain(actual) && n+unsched >= t.MinReplicasForScoring {
+		if m := int64(len(eligible.Domains)); targetN < m {
+			targetN = m
+		}
+	}
+	ev.Apportionment = leeway.Apportion(targetN, eligible.WeightsFor(intent), capsFor(intent, eligible))
 	ev.Scores = leeway.Score(eligible.Domains, actual, ev.Apportionment, maxSkew, t)
+	if unsched > 0 && n > 0 && len(eligible.Domains) >= 2 && hasEmptyDomain(actual) && n+unsched >= t.MinReplicasForScoring {
+		applyUnschedulableShortfall(&ev.Scores, unsched, targetN, maxSkew, t)
+	}
 	ev.Verdict = ev.Scores.JudgeTransient(intent, t, sup)
 	return ev
+}
+
+func unschedulableCount(dist *leeway.Distribution) int64 {
+	if dist == nil {
+		return 0
+	}
+	var total int64
+	for _, c := range dist.ByDomain {
+		if c != nil {
+			total += c.Unschedulable
+		}
+	}
+	return total
+}
+
+func hasEmptyDomain(actual []int64) bool {
+	for _, a := range actual {
+		if a == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func applyUnschedulableShortfall(s *leeway.Scores, unsched, targetN int64, maxSkew *int32, t leeway.Thresholds) {
+	if !s.Evaluable && s.Gate == leeway.GateBelowMinReplicas {
+		s.Gate = leeway.GateNone
+		s.Evaluable = true
+	}
+	floor := s.MinAchievableSkew
+	if maxSkew != nil && int64(*maxSkew) > floor {
+		floor = int64(*maxSkew)
+	}
+	if effExcess := (s.ObservedSkew + unsched) - floor; effExcess > s.ExcessSkew && effExcess > 0 {
+		s.ExcessSkew = effExcess
+	}
+	if s.Relocation < 1 && targetN > 0 {
+		s.Relocation = 1
+		s.Drift = float64(s.Relocation) / float64(targetN)
+	}
 }
 
 // capsFor turns an intent's §5.1 per-domain ceiling into the §7.2 caps slice

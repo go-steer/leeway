@@ -133,6 +133,10 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 		now = time.Now().UTC()
 	}
 	cfg.Now = func() time.Time { return now }
+	if cfg.Thresholds == nil {
+		t := leeway.ReportThresholds()
+		cfg.Thresholds = &t
+	}
 
 	s := New(nil, cfg)
 
@@ -258,7 +262,7 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 				FirstSeenAt: now,
 				Since:       now,
 			}, snap[ev.Key], now)
-			if !delivery.Signal {
+			if !delivery.Signal && (sub.Kind == leeway.SubjectNodeGroup || f.SuspectedCause == leeway.CauseUnknown) {
 				continue
 			}
 			res.Findings = append(res.Findings, f)

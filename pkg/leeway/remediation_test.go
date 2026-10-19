@@ -144,6 +144,40 @@ func TestSuggestRemediation_RolloutBiasWithoutMatchLabelKeysRecommendsManifestPa
 	}
 }
 
+func TestSuggestRemediation_ConflictingNodeAffinityRecommendsManifestPatch(t *testing.T) {
+	t.Parallel()
+
+	maxSkew := int32(1)
+	f := Finding{
+		Kind:           KindPlacementDrift,
+		Subject:        SubjectRef{Kind: SubjectDeployment, Namespace: "seeded-topology", Name: "zone-pinned-api"},
+		TopologyKey:    "topology.kubernetes.io/zone",
+		Tier:           TierB.String(),
+		Severity:       "warning",
+		SuspectedCause: CauseConstraintIgnored,
+		Intent: &FindingIntent{
+			Source:     SourceTopologySpreadConstraint.String(),
+			Confidence: ConfidenceDeclared.String(),
+			MaxSkew:    &maxSkew,
+			Evidence: []string{
+				"topologySpreadConstraints[0]: topologyKey=topology.kubernetes.io/zone maxSkew=1 whenUnsatisfiable=ScheduleAnyway labelSelector=app=zone-pinned-api",
+				"conflicting nodeAffinity/nodeSelector on topology.kubernetes.io/zone restricts placement to 1 domain(s), contradicting the spread constraint on topology.kubernetes.io/zone",
+			},
+		},
+	}
+
+	got := SuggestRemediation(f, map[string]string{"app": "zone-pinned-api"})
+	if got == nil {
+		t.Fatal("SuggestRemediation returned nil, want manifest_patch")
+	}
+	if got.Kind != RemediationManifestPatch {
+		t.Errorf("Kind = %q, want %q", got.Kind, RemediationManifestPatch)
+	}
+	if !strings.Contains(got.Summary, "conflicting nodeAffinity/nodeSelector") {
+		t.Errorf("Summary = %q, want mention of conflicting nodeAffinity/nodeSelector", got.Summary)
+	}
+}
+
 func TestSuggestRemediation_InfrastructureAndStorageCausesNeverPatchWorkloadYAML(t *testing.T) {
 	t.Parallel()
 

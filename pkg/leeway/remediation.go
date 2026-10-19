@@ -157,6 +157,23 @@ func SuggestRemediation(f Finding, selectorLabels map[string]string) *FindingRem
 	}
 
 	// 4. Workload / scheduler causes (constraint_ignored, rollout_bias, unknown).
+	if f.Intent != nil && evidenceHasConflictingNodeAffinity(f.Intent.Evidence) {
+		return &FindingRemediation{
+			Kind: RemediationManifestPatch,
+			Summary: fmt.Sprintf(
+				"Remove the conflicting nodeAffinity/nodeSelector on %s from %s so its topologySpreadConstraint can spread replicas across eligible domains.",
+				f.TopologyKey, f.Subject,
+			),
+			Command: rolloutRestartCommand(f.Subject),
+			YAML: renderTopologySpreadPatch(
+				f.Subject,
+				f.TopologyKey,
+				maxSkewOrOne(f.Intent),
+				whenUnsatisfiableFromEvidence(f.Intent),
+				selectorLabels,
+			),
+		}
+	}
 	if needsExplicitSpreadConstraint(f.Intent) {
 		return &FindingRemediation{
 			Kind: RemediationManifestPatch,
@@ -235,6 +252,15 @@ func needsExplicitSpreadConstraint(in *FindingIntent) bool {
 func evidenceHasMatchLabelKeys(evidence []string) bool {
 	for _, e := range evidence {
 		if strings.Contains(e, "matchLabelKeys=") {
+			return true
+		}
+	}
+	return false
+}
+
+func evidenceHasConflictingNodeAffinity(evidence []string) bool {
+	for _, e := range evidence {
+		if strings.Contains(e, "conflicting nodeAffinity/nodeSelector") {
 			return true
 		}
 	}

@@ -47,9 +47,12 @@ func VolumePins(lookup VolumeLookup, keys []leeway.TopologyKey) PinPredicate {
 	if lookup == nil {
 		return nil
 	}
-	pinning := make(map[string]struct{}, len(keys)+1)
+	pinning := make(map[string]struct{}, len(keys)+6)
 	for _, k := range keys {
 		pinning[string(k)] = struct{}{}
+		for _, alias := range volumePinningAliases(k) {
+			pinning[alias] = struct{}{}
+		}
 	}
 	// The hostname is always a pinning key, whether or not it is scored. A
 	// volume that admits exactly one node admits exactly one domain on every
@@ -59,6 +62,34 @@ func VolumePins(lookup VolumeLookup, keys []leeway.TopologyKey) PinPredicate {
 
 	return func(pod *corev1.Pod) bool {
 		return volumePinned(pod, lookup, pinning)
+	}
+}
+
+// volumePinningAliases returns cloud-provider CSI and legacy topology label
+// aliases for a scored axis. Managed CSI drivers (such as GKE PD CSI's
+// `topology.gke.io/zone`, AWS EBS CSI's `topology.ebs.csi.aws.com/zone`, and
+// Azure Disk CSI's `topology.disk.csi.azure.com/zone`) stamp their own
+// provider-specific zone key on PersistentVolume.Spec.NodeAffinity rather than
+// `topology.kubernetes.io/zone`, even though those labels map 1:1 to the node's
+// zone failure domain.
+func volumePinningAliases(key leeway.TopologyKey) []string {
+	switch string(key) {
+	case corev1.LabelTopologyZone, corev1.LabelFailureDomainBetaZone:
+		return []string{
+			corev1.LabelTopologyZone,
+			corev1.LabelFailureDomainBetaZone,
+			"topology.gke.io/zone",
+			"topology.ebs.csi.aws.com/zone",
+			"topology.disk.csi.azure.com/zone",
+		}
+	case corev1.LabelTopologyRegion, corev1.LabelFailureDomainBetaRegion:
+		return []string{
+			corev1.LabelTopologyRegion,
+			corev1.LabelFailureDomainBetaRegion,
+			"topology.gke.io/region",
+		}
+	default:
+		return nil
 	}
 }
 

@@ -4,6 +4,15 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-19
+
+### Added
+
+- **Snapshot Report Thresholds & Causal Tier-C Surfacing (`pkg/leeway/score.go`, `pkg/sources/topologydrift/snapshot.go`)**: Added `ReportThresholds()` (`MinReplicasForScoring: 2`, `MinRelocationSmallN: 1`) for one-shot `leeway report` evaluations and surfaced breached Tier-C workload findings when positive causal attribution (`volume_pinning`, `domain_capacity_shortfall`, etc.) is present.
+- **Conflicting `nodeAffinity` / `nodeSelector` Detection on Spread Axes (`pkg/sources/topologydrift/predicate.go`, `pkg/sources/topologydrift/resolve.go`, `pkg/leeway/remediation.go`)**: Detected workloads that declare a `Spread` `topologySpreadConstraint` on an axis while simultaneously pinning placement to a single domain on that same axis via `nodeSelector` or required `nodeAffinity`, emitting `manifest_patch` remediation.
+- **Cloud CSI Volume Topology Label Aliases (`pkg/sources/topologydrift/pinning.go`)**: Recognised provider-specific CSI volume node-affinity keys (`topology.gke.io/zone`, `topology.ebs.csi.aws.com/zone`, `topology.disk.csi.azure.com/zone`, `topology.gke.io/region`) when scoring standard zone/region axes.
+- **Unschedulable Shortfall Scoring for `DoNotSchedule` Spread Constraints (`pkg/sources/topologydrift/score.go`)**: Accounted for `Pending` (`Unschedulable`) pods blocked by a `DoNotSchedule` spread constraint and single-zone capacity starvation when only 1–2 replicas are `Running`.
+
 ## [0.1.2] - 2026-10-19
 
 ### Added

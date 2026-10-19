@@ -164,6 +164,25 @@ func Resolve(pod *corev1.Pod, inv *Inventory, cfg ResolveConfig) Resolution {
 		}
 
 		eligible := leeway.EligibleDomains(inv.NodeViews(key, constraints), opts)
+		if intent != nil &&
+			intent.Source == leeway.SourceTopologySpreadConstraint &&
+			intent.Mode == leeway.ModeSpread &&
+			intent.Policies.NodeAffinityPolicy == "" &&
+			len(eligible.Domains) <= 1 {
+			if stripped, changed := constraints.withoutKey(key); changed {
+				unconstrained := leeway.EligibleDomains(inv.NodeViews(key, stripped), opts)
+				if len(unconstrained.Domains) > len(eligible.Domains) {
+					intent.Evidence = append(intent.Evidence, leeway.EvidenceItem{
+						Source: intent.Source,
+						Detail: fmt.Sprintf(
+							"conflicting nodeAffinity/nodeSelector on %s restricts placement to %d domain(s), contradicting the spread constraint on %s",
+							key, len(eligible.Domains), key,
+						),
+					})
+					eligible = unconstrained
+				}
+			}
+		}
 		res.Eligible[key] = eligible
 		if intent != nil {
 			intent.EligibleDomains = sets.New(eligible.Domains...)

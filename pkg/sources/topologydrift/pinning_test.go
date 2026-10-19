@@ -94,6 +94,11 @@ func TestVolumePins(t *testing.T) {
 		pv:   affinityPV(term(zone, corev1.NodeSelectorOpIn, "us-central1-a")),
 		want: true,
 	}, {
+		name: "gke pd csi zonal disk (topology.gke.io/zone)",
+		pod:  pvcPod("db-0", "data-db-0"),
+		pv:   affinityPV(term("topology.gke.io/zone", corev1.NodeSelectorOpIn, "us-central1-a")),
+		want: true,
+	}, {
 		// Regional PD: two zones out of three is still a volume its pod
 		// cannot be rebalanced away from.
 		name: "regional disk naming two zones",

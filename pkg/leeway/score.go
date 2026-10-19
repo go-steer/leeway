@@ -46,6 +46,20 @@ func DefaultThresholds() Thresholds {
 	}
 }
 
+// ReportThresholds returns the thresholds used by one-shot snapshot evaluations
+// (`leeway report`). It lowers MinReplicasForScoring to 2 and MinRelocationSmallN
+// to 1 so 2-replica HA workloads stacked in a single failure domain (actual=[2,0],
+// drift=0.50, maxDomainShare=1.00) are surfaced in point-in-time audits.
+func ReportThresholds() Thresholds {
+	return Thresholds{
+		MinReplicasForScoring: 2,
+		SmallNThreshold:       10,
+		MinRelocationSmallN:   1,
+		Drift:                 0.2,
+		MaxDomainShare:        0.5,
+	}
+}
+
 // GateReason explains why a subject was not evaluated for drift.
 type GateReason uint8
 
