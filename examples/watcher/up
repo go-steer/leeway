@@ -29,7 +29,7 @@ require_examples_context
 if [[ -z "${LEEWAY_IMAGE:-}" ]] && is_kind_context && docker image inspect leeway:examples-dev >/dev/null 2>&1; then
   LEEWAY_IMAGE="leeway:examples-dev"
 fi
-image="${LEEWAY_IMAGE:-ghcr.io/go-steer/leeway:v0.1.1}"
+image="${LEEWAY_IMAGE:-ghcr.io/go-steer/leeway:v0.1.2}"
 root="$(repo_root)"
 
 echo "▸ namespace + CRDs"

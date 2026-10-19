@@ -42,7 +42,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: leeway
-          image: ghcr.io/go-steer/leeway:v0.1.1
+          image: ghcr.io/go-steer/leeway:v0.1.2
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

@@ -4,6 +4,16 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-19
+
+### Added
+
+- **Deterministic Remediation Recommendations (`pkg/leeway/remediation.go`)**: Added `Finding.Remediation` (`manifest_patch`, `rollout_restart`, `cluster_capacity`, `cluster_nodes`, `storage_topology`) with ready-to-apply `topologySpreadConstraints` YAML snippets and `kubectl rollout restart` commands on topology-drift findings.
+
+### Changed
+
+- **Informer & Report Object Trimming (`pkg/kube/transform.go`, `pkg/report/collector.go`)**: Stripped `spec.containers`, `spec.initContainers`, `spec.ephemeralContainers`, `status.containerStatuses`, `status.initContainerStatuses`, `status.ephemeralContainerStatuses`, and non-`Ready` node conditions on ingest across both `leeway watch` and `leeway report`, reducing per-Pod memory footprint by ~5–8x.
+
 ## [0.1.1] - 2026-10-16
 
 ### Added
