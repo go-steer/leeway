@@ -91,216 +91,60 @@ var sharedTransformRegistry = []fieldEntry{
 	},
 	{
 		Kind:   "Pod",
-		Path:   "spec.containers[].env[].value",
+		Path:   "spec.containers",
 		Action: fieldStripped,
-		Why: "The literal resolved value of an environment variable, which is where " +
-			"secret material lands in a Pod. This is the field the transform exists " +
-			"for: spike S9 checked every informer-reachable reader and not one of " +
-			"them reads Value — they read Name, ValueFrom, or both.",
+		Why:    "No leeway source reads container definitions; dropping the slice wholesale prevents secret env/arg values from entering process memory and shrinks cached Pods.",
 	},
 	{
 		Kind:   "Pod",
-		Path:   "spec.containers[].command",
+		Path:   "spec.initContainers",
 		Action: fieldStripped,
-		Why:    "Not read by any consumer, and a common place for credentials passed as flags.",
+		Why:    "Same reasoning as spec.containers; no leeway source reads init container specs.",
 	},
 	{
 		Kind:   "Pod",
-		Path:   "spec.containers[].args",
+		Path:   "spec.ephemeralContainers",
 		Action: fieldStripped,
-		Why:    "Not read by any consumer, and a common place for credentials passed as flags.",
+		Why:    "Same reasoning as spec.containers; debug containers can carry literal secrets via `kubectl debug --env` and are not read by any leeway source.",
 	},
 	{
 		Kind:   "Pod",
-		Path:   "spec.containers[].lifecycle",
+		Path:   "status.containerStatuses",
 		Action: fieldStripped,
-		Why:    "Lifecycle hooks are not read by any consumer and can embed command lines.",
+		Why:    "Per-container state is the largest sub-structure on a running Pod and is not read by topology-drift or compute-class (which use Pod-level Phase and Conditions).",
 	},
 	{
 		Kind:   "Pod",
-		Path:   "spec.containers[].livenessProbe",
+		Path:   "status.initContainerStatuses",
 		Action: fieldStripped,
-		Why:    "Probe definitions are not read by any consumer; probe RESULTS are read, and those live in status.containerStatuses, which is preserved.",
+		Why:    "Same reasoning as status.containerStatuses.",
 	},
 	{
 		Kind:   "Pod",
-		Path:   "spec.containers[].readinessProbe",
+		Path:   "status.ephemeralContainerStatuses",
 		Action: fieldStripped,
-		Why:    "Probe definitions are not read by any consumer; probe RESULTS are read, and those live in status.containerStatuses, which is preserved.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.containers[].startupProbe",
-		Action: fieldStripped,
-		Why:    "Probe definitions are not read by any consumer; probe RESULTS are read, and those live in status.containerStatuses, which is preserved.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.initContainers[].env[].value",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].env[].value; init containers carry secrets just as readily.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.initContainers[].command",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].command.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.initContainers[].args",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].args.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.initContainers[].lifecycle",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].lifecycle.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.initContainers[].livenessProbe",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].livenessProbe.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.initContainers[].readinessProbe",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].readinessProbe.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.initContainers[].startupProbe",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].startupProbe.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].env[].value",
-		Action: fieldStripped,
-		Why: "An ephemeral container has the same shape as a regular one, so " +
-			"`kubectl debug --env` writes literal secret values straight into the " +
-			"cache. The leeway design's S9 table did not cover ephemeral " +
-			"containers; stripping them closes the hole the other two strips leave.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].command",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].command.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].args",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].args.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].lifecycle",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].lifecycle.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].livenessProbe",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].livenessProbe.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].readinessProbe",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].readinessProbe.",
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].startupProbe",
-		Action: fieldStripped,
-		Why:    "Same reasoning as spec.containers[].startupProbe.",
+		Why:    "Same reasoning as status.containerStatuses.",
 	},
 
 	// --------------------------------------------------------------- Pod: preserved
 	{
 		Kind:   "Pod",
-		Path:   "spec.containers[].env[].name",
-		Action: fieldPreserved,
-		Why:    "The variable NAME is how two checks identify a binding without ever seeing its value.",
-		Readers: []string{
-			"pkg/checks/state/edges_checks.go:391 — pairs Name with ValueFrom to build config/secret edges",
-			"pkg/checks/state/wi.go:330 — reads Name alone for the Workload Identity check",
-		},
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.containers[].env[].valueFrom",
-		Action: fieldPreserved,
-		Why: "The REFERENCE to a ConfigMap or Secret. This is how pkg/graph builds " +
-			"config and secret edges, and stripping it empties the graph silently " +
-			"because a nil slice is a valid empty slice.",
-		Readers: []string{
-			"pkg/graph/derive.go:160 — ConfigMapKeyRef/SecretKeyRef to derive edges",
-			"pkg/graph/changes.go:273 — same, on the change path",
-			"pkg/checks/state/edges_checks.go:391 — dangling-reference edge checks",
-		},
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.containers[].envFrom",
-		Action: fieldPreserved,
-		Why:    "Bulk ConfigMap/Secret references, the other half of the graph's edge derivation.",
-		Readers: []string{
-			"pkg/graph/derive.go:169 — ConfigMapRef/SecretRef",
-			"pkg/graph/changes.go:282 — same, on the change path",
-			"pkg/checks/state/edges_checks.go:404 — dangling-reference edge checks",
-		},
-	},
-	{
-		Kind:   "Pod",
-		Path:   "spec.ephemeralContainers[].name",
-		Action: fieldPreserved,
-		Why: "pkg/checks/logs enumerates container names to decide which logs it can " +
-			"fetch, and it is informer-reachable through the enricher. This is why " +
-			"the ephemeral-container strip nulls the common fields individually " +
-			"rather than dropping the slice.",
-		Readers: []string{
-			"pkg/checks/logs/fetch.go:183 — enumerates ephemeral container names",
-		},
-	},
-	{
-		Kind:   "Pod",
-		Path:   "status.containerStatuses",
-		Action: fieldPreserved,
-		Why:    "Live container state. Four informer-reachable consumers read it; it is the largest preserved item and the main reason a trimmed pod is well above the 1.5 KiB the standalone design assumed.",
-		Readers: []string{
-			"pkg/sources/objectstate/podclearance.go:349 — pod clearance",
-			"pkg/sources/rollout/rollout.go:501 — rollout progress",
-			"pkg/checks/delta/pods.go:98 — per-container delta checks",
-			"pkg/checks/inventory/render.go:77 — inventory rendering",
-		},
-	},
-	{
-		Kind:   "Pod",
-		Path:   "status.initContainerStatuses",
-		Action: fieldPreserved,
-		Why:    "Same as status.containerStatuses, for init containers.",
-		Readers: []string{
-			"pkg/sources/rollout/rollout.go:501 — rollout progress",
-			"pkg/checks/delta/pods.go:95 — per-container delta checks",
-		},
-	},
-	{
-		Kind:   "Pod",
 		Path:   "status.phase",
 		Action: fieldPreserved,
-		Why: "objectstate's eviction-burst detector reads Phase==Failed. This entry " +
-			"also guards the §6.1 field selector, which excludes Succeeded " +
-			"server-side but must NOT exclude Failed — spike S9 caught that as a " +
-			"proposed change that would have deleted eviction detection with no error.",
+		Why:    "Both topology-drift and compute-class ignore terminal (Succeeded/Failed) pods via podTerminal().",
 		Readers: []string{
-			"pkg/sources/objectstate/objectstate.go:1220 — podEvicted() reads Phase==Failed && Reason==Evicted",
+			"pkg/sources/topologydrift/state.go:702 — podTerminal() excludes Succeeded and Failed pods",
+			"pkg/sources/computeclass/state.go:542 — podTerminal() excludes Succeeded and Failed pods",
+		},
+	},
+	{
+		Kind:   "Pod",
+		Path:   "status.conditions",
+		Action: fieldPreserved,
+		Why:    "PodScheduled and PodReady conditions drive pending/unschedulable attribution and active replica counting.",
+		Readers: []string{
+			"pkg/sources/topologydrift/state.go:709 — podUnschedulable() and podReady() inspect PodScheduled and PodReady",
+			"pkg/sources/computeclass/state.go:549 — podUnschedulable() inspects PodScheduled=False/Unschedulable",
 		},
 	},
 
@@ -348,7 +192,7 @@ var sharedTransformRegistry = []fieldEntry{
 		Kind:   "Node",
 		Path:   "status.conditions",
 		Action: fieldStripped,
-		Why:    "Filtered, not dropped: reduced to Ready + MemoryPressure + DiskPressure + PIDPressure. Other informational/custom conditions (e.g. NetworkUnavailable, KernelDeadlock) are not read on the watch path.",
+		Why:    "Filtered, not dropped: reduced to Ready. Other node conditions (e.g. MemoryPressure, DiskPressure, PIDPressure, NetworkUnavailable) are not read by any leeway source.",
 	},
 
 	// -------------------------------------------------------------- Node: preserved
@@ -361,7 +205,7 @@ var sharedTransformRegistry = []fieldEntry{
 			"the provider noise the annotation filter exists to drop — dropping it " +
 			"would silently disable preference-rank tracking with no error anywhere.",
 		Readers: []string{
-			"pkg/sources/compute-class — rank resolution, docs/leeway-design.md §7.7.2",
+			"pkg/sources/computeclass — rank resolution, docs/leeway-design.md §7.7.2",
 		},
 	},
 	{
@@ -370,16 +214,7 @@ var sharedTransformRegistry = []fieldEntry{
 		Action: fieldPreserved,
 		Why:    "Node readiness gates whether a domain counts as available.",
 		Readers: []string{
-			"pkg/sources/topology-drift — domain inventory, docs/leeway-design.md §6.1",
-		},
-	},
-	{
-		Kind:   "Node",
-		Path:   "status.conditions[MemoryPressure,DiskPressure,PIDPressure]",
-		Action: fieldPreserved,
-		Why:    "Node pressure conditions drive objectstate.node_pressure signals, eviction-burst severity escalation, and node pressure clearance.",
-		Readers: []string{
-			"pkg/sources/objectstate — nodePressure / eviction escalation / nodeclearance",
+			"pkg/sources/topologydrift — domain inventory, docs/leeway-design.md §6.1",
 		},
 	},
 	{
@@ -388,7 +223,7 @@ var sharedTransformRegistry = []fieldEntry{
 		Action: fieldPreserved,
 		Why:    "Capacity weighting for node-group subjects.",
 		Readers: []string{
-			"pkg/sources/topology-drift — capacity weighting, docs/leeway-design.md §6.1",
+			"pkg/sources/topologydrift — capacity weighting, docs/leeway-design.md §6.1",
 		},
 	},
 	{
@@ -397,7 +232,7 @@ var sharedTransformRegistry = []fieldEntry{
 		Action: fieldPreserved,
 		Why:    "Eligibility: a node whose taints a pod does not tolerate is not an eligible domain, and GKE auto-injects compute-class and GPU taints that make this non-obvious.",
 		Readers: []string{
-			"pkg/sources/topology-drift — eligible-domain computation, docs/leeway-design.md §7.1",
+			"pkg/sources/topologydrift — eligible-domain computation, docs/leeway-design.md §7.1",
 		},
 	},
 }
@@ -419,7 +254,7 @@ func init() {
 }
 
 func workloadRegistryEntries(kind, prefix string) []fieldEntry {
-	entries := []fieldEntry{
+	return []fieldEntry{
 		{
 			Kind:   kind,
 			Path:   "metadata.managedFields",
@@ -440,79 +275,21 @@ func workloadRegistryEntries(kind, prefix string) []fieldEntry {
 		},
 		{
 			Kind:   kind,
-			Path:   prefix + ".spec.containers[].env[].name",
-			Action: fieldPreserved,
-			Why:    "Preserved so graph derivation and state checks can inspect template env bindings without retaining literal secrets.",
-			Readers: []string{
-				"pkg/graph/derive.go — template config/secret edge derivation",
-				"pkg/sources/workload — workload controller listers",
-			},
+			Path:   prefix + ".spec.containers",
+			Action: fieldStripped,
+			Why:    "Container specs on workload templates carry embedded secrets and are not read by any leeway source.",
 		},
 		{
 			Kind:   kind,
-			Path:   prefix + ".spec.containers[].env[].valueFrom",
-			Action: fieldPreserved,
-			Why:    "Preserved so graph derivation can resolve ConfigMapKeyRef and SecretKeyRef edges on workload templates.",
-			Readers: []string{
-				"pkg/graph/derive.go — template ConfigMapKeyRef/SecretKeyRef edge derivation",
-			},
+			Path:   prefix + ".spec.initContainers",
+			Action: fieldStripped,
+			Why:    "InitContainer specs on workload templates carry embedded secrets and are not read by any leeway source.",
 		},
 		{
 			Kind:   kind,
-			Path:   prefix + ".spec.containers[].envFrom",
-			Action: fieldPreserved,
-			Why:    "Preserved so graph derivation can resolve bulk ConfigMapRef and SecretRef edges on workload templates.",
-			Readers: []string{
-				"pkg/graph/derive.go — template ConfigMapRef/SecretRef edge derivation",
-			},
+			Path:   prefix + ".spec.ephemeralContainers",
+			Action: fieldStripped,
+			Why:    "EphemeralContainer specs on workload templates are not read by any leeway source.",
 		},
 	}
-	for _, slice := range []string{"containers", "initContainers", "ephemeralContainers"} {
-		base := prefix + ".spec." + slice + "[]"
-		entries = append(entries,
-			fieldEntry{
-				Kind:   kind,
-				Path:   base + ".env[].value",
-				Action: fieldStripped,
-				Why:    "Literal environment variable values on workload templates carry embedded secrets and are never read by watch consumers.",
-			},
-			fieldEntry{
-				Kind:   kind,
-				Path:   base + ".command",
-				Action: fieldStripped,
-				Why:    "Container command lines on workload templates can carry credentials and are not read by watch consumers.",
-			},
-			fieldEntry{
-				Kind:   kind,
-				Path:   base + ".args",
-				Action: fieldStripped,
-				Why:    "Container argument lists on workload templates can carry credentials and are not read by watch consumers.",
-			},
-			fieldEntry{
-				Kind:   kind,
-				Path:   base + ".lifecycle",
-				Action: fieldStripped,
-				Why:    "Container lifecycle hooks on workload templates are not read by watch consumers.",
-			},
-			fieldEntry{
-				Kind:   kind,
-				Path:   base + ".livenessProbe",
-				Action: fieldStripped,
-				Why:    "Probe definitions on workload templates are not read by watch consumers.",
-			},
-			fieldEntry{
-				Kind:   kind,
-				Path:   base + ".readinessProbe",
-				Action: fieldStripped,
-				Why:    "Probe definitions on workload templates are not read by watch consumers.",
-			},
-			fieldEntry{
-				Kind:   kind,
-				Path:   base + ".startupProbe",
-				Action: fieldStripped,
-				Why:    "Probe definitions on workload templates are not read by watch consumers.",
-			},
-		)
-	}
-	return entries
 }

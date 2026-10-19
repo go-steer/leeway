@@ -207,13 +207,8 @@ func TestNewTransformingFactory_TrimsOnTheWayIntoTheCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pod not in cache: %v", err)
 	}
-	if got := cached.Spec.Containers[0].Env[0].Value; got != "" {
-		t.Errorf("secret env value reached the shared cache: %q", got)
-	}
-	// The reference has to survive, or pkg/graph loses its Secret edges. It
-	// is the half of the strip that is easy to get wrong.
-	if cached.Spec.Containers[0].Env[1].ValueFrom == nil {
-		t.Error("ValueFrom was stripped along with the value — graph loses its Secret edge")
+	if cached.Spec.Containers != nil {
+		t.Errorf("container specs (and secret env values) reached the shared cache: %+v", cached.Spec.Containers)
 	}
 	if cached.ManagedFields != nil {
 		t.Error("ManagedFields reached the shared cache")
@@ -235,8 +230,8 @@ func TestNewTransformingFactory_TrimsOnTheWayIntoTheCache(t *testing.T) {
 	if !hasCondition(cachedNode.Status.Conditions, corev1.NodeReady) {
 		t.Error("NodeReady was dropped")
 	}
-	if !hasCondition(cachedNode.Status.Conditions, corev1.NodeMemoryPressure) {
-		t.Error("NodeMemoryPressure was dropped — blinds objectstate.node_pressure (#622)")
+	if hasCondition(cachedNode.Status.Conditions, corev1.NodeMemoryPressure) {
+		t.Error("an unretained condition (NodeMemoryPressure) survived")
 	}
 	if hasCondition(cachedNode.Status.Conditions, corev1.NodeNetworkUnavailable) {
 		t.Error("an unretained condition survived")

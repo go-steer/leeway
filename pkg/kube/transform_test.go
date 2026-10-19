@@ -102,30 +102,17 @@ func TestSharedTransform_PreservesLoadBearingFields(t *testing.T) {
 	}
 	p := pod.(*corev1.Pod)
 
-	c := p.Spec.Containers[0]
-	if c.Env[0].Name == "" {
-		t.Error("spec.containers[].env[].name was stripped; pkg/checks/state/wi.go:330 reads it")
-	}
-	if c.Env[0].ValueFrom == nil {
-		t.Error("spec.containers[].env[].valueFrom was stripped; pkg/graph/derive.go:160 builds " +
-			"ConfigMap and Secret edges from it, and would silently derive none")
-	}
-	if len(c.EnvFrom) == 0 {
-		t.Error("spec.containers[].envFrom was stripped; pkg/graph/derive.go:169 reads it")
-	}
-	if len(p.Status.ContainerStatuses) == 0 {
-		t.Error("status.containerStatuses was stripped; objectstate/podclearance.go:349, " +
-			"rollout/rollout.go:501 and checks/delta/pods.go:98 all read it")
-	}
-	if len(p.Status.InitContainerStatuses) == 0 {
-		t.Error("status.initContainerStatuses was stripped; rollout/rollout.go:501 reads it")
-	}
 	if p.Status.Phase == "" {
-		t.Error("status.phase was stripped; objectstate.go:1220 reads Phase==Failed to detect evictions")
+		t.Error("status.phase was stripped; podTerminal() in topologydrift and computeclass reads it")
 	}
-	if p.Spec.EphemeralContainers[0].Name == "" {
-		t.Error("spec.ephemeralContainers[].name was stripped; pkg/checks/logs/fetch.go:183 " +
-			"enumerates it to decide which container logs it can fetch")
+	if len(p.Status.Conditions) == 0 {
+		t.Error("status.conditions was stripped; podUnschedulable() and podReady() read it")
+	}
+	if p.Spec.NodeName == "" {
+		t.Error("spec.nodeName was stripped; placement and rank attribution read it")
+	}
+	if len(p.Spec.TopologySpreadConstraints) == 0 {
+		t.Error("spec.topologySpreadConstraints was stripped; topology-drift reads it")
 	}
 	if p.Annotations["example.com/custom"] != "kept" {
 		t.Error("custom Pod annotation was stripped; only applied-configuration blobs should be dropped")
@@ -154,9 +141,9 @@ func TestSharedTransform_PreservesLoadBearingFields(t *testing.T) {
 	}
 }
 
-// TestSharedTransform_StripsSecretEnvValues states the security goal directly
-// rather than leaving it implied by a path in a table: no literal environment
-// variable value survives, in any of the three container slices.
+// TestSharedTransform_StripsSecretEnvValues states the security and memory
+// goal directly: container slices and per-container statuses (including any
+// embedded secret env values) are dropped wholesale from cached Pods.
 func TestSharedTransform_StripsSecretEnvValues(t *testing.T) {
 	const secret = "s3cr3t-literal"
 
@@ -171,18 +158,23 @@ func TestSharedTransform_StripsSecretEnvValues(t *testing.T) {
 	}
 	p := out.(*corev1.Pod)
 
-	for _, tc := range []struct {
-		where string
-		got   string
-	}{
-		{"spec.containers[0]", p.Spec.Containers[0].Env[0].Value},
-		{"spec.initContainers[0]", p.Spec.InitContainers[0].Env[0].Value},
-		{"spec.ephemeralContainers[0]", p.Spec.EphemeralContainers[0].Env[0].Value},
-	} {
-		if tc.got != "" {
-			t.Errorf("%s.env[0].value survived the transform as %q; secret values must never "+
-				"enter the shared cache or a heap dump", tc.where, tc.got)
-		}
+	if p.Spec.Containers != nil {
+		t.Errorf("spec.containers survived the transform: %+v", p.Spec.Containers)
+	}
+	if p.Spec.InitContainers != nil {
+		t.Errorf("spec.initContainers survived the transform: %+v", p.Spec.InitContainers)
+	}
+	if p.Spec.EphemeralContainers != nil {
+		t.Errorf("spec.ephemeralContainers survived the transform: %+v", p.Spec.EphemeralContainers)
+	}
+	if p.Status.ContainerStatuses != nil {
+		t.Errorf("status.containerStatuses survived the transform: %+v", p.Status.ContainerStatuses)
+	}
+	if p.Status.InitContainerStatuses != nil {
+		t.Errorf("status.initContainerStatuses survived the transform: %+v", p.Status.InitContainerStatuses)
+	}
+	if p.Status.EphemeralContainerStatuses != nil {
+		t.Errorf("status.ephemeralContainerStatuses survived the transform: %+v", p.Status.EphemeralContainerStatuses)
 	}
 }
 
@@ -211,11 +203,8 @@ func TestSharedTransform_StripsAppliedAnnotationsAndWorkloadTemplates(t *testing
 	if got.Annotations["deployment.kubernetes.io/revision"] != "3" {
 		t.Errorf("rollout revision annotation was stripped from Deployment")
 	}
-	if got.Spec.Template.Spec.Containers[0].Env[0].Value != "" {
-		t.Errorf("Deployment template container env value survived: %q", got.Spec.Template.Spec.Containers[0].Env[0].Value)
-	}
-	if got.Spec.Template.Spec.Containers[0].Env[0].ValueFrom == nil {
-		t.Errorf("Deployment template container env ValueFrom was stripped")
+	if got.Spec.Template.Spec.Containers != nil {
+		t.Errorf("Deployment template containers survived: %+v", got.Spec.Template.Spec.Containers)
 	}
 	if len(got.Spec.Template.Labels) == 0 {
 		t.Errorf("Deployment template labels were stripped")

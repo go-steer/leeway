@@ -139,11 +139,13 @@ var retainedNodeAnnotations = map[string]bool{
 // trimPod drops fields no informer-reachable consumer reads, before the object
 // enters the shared cache.
 //
-// The security goal is that secret VALUES never enter process memory or a heap
-// dump. That is satisfied by nulling Env[i].Value while preserving Name and
-// ValueFrom — the reference, not the resolved secret — which is precisely what
-// pkg/graph needs to build its ConfigMap and Secret edges. Container statuses
-// stay, because four sources read them.
+// Neither topology-drift nor compute-class inspects container specs or
+// per-container statuses — they read Pod scheduling constraints (nodeName,
+// nodeSelector, affinity, topologySpreadConstraints, tolerations, PVC volumes)
+// and Pod-level status (Phase, PodScheduled/PodReady conditions). Dropping the
+// container and container-status slices wholesale guarantees that literal
+// secret env values/args never enter process memory while cutting cached Pod
+// footprint to a minimum.
 func trimPod(obj any) (any, error) {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -152,6 +154,9 @@ func trimPod(obj any) (any, error) {
 	pod.ManagedFields = nil
 	pod.Annotations = stripAppliedAnnotations(pod.Annotations)
 	trimPodSpec(&pod.Spec)
+	pod.Status.ContainerStatuses = nil
+	pod.Status.InitContainerStatuses = nil
+	pod.Status.EphemeralContainerStatuses = nil
 	return pod, nil
 }
 
@@ -227,44 +232,9 @@ func trimPodTemplateSpec(tpl *corev1.PodTemplateSpec) {
 }
 
 func trimPodSpec(spec *corev1.PodSpec) {
-	trimContainers(spec.Containers)
-	trimContainers(spec.InitContainers)
-
-	// Ephemeral containers carry the same EphemeralContainerCommon shape as a
-	// regular container, so a debug container started with `kubectl debug
-	// --env` puts literal secret values in the cache by exactly the route this
-	// transform exists to close. Their Name is preserved: pkg/checks/logs reads
-	// it to enumerate the containers it can fetch logs from, and that check is
-	// informer-reachable through the enricher.
-	for i := range spec.EphemeralContainers {
-		trimContainerCommon(&spec.EphemeralContainers[i].EphemeralContainerCommon)
-	}
-}
-
-// trimContainers strips each container in place. It takes the slice rather than
-// returning one so that callers cannot accidentally drop the result and leave
-// the originals untrimmed.
-func trimContainers(cs []corev1.Container) {
-	for i := range cs {
-		c := &cs[i]
-		for j := range c.Env {
-			c.Env[j].Value = "" // drop literal values; keep Name + ValueFrom
-		}
-		c.Command, c.Args, c.Lifecycle = nil, nil, nil
-		c.ReadinessProbe, c.LivenessProbe, c.StartupProbe = nil, nil, nil
-	}
-}
-
-// trimContainerCommon applies the same strips to an ephemeral container's
-// embedded common fields. Kept separate from trimContainers because
-// EphemeralContainerCommon is a distinct type with the same field set, and Go
-// will not let one function span both.
-func trimContainerCommon(c *corev1.EphemeralContainerCommon) {
-	for j := range c.Env {
-		c.Env[j].Value = ""
-	}
-	c.Command, c.Args, c.Lifecycle = nil, nil, nil
-	c.ReadinessProbe, c.LivenessProbe, c.StartupProbe = nil, nil, nil
+	spec.Containers = nil
+	spec.InitContainers = nil
+	spec.EphemeralContainers = nil
 }
 
 // trimNode drops the node-side fields nothing in the repo reads. status.images
@@ -282,9 +252,6 @@ func trimNode(obj any) (any, error) {
 	node.Status.NodeInfo = corev1.NodeSystemInfo{}
 	node.Status.Conditions = retainConditions(node.Status.Conditions,
 		corev1.NodeReady,
-		corev1.NodeMemoryPressure,
-		corev1.NodeDiskPressure,
-		corev1.NodePIDPressure,
 	)
 	return node, nil
 }

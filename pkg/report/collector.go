@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/go-steer/leeway/pkg/clusters"
+	"github.com/go-steer/leeway/pkg/kube"
 	"github.com/go-steer/leeway/pkg/leeway"
 	"github.com/go-steer/leeway/pkg/sources/computeclass"
 	"github.com/go-steer/leeway/pkg/sources/topologydrift"
@@ -357,7 +358,9 @@ func listNodes(ctx context.Context, client kubernetes.Interface) ([]*corev1.Node
 	}
 	out := make([]*corev1.Node, len(list.Items))
 	for i := range list.Items {
-		out[i] = &list.Items[i]
+		n := &list.Items[i]
+		_, _ = kube.Transform(n)
+		out[i] = n
 	}
 	return out, nil
 }
@@ -370,7 +373,9 @@ func listPods(ctx context.Context, client kubernetes.Interface, namespaces []str
 			return nil, err
 		}
 		for i := range list.Items {
-			out = append(out, &list.Items[i])
+			p := &list.Items[i]
+			_, _ = kube.Transform(p)
+			out = append(out, p)
 		}
 	}
 	return out, nil
@@ -384,7 +389,9 @@ func listReplicaSets(ctx context.Context, client kubernetes.Interface, namespace
 			return nil, err
 		}
 		for i := range list.Items {
-			out = append(out, &list.Items[i])
+			rs := &list.Items[i]
+			_, _ = kube.Transform(rs)
+			out = append(out, rs)
 		}
 	}
 	return out, nil
@@ -398,7 +405,9 @@ func listDeployments(ctx context.Context, client kubernetes.Interface, namespace
 			return nil, err
 		}
 		for i := range list.Items {
-			out = append(out, &list.Items[i])
+			d := &list.Items[i]
+			_, _ = kube.Transform(d)
+			out = append(out, d)
 		}
 	}
 	return out, nil
@@ -412,7 +421,9 @@ func listStatefulSets(ctx context.Context, client kubernetes.Interface, namespac
 			return nil, err
 		}
 		for i := range list.Items {
-			out = append(out, &list.Items[i])
+			sts := &list.Items[i]
+			_, _ = kube.Transform(sts)
+			out = append(out, sts)
 		}
 	}
 	return out, nil
