@@ -157,15 +157,21 @@ func SuggestRemediation(f Finding, selectorLabels map[string]string) *FindingRem
 	}
 
 	// 4. Workload / scheduler causes (constraint_ignored, rollout_bias, unknown).
+	//
+	// The conflicting-affinity case is a two-step fix and only the second step
+	// can be rendered: the evidence line carries the topology key and the
+	// domain count, not the selector's values, so the affinity removal cannot
+	// be expressed as a patch. The summary and the YAML both say so, because a
+	// consumer that applies the YAML alone changes nothing.
 	if f.Intent != nil && evidenceHasConflictingNodeAffinity(f.Intent.Evidence) {
 		return &FindingRemediation{
 			Kind: RemediationManifestPatch,
 			Summary: fmt.Sprintf(
-				"Remove the conflicting nodeAffinity/nodeSelector on %s from %s so its topologySpreadConstraint can spread replicas across eligible domains.",
+				"Remove, or widen to more than one domain, the conflicting nodeAffinity/nodeSelector on %s from %s so its topologySpreadConstraint can spread replicas across eligible domains; the yaml only restates the spread constraint and does not remove the affinity, so applying it alone changes nothing.",
 				f.TopologyKey, f.Subject,
 			),
 			Command: rolloutRestartCommand(f.Subject),
-			YAML: renderTopologySpreadPatch(
+			YAML: conflictingAffinityPreamble(f.TopologyKey) + renderTopologySpreadPatch(
 				f.Subject,
 				f.TopologyKey,
 				maxSkewOrOne(f.Intent),
@@ -265,6 +271,24 @@ func evidenceHasConflictingNodeAffinity(evidence []string) bool {
 		}
 	}
 	return false
+}
+
+// conflictingAffinityPreamble is the YAML comment that precedes the spread
+// constraint patch in the conflicting-affinity remediation. It is a comment
+// rather than a patch because the removal cannot be rendered: the finding
+// knows which key the affinity narrows and to how many domains, not which
+// nodeSelector entry or nodeSelectorTerm expresses it, and a strategic merge
+// patch cannot delete one matchExpression without restating the whole
+// affinity block. Prepending it keeps the YAML field a valid document that
+// still says, to anyone who applies it, what has to happen first.
+func conflictingAffinityPreamble(key TopologyKey) string {
+	return fmt.Sprintf(
+		"# Step 2 of 2. This patch only restates the topologySpreadConstraint on %[1]s.\n"+
+			"# Step 1, which it cannot express, is to remove (or widen to more than one\n"+
+			"# domain) the nodeAffinity/nodeSelector on %[1]s in this pod template;\n"+
+			"# applying this patch on its own changes nothing.\n",
+		key,
+	)
 }
 
 func maxSkewOrOne(in *FindingIntent) int32 {

@@ -176,6 +176,46 @@ func TestSuggestRemediation_ConflictingNodeAffinityRecommendsManifestPatch(t *te
 	if !strings.Contains(got.Summary, "conflicting nodeAffinity/nodeSelector") {
 		t.Errorf("Summary = %q, want mention of conflicting nodeAffinity/nodeSelector", got.Summary)
 	}
+	// The YAML cannot express the affinity removal, so the summary must say
+	// that applying it alone is not the fix.
+	if !strings.Contains(got.Summary, "applying it alone changes nothing") {
+		t.Errorf("Summary = %q, want a statement that the yaml alone changes nothing", got.Summary)
+	}
+	if got.Command != "kubectl -n topology rollout restart deployment/affinity-pinned-api" {
+		t.Errorf("Command = %q, want rollout restart command", got.Command)
+	}
+
+	// The YAML leads with a comment naming the step it cannot render, and is
+	// still the spread-constraint patch underneath.
+	if !strings.HasPrefix(got.YAML, "# Step 2 of 2.") {
+		t.Errorf("YAML does not open with the two-step comment:\n%s", got.YAML)
+	}
+	for _, want := range []string{
+		"remove (or widen to more than one",
+		"nodeAffinity/nodeSelector on topology.kubernetes.io/zone",
+		"applying this patch on its own changes nothing",
+		"\nspec:\n  template:\n    spec:\n      topologySpreadConstraints:\n",
+		"maxSkew: 1",
+		"topologyKey: topology.kubernetes.io/zone",
+		"whenUnsatisfiable: ScheduleAnyway",
+		"app: affinity-pinned-api",
+		"matchLabelKeys:\n        - pod-template-hash",
+	} {
+		if !strings.Contains(got.YAML, want) {
+			t.Errorf("YAML missing %q:\n%s", want, got.YAML)
+		}
+	}
+	// Every preamble line is a YAML comment, so the field stays a document a
+	// consumer can parse rather than prose it has to strip first.
+	body := strings.SplitN(got.YAML, "\nspec:\n", 2)
+	if len(body) != 2 {
+		t.Fatalf("YAML has no spec: block after the preamble:\n%s", got.YAML)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(body[0]), "\n") {
+		if !strings.HasPrefix(line, "# ") {
+			t.Errorf("preamble line %q is not a YAML comment", line)
+		}
+	}
 }
 
 func TestSuggestRemediation_InfrastructureAndStorageCausesNeverPatchWorkloadYAML(t *testing.T) {

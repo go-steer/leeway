@@ -6,6 +6,7 @@ All notable changes to `leeway` are documented in this file.
 
 ### Changed
 
+- **Conflicting-Affinity Remediation Payload (`pkg/leeway/remediation.go`)**: When a `topologySpreadConstraint` is contradicted by a `nodeAffinity`/`nodeSelector` on the same key, the `manifest_patch` remediation's `summary` now states that the affinity must be removed or widened first and that the `yaml` alone changes nothing, and the `yaml` opens with a comment saying the same. The finding never learns which selector entry to delete, so the removal cannot be rendered as a patch; the schema (`kind`, `summary`, `command`, `yaml`) is unchanged.
 - **Report Test Fixture Names (`pkg/report/report_test.go`, `pkg/leeway/remediation_test.go`)**: Renamed the cause-attribution fixture (`TestCollect_SeededD` → `TestCollect_CauseAttribution`) and its workloads to names that describe the mechanism under test (`affinity-pinned-api`, `zonal-pv-store`, `cpu-starved-worker`, `pool-pinned-filler`, namespace `topology`) instead of a downstream evaluation fixture's names. Scenarios are unchanged.
 
 ## [0.1.3] - 2026-10-19
