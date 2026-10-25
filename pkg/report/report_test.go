@@ -226,6 +226,16 @@ func TestCollect_CauseAttribution(t *testing.T) {
 	if workerFinding.Remediation == nil || workerFinding.Remediation.Kind != leeway.RemediationClusterCapacity {
 		t.Errorf("cpu-starved-worker Remediation = %+v, want %q", workerFinding.Remediation, leeway.RemediationClusterCapacity)
 	}
+	// One Running pod and three Pending/Unschedulable ones under maxSkew 1:
+	// observedSkew counts Running pods only (1 − 0), while the shortfall
+	// scoring in topologydrift.ScoreAxis adds the three blocked replicas
+	// before subtracting the floor ((1 + 3) − 1). excessSkew > observedSkew
+	// is the intended reading of a constraint that is holding pods back, and
+	// is documented in concepts/scoring-and-attribution.md.
+	if workerFinding.Score.ObservedSkew != 1 || workerFinding.Score.ExcessSkew != 3 {
+		t.Errorf("cpu-starved-worker score = observedSkew %d, excessSkew %d; want 1 and 3 (Pending replicas counted into the excess)",
+			workerFinding.Score.ObservedSkew, workerFinding.Score.ExcessSkew)
+	}
 }
 
 func buildAttributionCluster() kubernetes.Interface {

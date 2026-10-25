@@ -18,7 +18,7 @@ Every `leeway.Finding` reports six numbers in its `score` block:
 - **`drift`** (`[0.0, 1.0]`): `relocationDistance / N`, which is the normalized L1 distance $\frac{1}{2N}\sum_d |O_d - E_d|$ — the fraction of the workload that is in the wrong domain.
 - **`observedSkew`**: $\max_d(O_d) - \min_d(O_d)$ across eligible domains, counting Running pods only.
 - **`minAchievableSkew`**: The skew of the expectation itself — the best any placement can do given integer division, unequal weights, and per-domain caps.
-- **`excessSkew`**: $\max(0, \text{observedSkew} - \max(\text{maxSkew}, \text{minAchievableSkew}))$ — the skew *beyond* what the contract permits.
+- **`excessSkew`**: $\max(0, \text{observedSkew} - \max(\text{maxSkew}, \text{minAchievableSkew}))$ — the skew *beyond* what the contract permits. In `leeway report`, when a workload with Running pods also has Pending pods carrying the scheduler's `PodScheduled=False`/`Unschedulable` condition and at least one eligible domain holds none of its pods, those Pending pods are added to the observed skew before the floor is subtracted — they are the replicas the constraint or the capacity is holding back — so `excessSkew` can exceed `observedSkew` (one Running and three Pending replicas under `maxSkew: 1` report `observedSkew: 1`, `excessSkew: 3`).
 - **`relocationDistance`**: $\sum_d \max(0, O_d - E_d)$ — how many pods sit above their domain's expectation, which is the number that would have to move.
 - **`maxDomainShare`**: $\max_d(O_d) / N$, catching single-domain blast-radius concentration.
 
