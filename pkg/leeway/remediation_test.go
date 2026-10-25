@@ -150,7 +150,7 @@ func TestSuggestRemediation_ConflictingNodeAffinityRecommendsManifestPatch(t *te
 	maxSkew := int32(1)
 	f := Finding{
 		Kind:           KindPlacementDrift,
-		Subject:        SubjectRef{Kind: SubjectDeployment, Namespace: "seeded-topology", Name: "zone-pinned-api"},
+		Subject:        SubjectRef{Kind: SubjectDeployment, Namespace: "topology", Name: "affinity-pinned-api"},
 		TopologyKey:    "topology.kubernetes.io/zone",
 		Tier:           TierB.String(),
 		Severity:       "warning",
@@ -160,13 +160,13 @@ func TestSuggestRemediation_ConflictingNodeAffinityRecommendsManifestPatch(t *te
 			Confidence: ConfidenceDeclared.String(),
 			MaxSkew:    &maxSkew,
 			Evidence: []string{
-				"topologySpreadConstraints[0]: topologyKey=topology.kubernetes.io/zone maxSkew=1 whenUnsatisfiable=ScheduleAnyway labelSelector=app=zone-pinned-api",
+				"topologySpreadConstraints[0]: topologyKey=topology.kubernetes.io/zone maxSkew=1 whenUnsatisfiable=ScheduleAnyway labelSelector=app=affinity-pinned-api",
 				"conflicting nodeAffinity/nodeSelector on topology.kubernetes.io/zone restricts placement to 1 domain(s), contradicting the spread constraint on topology.kubernetes.io/zone",
 			},
 		},
 	}
 
-	got := SuggestRemediation(f, map[string]string{"app": "zone-pinned-api"})
+	got := SuggestRemediation(f, map[string]string{"app": "affinity-pinned-api"})
 	if got == nil {
 		t.Fatal("SuggestRemediation returned nil, want manifest_patch")
 	}

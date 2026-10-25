@@ -4,6 +4,10 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Report Test Fixture Names (`pkg/report/report_test.go`, `pkg/leeway/remediation_test.go`)**: Renamed the cause-attribution fixture (`TestCollect_SeededD` → `TestCollect_CauseAttribution`) and its workloads to names that describe the mechanism under test (`affinity-pinned-api`, `zonal-pv-store`, `cpu-starved-worker`, `pool-pinned-filler`, namespace `topology`) instead of a downstream evaluation fixture's names. Scenarios are unchanged.
+
 ## [0.1.3] - 2026-10-19
 
 ### Added
