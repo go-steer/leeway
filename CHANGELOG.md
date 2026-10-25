@@ -4,6 +4,10 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Docs Drift Against the Code (`docs/site/src/content/docs/`)**: `agents.md`, `reference/finding-kinds.md`, `reference/cli.md`, `getting-started/report.md`, `concepts/scoring-and-attribution.md` and `concepts/tiers-and-intent.md` now match `cmd/leeway` and `pkg/leeway`: the report envelope is documented as snake_case (`schema_version`, `topology_findings`, `rank_findings`, `domains`, `summary.clusters_total`, …); `suspectedCause` lists the real vocabulary (`domain_outage`, `domain_capacity_shortfall`, `taint_exclusion`, `consolidation`, `volume_pinning`, `rollout_bias`, `constraint_ignored`, `unknown`) instead of names the binary never prints; `intent.source` / `confidence` / `weighting`, `remediation.kind` and the rank-finding fields are listed as emitted; the `report` flags are `--parallelism`, `--pretty`, `--namespace`, `--all`, `--min-drift` (there is no `--concurrency` or `--compact`) and `--clusters-from` takes `kubeconfig[:/path]`, `profiles:/path` or `<project>[/<location>]`, not a file; the `watch` flag table lists only flags the binary defines; the intent precedence list follows `IntentSource` order. All JSON examples are taken from a real `leeway report` run.
+
 ### Changed
 
 - **Conflicting-Affinity Remediation Payload (`pkg/leeway/remediation.go`)**: When a `topologySpreadConstraint` is contradicted by a `nodeAffinity`/`nodeSelector` on the same key, the `manifest_patch` remediation's `summary` now states that the affinity must be removed or widened first and that the `yaml` alone changes nothing, and the `yaml` opens with a comment saying the same. The finding never learns which selector entry to delete, so the removal cannot be rendered as a patch; the schema (`kind`, `summary`, `command`, `yaml`) is unchanged.

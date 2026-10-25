@@ -9,9 +9,11 @@ Every `leeway` finding carries a **Tier** (`A`, `B`, or `C`). The tier is not a 
 
 | Tier | Where the expectation came from | Default Severity | Finding Kind |
 | --- | --- | --- | --- |
-| **A** | An explicit hard contract declared by the workload owner (`TopologySpreadConstraints` with `whenUnsatisfiable: DoNotSchedule`, required pod anti-affinity, or a `LeewayPolicy` contract). | `critical` | `leeway.contract_violated` |
-| **B** | A declared soft preference (`whenUnsatisfiable: ScheduleAnyway`, preferred pod anti-affinity, `LeewayPolicy` soft target) or assumed cluster default. | `warning` | `leeway.placement_drift` |
-| **C** | No declared constraint. Scored either against the subject's own learned EWMA history or an unanchored apportionment. | `info` (or `warning` on max-domain-share breach) | `leeway.baseline_breach` / `leeway.placement_drift` |
+| **A** | An explicit hard contract declared in the pod spec (`topologySpreadConstraints` with `whenUnsatisfiable: DoNotSchedule`, or a required pod anti-affinity), and the rule that fired was that contract. | `critical` | `leeway.contract_violated` |
+| **B** | Any other declared or inferred intent: `whenUnsatisfiable: ScheduleAnyway`, preferred or required pod (anti-)affinity, a `LeewayPolicy` / `ClusterLeewayPolicy`, or a declared or assumed cluster default. | `warning` | `leeway.placement_drift` |
+| **C** | No declared or inferred intent. Scored either against the subject's own learned baseline (`leeway watch`) or against an apportionment over its eligible domains. | `info` (`warning` when `maxDomainShare > 0.5`) | `leeway.baseline_breach` / `leeway.placement_drift` |
+
+A `LeewayPolicy` carries no `maxSkew` of its own, so a policy alone never produces Tier A. A `DoNotSchedule` `maxSkew` declared in the pod spec survives a policy outranking it, so a subject with both is still judged at Tier A on that bound. A `LeewayPolicy` can set `thresholds.severity`, which replaces the tier's default severity; such findings carry `severityFromPolicy: true`.
 
 ## Why Tier A violations happen at runtime
 
@@ -22,13 +24,19 @@ The Kubernetes scheduler enforces `DoNotSchedule` constraints only **at admissio
 
 Because admission controllers never re-evaluate running pods, `leeway` is often the only component in a cluster that notices a broken `DoNotSchedule` contract.
 
-## The 6-level intent precedence hierarchy
+## Intent precedence
 
-For every `(subject, topologyKey)` pair, `leeway` resolves intent using strict precedence (highest wins; lower-precedence observations are retained in `intent.evidence[]` with `(not applied)`):
+For every `(subject, topologyKey)` pair, `leeway` resolves one intent using strict precedence (highest wins; lower-precedence observations are retained in `intent.evidence[]` prefixed `(not applied)`). The value in `intent.source` names the winner:
 
-1. **Namespaced `LeewayPolicy` CRD** (`leeway.lookout.go-steer.io/v1alpha1`)
-2. **Cluster-scoped `ClusterLeewayPolicy` CRD**
-3. **Workload annotations** (`leeway.lookout.go-steer.io/*`)
-4. **Pod spec constraints** (`spec.topologySpreadConstraints` and `spec.affinity.podAntiAffinity`)
-5. **Assumed cluster-level scheduler defaults** (`--topology-cluster-defaults`, capped at Tier B)
-6. **Learned EWMA baseline** (`--topology-learn-baselines`, always Tier C)
+1. `policy-crd` — a `LeewayPolicy` (namespaced) or `ClusterLeewayPolicy` (cluster-scoped) in `leeway.lookout.go-steer.io/v1alpha1` whose selector matches the pod; a namespaced policy outranks a cluster-scoped one.
+2. `workload-annotation` — reserved in the vocabulary; the shipped resolver does not produce it.
+3. `topology-spread-constraint` — `spec.topologySpreadConstraints` on the pod.
+4. `pod-anti-affinity-required` — `requiredDuringSchedulingIgnoredDuringExecution` pod anti-affinity.
+5. `pod-affinity-required` — required pod affinity (a colocation intent).
+6. `cluster-default-declared` — kube-scheduler default constraints passed in `--topology-cluster-defaults`.
+7. `pod-anti-affinity-preferred` — preferred pod anti-affinity.
+8. `pod-affinity-preferred` — preferred pod affinity.
+9. `learned-baseline` — the subject's own learned history (`leeway watch` only; always Tier C).
+10. `cluster-default-assumed` — kube-scheduler's system default constraints, assumed when `--topology-cluster-defaults` is not set (`confidence: assumed`, capped at Tier B).
+
+`intent.confidence` records how much the winner is trusted: `declared` (written by the workload owner or operator), `inferred` (derived from an affinity rule), `assumed` (a cluster default nobody declared), or `learned` (measured from history).
