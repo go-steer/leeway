@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-All series exported on `/metrics` carry the `cluster` label (`--cluster` in single-cluster mode, or the resolved cluster name in multi-cluster mode).
+All series exported on `/metrics` carry the `cluster` label (`--cluster-name` in single-cluster mode, or the resolved cluster name in multi-cluster mode).
 
 ## Standalone process metrics
 
