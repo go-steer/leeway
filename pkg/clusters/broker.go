@@ -41,8 +41,8 @@ const (
 	// set inside the agent-sandbox container (CALLER_ROLE_SHELL). When present,
 	// Google REST API reads route through /v1/gcp/<host>/ and Kubernetes object
 	// reads route through the sandbox's `kubectl` credential-proxy wrapper.
-	CredentialProxyURLEnv       = "CREDENTIAL_PROXY_URL"
-	CredentialProxyTokenFileEnv = "CREDENTIAL_PROXY_TOKEN_FILE"
+	CredentialProxyURLEnv       = "CREDENTIAL_PROXY_URL"        // #nosec G101 -- environment variable name, not a credential
+	CredentialProxyTokenFileEnv = "CREDENTIAL_PROXY_TOKEN_FILE" // #nosec G101 -- environment variable name, not a credential
 
 	// brokerGCPPathFormat is the proxy's route for a Google REST API, taking
 	// the proxy's base URL and the API's host. The trailing slash is

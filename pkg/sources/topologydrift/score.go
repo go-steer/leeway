@@ -145,7 +145,7 @@ func ScoreAxis(key leeway.TopologyKey, intent *leeway.Intent, eligible leeway.El
 	ev.Apportionment = leeway.Apportion(targetN, eligible.WeightsFor(intent), capsFor(intent, eligible))
 	ev.Scores = leeway.Score(eligible.Domains, actual, ev.Apportionment, maxSkew, t)
 	if unsched > 0 && n > 0 && len(eligible.Domains) >= 2 && hasEmptyDomain(actual) && n+unsched >= t.MinReplicasForScoring {
-		applyUnschedulableShortfall(&ev.Scores, unsched, targetN, maxSkew, t)
+		applyUnschedulableShortfall(&ev.Scores, unsched, targetN, maxSkew)
 	}
 	ev.Verdict = ev.Scores.JudgeTransient(intent, t, sup)
 	return ev
@@ -173,7 +173,7 @@ func hasEmptyDomain(actual []int64) bool {
 	return false
 }
 
-func applyUnschedulableShortfall(s *leeway.Scores, unsched, targetN int64, maxSkew *int32, t leeway.Thresholds) {
+func applyUnschedulableShortfall(s *leeway.Scores, unsched, targetN int64, maxSkew *int32) {
 	if !s.Evaluable && s.Gate == leeway.GateBelowMinReplicas {
 		s.Gate = leeway.GateNone
 		s.Evaluable = true
