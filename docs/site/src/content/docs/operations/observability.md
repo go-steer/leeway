@@ -7,7 +7,7 @@ sidebar:
 
 ## HTTP endpoints (`leeway watch`)
 
-`leeway watch` serves three HTTP endpoints on `--listen-addr` (default `:9090`):
+`leeway watch` serves three HTTP endpoints on `--metrics-addr` (default `:9090`; an empty value disables the listener):
 
 - **`/metrics`**: Prometheus scrape endpoint containing all `lookout_leeway_*` series plus `lookout_leeway_standalone_info` and `lookout_leeway_standalone_signals_total`.
 - **`/healthz`**: Liveness probe (`200 ok`). Deliberately independent of apiserver connectivity so transient control-plane hiccups do not cause pod restart loops.

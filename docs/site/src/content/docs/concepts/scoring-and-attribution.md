@@ -9,28 +9,30 @@ sidebar:
 
 Assuming every zone should receive an equal `1/D` share of pods produces false positives whenever zones have unequal node capacity.
 
-`leeway` queries the **Capacity Oracle** for the allocatable CPU of ready, eligible nodes in each domain for the subject. When the largest-to-smallest domain capacity ratio reaches `--topology-capacity-ratio` (default `1.25`), `leeway` switches from uniform weighting to **capacity-proportional weighting** and uses **Hamilton's largest-remainder method** so integer `expected` pod counts always sum to the exact replica count `N`.
+`leeway` sums the allocatable CPU of the ready, eligible nodes in each domain for the subject. When the largest-to-smallest domain capacity ratio reaches `1.25` (`leeway.CapacityWeightingRatioTrigger`, not a flag), a subject whose intent declared no weighting switches from `Equal` to `AllocatableCPU` weighting, and the finding's `intent.weighting` reports which one was used. A subject with a declared `maxSkew` or a required anti-affinity ceiling stays on `Equal`: kube-scheduler bounds pod counts, not millicores, so a capacity-weighted expectation would make the declared bound unviolable. Expected counts are apportioned with **Hamilton's largest-remainder method**, so integer `expected` values always sum to the replica count `N`.
 
 ## Core score metrics
 
 Every `leeway.Finding` reports six numbers in its `score` block:
 
-- **`drift`** (`[0.0, 1.0]`): Normalized L1 distance $\frac{1}{2N}\sum_d |O_d - E_d|$, representing the fraction of the workload displaced from expectation.
-- **`observedSkew`**: $\max_d(O_d) - \min_d(O_d)$ across eligible domains.
-- **`minAchievableSkew`**: The theoretical best-case skew given integer division and fixed/pinned pods.
-- **`excessSkew`**: $\max(0, \text{observedSkew} - \max(\text{maxSkew}, \text{minAchievableSkew}))$ — the skew *beyond* what the contract permits.
-- **`relocationDistance`**: Minimum number of pod moves required to bring every domain within the contract's `maxSkew`.
+- **`drift`** (`[0.0, 1.0]`): `relocationDistance / N`, which is the normalized L1 distance $\frac{1}{2N}\sum_d |O_d - E_d|$ — the fraction of the workload that is in the wrong domain.
+- **`observedSkew`**: $\max_d(O_d) - \min_d(O_d)$ across eligible domains, counting Running pods only.
+- **`minAchievableSkew`**: The skew of the expectation itself — the best any placement can do given integer division, unequal weights, and per-domain caps.
+- **`excessSkew`**: $\max(0, \text{observedSkew} - \max(\text{maxSkew}, \text{minAchievableSkew}))$ — the skew *beyond* what the contract permits. In `leeway report`, when a workload with Running pods also has Pending pods carrying the scheduler's `PodScheduled=False`/`Unschedulable` condition and at least one eligible domain holds none of its pods, those Pending pods are added to the observed skew before the floor is subtracted — they are the replicas the constraint or the capacity is holding back — so `excessSkew` can exceed `observedSkew` (one Running and three Pending replicas under `maxSkew: 1` report `observedSkew: 1`, `excessSkew: 3`).
+- **`relocationDistance`**: $\sum_d \max(0, O_d - E_d)$ — how many pods sit above their domain's expectation, which is the number that would have to move.
 - **`maxDomainShare`**: $\max_d(O_d) / N$, catching single-domain blast-radius concentration.
 
-## The 8-rung root-cause attribution ladder
+## The root-cause attribution ladder
 
-Once a subject breaches, `leeway` evaluates an ordered attribution ladder (`pkg/leeway/attribute.go`) against per-domain evidence to name `suspectedCause`:
+Once a subject breaches, `leeway` evaluates an ordered attribution ladder (`pkg/leeway/cause.go`) against per-domain evidence to name `suspectedCause`. The first rung with positive evidence wins; every rung's evidence, including ruled-out ones, is listed in `contributingFactors[]`:
 
-1. **`domain_cordoned`**: Deficit domains have nodes, but all or most are cordoned (`spec.unschedulable=true`).
-2. **`volume_topology_lock`**: Pods mount PersistentVolumes with `nodeAffinity` pinning them to surplus zones.
-3. **`taint_mismatch`**: Ready nodes in deficit domains carry taints that the workload's pod spec does not tolerate.
-4. **`affinity_conflict`**: Node selectors or required `nodeAffinity` rules exclude nodes in deficit domains.
-5. **`capacity_shortfall`**: Deficit domains have zero ready/allocatable nodes or pending pods failing scheduling due to `Insufficient cpu/memory`.
-6. **`rollout_bias`**: A recent controller rollout completed shortly before the skew appeared, leaving replicas concentrated where capacity was momentarily free.
-7. **`descheduler_absent`**: All domains are healthy, eligible, and have capacity, meaning the skew is a historical artifact that persists because nothing is evicting excess pods.
-8. **`unknown`**: Fallback when no specific mechanical cause dominates.
+1. **`domain_outage`**: A deficit domain has NotReady nodes, and at least as many of them as Ready nodes.
+2. **`consolidation`**: A deficit domain lost a node to autoscaler consolidation inside the attribution window (2h).
+3. **`taint_exclusion`**: A deficit domain became ineligible through a taint or cordon inside the window.
+4. **`domain_capacity_shortfall`**: Pods are Pending with `FailedScheduling` citing insufficient resources, or a deficit domain's Ready node count fell inside the window.
+5. **`volume_pinning`**: At least half of the pods that would have to move are pinned to a surplus domain by a zonal PersistentVolume.
+6. **`rollout_bias`**: A rollout completed inside the window, more than 10 minutes ago, and the drift did not recover.
+7. **`constraint_ignored`**: The subject declared `maxSkew` with `whenUnsatisfiable: ScheduleAnyway` and the observed skew exceeds it — nothing malfunctioned, the scheduler was told to place the pods anyway.
+8. **`unknown`**: Fallback when no rung has positive evidence.
+
+Rungs whose evidence comes from a source that is not running — `rollout_bias` in `leeway report`, which has no rollout source — are listed in `untestedCauses[]` when they sit above the winning rung, so a reader can tell "ruled out" from "never asked".

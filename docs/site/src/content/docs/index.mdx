@@ -8,7 +8,7 @@ tableOfContents: false
 `leeway` analyzes and monitors **where Kubernetes workloads actually land** compared to where they were meant to run.
 
 Most Kubernetes monitoring answers whether pods are `Running` and `Ready`. `leeway` answers the two placement questions that admission-time controls cannot:
-1. **Topology Placement Drift (`topology-drift`)**: Are a workload's pods spread across zones, regions, or custom failure domains the way its `TopologySpreadConstraints`, pod anti-affinity, or `LeewayPolicy` intended — and if not, *why* (`capacity_shortfall`, `affinity_conflict`, `taint_mismatch`, `volume_topology_lock`, `domain_cordoned`, `rollout_bias`, `descheduler_absent`)?
+1. **Topology Placement Drift (`topology-drift`)**: Are a workload's pods spread across zones, regions, or custom failure domains the way its `TopologySpreadConstraints`, pod anti-affinity, or `LeewayPolicy` intended — and if not, *why* (`domain_outage`, `consolidation`, `taint_exclusion`, `domain_capacity_shortfall`, `volume_pinning`, `rollout_bias`, `constraint_ignored`)?
 2. **ComputeClass Priority Rank Occupancy (`compute-class`)**: Are workloads bound to a GKE `ComputeClass` (`cloud.google.com/v1`) running on their preferred node-pool priority tier, or are they degraded onto fallback tiers (`leeway.rank_degraded`), wedged on unsatisfiable nodes (`leeway.rank_wedged`), or failing to scale back (`leeway.rank_no_migration`)?
 
 ## Two execution modes, one binary
@@ -30,9 +30,9 @@ Run `leeway watch` as a daemon reporting incidents to a webhook receiver:
 
 ```sh
 leeway watch \
-  --cluster=gke-prod-us-east1 \
+  --cluster-name=gke-prod-us-east1 \
   --webhook-url=http://localhost:8080/webhook \
-  --listen-addr=:9090
+  --metrics-addr=:9090
 ```
 
 ## Where next

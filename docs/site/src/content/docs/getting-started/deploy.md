@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-`leeway watch` runs continuously as a daemon. Unlike `leeway report`, which evaluates a single point-in-time snapshot, `leeway watch` maintains live Kubernetes informers, tracks dwell and resolution hysteresis (`--topology-dwell`, `--compute-class-dwell`), learns per-subject EWMA baselines (`--topology-learn-baselines`), serves Prometheus `/metrics`, and delivers incident and resolution events to an HTTP webhook callback.
+`leeway watch` runs continuously as a daemon. Unlike `leeway report`, which evaluates a single point-in-time snapshot, `leeway watch` maintains live Kubernetes informers, tracks dwell and resolution hysteresis (`--topology-dwell`, `--compute-class-dwell`), learns per-subject baselines (persisted across restarts with `--store`), serves Prometheus `/metrics`, and delivers incident and resolution events to an HTTP webhook callback.
 
 ## Deploying in-cluster with Kustomize
 
@@ -29,11 +29,11 @@ To send incident notifications and recovery events to an external HTTP webhook r
 ```sh
 leeway watch \
   --in-cluster \
-  --cluster=prod-us-east1 \
+  --cluster-name=prod-us-east1 \
   --webhook-url=http://incident-receiver.monitoring.svc:8080 \
   --sink-token-env=LEEWAY_WEBHOOK_TOKEN \
   --store=/var/lib/leeway/leeway.db \
-  --listen-addr=:9090
+  --metrics-addr=:9090
 ```
 
 ## Watching multiple clusters from one daemon
@@ -42,7 +42,7 @@ leeway watch \
 
 ```sh
 leeway watch \
-  --clusters-from=/etc/leeway/clusters.txt \
+  --clusters-from=kubeconfig:/etc/leeway/kubeconfig \
   --webhook-url=http://incident-receiver.monitoring.svc:8080 \
-  --listen-addr=:9090
+  --metrics-addr=:9090
 ```

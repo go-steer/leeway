@@ -5,7 +5,7 @@ sidebar:
   order: 2
 ---
 
-Nothing on this page changes what is measured. Every flag below changes what is *reported*, and the core Prometheus gauges stay complete either way.
+Nothing on this page changes what is measured. Every flag below changes what is *reported*, and the core Prometheus gauges stay complete either way. `leeway watch --help` prints the authoritative list for the installed build.
 
 ## Per-workload severity with `LeewayPolicy`
 
@@ -28,6 +28,8 @@ spec:
         severity: critical   # info | warning | critical
 ```
 
+The policy's key must be one of the tracked axes (`--topology-keys`); a policy carries no `maxSkew`, so it changes the severity and the expectation (`mode`, `weighting`, `expectedDistribution`), not the tier. Findings whose severity came from a policy carry `severityFromPolicy: true`.
+
 ## Which flag moves which tier
 
 ### Tier A and B — `topology-drift`
@@ -35,18 +37,20 @@ spec:
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `--topology-dwell` | `10m` | How long a breach must persist in `leeway watch` before it emits a signal. Raise on clusters that deploy continuously. |
-| `--topology-keys` | `topology.kubernetes.io/zone,topology.kubernetes.io/region` | Topology axes evaluated by default. |
-| `--topology-capacity-ratio` | `1.25` | Largest-to-smallest domain allocatable CPU ratio at which expectation switches from uniform to capacity-weighted. |
-| `--topology-cluster-defaults` | — | Your `kube-scheduler` `defaultConstraints` (`key:maxSkew:ScheduleAnyway,...`). Capped at Tier B. |
+| `--topology-keys` | `topology.kubernetes.io/zone,topology.kubernetes.io/region` | Topology axes evaluated, in precedence order. |
+| `--topology-domain-unavailable-keys` | `topology.kubernetes.io/zone,topology.kubernetes.io/region` | Axes on which a domain with no usable node raises `leeway.domain_unavailable` (Tier B). Pass an empty string to turn the detector off. |
+| `--topology-cluster-defaults` | `""` | Your `kube-scheduler` `defaultConstraints` as `key=maxSkew[:DoNotSchedule\|ScheduleAnyway],...`, or `none`. Empty assumes the system defaults, which are capped at Tier B; a declared default is judged like any other declared constraint. |
+
+The switch from uniform to capacity-weighted expectation (largest-to-smallest domain allocatable CPU ratio of `1.25`) is a constant, not a flag.
 
 ### Tier C — learned baselines
 
+Baselines are learned automatically in `leeway watch` for every scored subject, with fixed parameters (12h half-life; a band of 4 learned deviations with a 0.05 floor; mature after 200 samples and 6h). There is no flag to turn them off or retune them.
+
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--topology-learn-baselines` | `true` | Enables EWMA baseline learning for workloads without declared constraints. |
-| `--topology-baseline-band` | `4` | Width of the learned tolerance band (in learned mean-absolute-deviations). Widen first if Tier C is noisy. |
-| `--topology-baseline-half-life` | `12h` | How fast a learned baseline absorbs a step change. |
-| `--topology-tier-c-signals` | `false` | Opt-in to emit Tier C findings (`leeway.baseline_breach`) as signals/webhook incidents. |
+| `--store` | `""` | SQLite file that persists learned baselines (and dwell timers) across restarts. Without it a restart starts learning from scratch. |
+| `--topology-tier-c-signals` | `false` | Opt-in to emit Tier C findings (`leeway.baseline_breach`, Tier C `leeway.placement_drift`) as signals/webhook incidents. |
 
 ### `compute-class`
 
@@ -54,20 +58,16 @@ spec:
 | --- | --- | --- |
 | `--compute-class-dwell` | `10m` | Dwell time for rank findings in `leeway watch`. |
 | `--compute-class-window` | `1h` | Rolling pod-time integration window for rank shares. |
-| `--compute-class-last-rank-ceiling` | `0.9` | Fires `leeway.rank_degraded` when more than this share of pod-time ran on the least-preferred priority (`K-1`). |
+| `--compute-class-last-rank-ceiling` | `0.9` | Fires `leeway.rank_degraded` when more than this share of pod-time ran on the least-preferred priority (`0` disables). |
 | `--compute-class-rank0-floor` | `0` (off) | Fires `leeway.rank_degraded` when less than this share of pod-time ran on `rank 0`. |
 | `--compute-class-tier-c-signals` | `false` | Opt-in to emit `leeway.rank_tier_unused` as signals/webhook incidents. |
 
 ## Per-domain metric cardinality controls
 
-The per-domain breakdown gauges (`lookout_leeway_domain_objects` and `lookout_leeway_domain_expected`) emit one series per `(subject, topology_key, domain, state)`. By default they are gated by a minimum drift threshold:
+The per-domain breakdown gauges emit one series per `(subject, topology_key, domain, state)` for `lookout_leeway_domain_objects` and one per `(subject, topology_key, domain)` for `lookout_leeway_domain_expected`. By default they are gated: a subject exports its breakdown when it has an open episode or its drift is at least `0.05`, on at most 4 topology keys, with the four pod states collapsed to `active` / `waiting`. Subjects held back are counted in `lookout_leeway_domain_series_withheld{reason="gate"|"namespace"|"key_cap"}`. Node-group subjects are tracked up to 200 groups.
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--topology-per-domain-min-drift` | `0.05` | Only subjects drifting by at least this fraction export per-domain series. |
 | `--topology-per-domain-series` | `false` | Export per-domain series for every tracked subject regardless of drift. |
-| `--topology-per-domain-namespaces` | all | Restrict per-domain series to named namespaces. |
-| `--topology-per-domain-exclude-namespaces` | — | Exclude named namespaces from per-domain series (takes precedence over include list). |
-| `--topology-per-domain-max-keys` | `4` | Maximum topology keys per subject that may export per-domain series. |
-| `--topology-per-domain-collapse-states` | `true` | Collapses 4 pod states onto 2 (`running`, `other`), halving series cardinality. |
-| `--topology-max-node-groups` | `200` | Upper bound on node groups before node-group scoring is withheld (`lookout_leeway_domain_series_withheld`). |
+
+The floor, key cap, state collapsing, namespace filters and node-group bound are fixed in this build (`topologydrift.Config` defaults); there are no flags for them.

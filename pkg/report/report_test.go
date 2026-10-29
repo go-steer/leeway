@@ -145,12 +145,25 @@ func TestCollect_MultiCluster(t *testing.T) {
 	}
 }
 
-func TestCollect_SeededD(t *testing.T) {
+// TestCollect_CauseAttribution exercises one two-zone cluster holding four
+// workloads, each skewed by a different mechanism, and checks that the
+// snapshot pipeline attributes each one to the right SuspectedCause and
+// RemediationKind:
+//
+//   - affinity-pinned-api: a zone topologySpreadConstraint contradicted by a
+//     required nodeAffinity on the same key → constraint_ignored, manifest_patch.
+//   - zonal-pv-store: StatefulSet replicas held in one zone by zonal
+//     PersistentVolumes → volume_pinning, storage_topology.
+//   - cpu-starved-worker: a DoNotSchedule constraint whose remaining replicas
+//     are Pending on Insufficient cpu → domain_capacity_shortfall, cluster_capacity.
+//   - pool-pinned-filler: a nodeSelector onto a single-zone node pool, which
+//     is honoured as intent and must produce no finding at all.
+func TestCollect_CauseAttribution(t *testing.T) {
 	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
-	client := buildSeededDCluster()
+	client := buildAttributionCluster()
 
 	targets := []clusters.Cluster{
-		{Identity: clusters.Identity{Cluster: "seeded-d"}, Profile: "flag"},
+		{Identity: clusters.Identity{Cluster: "gke-two-zone"}, Profile: "flag"},
 	}
 
 	rep, err := Collect(context.Background(), targets, Options{
@@ -174,84 +187,94 @@ func TestCollect_SeededD(t *testing.T) {
 		}
 	}
 
-	if _, bad := byWorkload["first-zone-sponge"]; bad {
-		t.Errorf("first-zone-sponge should not be flagged as topology drift (intentionally pinned to default-pool)")
+	if _, bad := byWorkload["pool-pinned-filler"]; bad {
+		t.Errorf("pool-pinned-filler should not be flagged as topology drift (intentionally pinned to default-pool)")
 	}
 
-	// 1. zone-pinned-api (zonal-skew-scheduling)
-	apiFinding, ok := byWorkload["zone-pinned-api"]
+	// 1. affinity-pinned-api: required nodeAffinity conflicts with the zone spread constraint.
+	apiFinding, ok := byWorkload["affinity-pinned-api"]
 	if !ok {
-		t.Fatalf("expected topology finding for zone-pinned-api, got findings: %+v", byWorkload)
+		t.Fatalf("expected topology finding for affinity-pinned-api, got findings: %+v", byWorkload)
 	}
 	if apiFinding.SuspectedCause != leeway.CauseConstraintIgnored {
-		t.Errorf("zone-pinned-api SuspectedCause = %q, want %q", apiFinding.SuspectedCause, leeway.CauseConstraintIgnored)
+		t.Errorf("affinity-pinned-api SuspectedCause = %q, want %q", apiFinding.SuspectedCause, leeway.CauseConstraintIgnored)
 	}
 	if apiFinding.Remediation == nil || apiFinding.Remediation.Kind != leeway.RemediationManifestPatch {
-		t.Errorf("zone-pinned-api Remediation = %+v, want %q", apiFinding.Remediation, leeway.RemediationManifestPatch)
+		t.Errorf("affinity-pinned-api Remediation = %+v, want %q", apiFinding.Remediation, leeway.RemediationManifestPatch)
 	}
 
-	// 2. zone-bound-store (zonal-skew-volume)
-	storeFinding, ok := byWorkload["zone-bound-store"]
+	// 2. zonal-pv-store: replicas pinned to one zone by zonal PersistentVolumes.
+	storeFinding, ok := byWorkload["zonal-pv-store"]
 	if !ok {
-		t.Fatalf("expected topology finding for zone-bound-store, got findings: %+v", byWorkload)
+		t.Fatalf("expected topology finding for zonal-pv-store, got findings: %+v", byWorkload)
 	}
 	if storeFinding.SuspectedCause != leeway.CauseVolumePinning {
-		t.Errorf("zone-bound-store SuspectedCause = %q, want %q", storeFinding.SuspectedCause, leeway.CauseVolumePinning)
+		t.Errorf("zonal-pv-store SuspectedCause = %q, want %q", storeFinding.SuspectedCause, leeway.CauseVolumePinning)
 	}
 	if storeFinding.Remediation == nil || storeFinding.Remediation.Kind != leeway.RemediationStorageTopology {
-		t.Errorf("zone-bound-store Remediation = %+v, want %q", storeFinding.Remediation, leeway.RemediationStorageTopology)
+		t.Errorf("zonal-pv-store Remediation = %+v, want %q", storeFinding.Remediation, leeway.RemediationStorageTopology)
 	}
 
-	// 3. capacity-starved-worker (zonal-skew-capacity)
-	workerFinding, ok := byWorkload["capacity-starved-worker"]
+	// 3. cpu-starved-worker: DoNotSchedule constraint with replicas Pending on Insufficient cpu.
+	workerFinding, ok := byWorkload["cpu-starved-worker"]
 	if !ok {
-		t.Fatalf("expected topology finding for capacity-starved-worker, got findings: %+v", byWorkload)
+		t.Fatalf("expected topology finding for cpu-starved-worker, got findings: %+v", byWorkload)
 	}
 	if workerFinding.SuspectedCause != leeway.CauseCapacityShortfall {
-		t.Errorf("capacity-starved-worker SuspectedCause = %q, want %q", workerFinding.SuspectedCause, leeway.CauseCapacityShortfall)
+		t.Errorf("cpu-starved-worker SuspectedCause = %q, want %q", workerFinding.SuspectedCause, leeway.CauseCapacityShortfall)
 	}
 	if workerFinding.Remediation == nil || workerFinding.Remediation.Kind != leeway.RemediationClusterCapacity {
-		t.Errorf("capacity-starved-worker Remediation = %+v, want %q", workerFinding.Remediation, leeway.RemediationClusterCapacity)
+		t.Errorf("cpu-starved-worker Remediation = %+v, want %q", workerFinding.Remediation, leeway.RemediationClusterCapacity)
+	}
+	// One Running pod and three Pending/Unschedulable ones under maxSkew 1:
+	// observedSkew counts Running pods only (1 − 0), while the shortfall
+	// scoring in topologydrift.ScoreAxis adds the three blocked replicas
+	// before subtracting the floor ((1 + 3) − 1). excessSkew > observedSkew
+	// is the intended reading of a constraint that is holding pods back, and
+	// is documented in concepts/scoring-and-attribution.md.
+	if workerFinding.Score.ObservedSkew != 1 || workerFinding.Score.ExcessSkew != 3 {
+		t.Errorf("cpu-starved-worker score = observedSkew %d, excessSkew %d; want 1 and 3 (Pending replicas counted into the excess)",
+			workerFinding.Score.ObservedSkew, workerFinding.Score.ExcessSkew)
 	}
 }
 
-func buildSeededDCluster() kubernetes.Interface {
-	nodeA := makeReadyNode("gke-seeded-d-default-pool-1", "us-central1-a", "us-central1", "", "", "e2-small")
+func buildAttributionCluster() kubernetes.Interface {
+	nodeA := makeReadyNode("gke-two-zone-default-pool-1", "us-central1-a", "us-central1", "", "", "e2-small")
 	nodeA.Labels["cloud.google.com/gke-nodepool"] = "default-pool"
 	nodeA.Labels["topology.gke.io/zone"] = "us-central1-a"
 	nodeA.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("940m")
 
-	nodeB := makeReadyNode("gke-seeded-d-second-zone-pool-1", "us-central1-b", "us-central1", "", "", "e2-standard-2")
+	nodeB := makeReadyNode("gke-two-zone-second-zone-pool-1", "us-central1-b", "us-central1", "", "", "e2-standard-2")
 	nodeB.Labels["cloud.google.com/gke-nodepool"] = "second-zone-pool"
 	nodeB.Labels["topology.gke.io/zone"] = "us-central1-b"
 	nodeB.Status.Allocatable[corev1.ResourceCPU] = resource.MustParse("1930m")
 
 	isController := true
-	ns := "seeded-topology"
+	ns := "topology"
 
-	spongeRS := &appsv1.ReplicaSet{
+	fillerRS := &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "first-zone-sponge-rs",
+			Name:      "pool-pinned-filler-rs",
 			Namespace: ns,
-			UID:       types.UID("rs-sponge"),
+			UID:       types.UID("rs-filler"),
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
-				Name:       "first-zone-sponge",
-				UID:        types.UID("dep-sponge"),
+				Name:       "pool-pinned-filler",
+				UID:        types.UID("dep-filler"),
 				Controller: &isController,
 			}},
 		},
 	}
 	apiRS := &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "zone-pinned-api-rs",
+			Name:      "affinity-pinned-api-rs",
 			Namespace: ns,
 			UID:       types.UID("rs-api"),
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
-				Name:       "zone-pinned-api",
+				Name:       "affinity-pinned-api",
 				UID:        types.UID("dep-api"),
 				Controller: &isController,
 			}},
@@ -259,13 +282,13 @@ func buildSeededDCluster() kubernetes.Interface {
 	}
 	workerRS := &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "capacity-starved-worker-rs",
+			Name:      "cpu-starved-worker-rs",
 			Namespace: ns,
 			UID:       types.UID("rs-worker"),
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
-				Name:       "capacity-starved-worker",
+				Name:       "cpu-starved-worker",
 				UID:        types.UID("dep-worker"),
 				Controller: &isController,
 			}},
@@ -273,21 +296,21 @@ func buildSeededDCluster() kubernetes.Interface {
 	}
 
 	var objs []runtime.Object
-	objs = append(objs, nodeA, nodeB, spongeRS, apiRS, workerRS)
+	objs = append(objs, nodeA, nodeB, fillerRS, apiRS, workerRS)
 
-	// 1. first-zone-sponge: 6 pods in us-central1-a via nodeSelector on gke-nodepool
+	// 1. pool-pinned-filler: 6 pods in us-central1-a via nodeSelector on gke-nodepool
 	for i := 0; i < 6; i++ {
 		objs = append(objs, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "first-zone-sponge-" + string(rune('a'+i)),
+				Name:      "pool-pinned-filler-" + string(rune('a'+i)),
 				Namespace: ns,
-				UID:       types.UID("sponge-" + string(rune('a'+i))),
-				Labels:    map[string]string{"app": "first-zone-sponge"},
+				UID:       types.UID("filler-" + string(rune('a'+i))),
+				Labels:    map[string]string{"app": "pool-pinned-filler"},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: "apps/v1",
 					Kind:       "ReplicaSet",
-					Name:       "first-zone-sponge-rs",
-					UID:        types.UID("rs-sponge"),
+					Name:       "pool-pinned-filler-rs",
+					UID:        types.UID("rs-filler"),
 					Controller: &isController,
 				}},
 			},
@@ -299,18 +322,18 @@ func buildSeededDCluster() kubernetes.Interface {
 		})
 	}
 
-	// 2. zone-pinned-api: 2 pods in us-central1-a with conflicting zone nodeAffinity + zone TSC
+	// 2. affinity-pinned-api: 2 pods in us-central1-a with conflicting zone nodeAffinity + zone TSC
 	for i := 0; i < 2; i++ {
 		objs = append(objs, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "zone-pinned-api-" + string(rune('a'+i)),
+				Name:      "affinity-pinned-api-" + string(rune('a'+i)),
 				Namespace: ns,
 				UID:       types.UID("api-" + string(rune('a'+i))),
-				Labels:    map[string]string{"app": "zone-pinned-api"},
+				Labels:    map[string]string{"app": "affinity-pinned-api"},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: "apps/v1",
 					Kind:       "ReplicaSet",
-					Name:       "zone-pinned-api-rs",
+					Name:       "affinity-pinned-api-rs",
 					UID:        types.UID("rs-api"),
 					Controller: &isController,
 				}},
@@ -335,7 +358,7 @@ func buildSeededDCluster() kubernetes.Interface {
 					TopologyKey:       corev1.LabelTopologyZone,
 					WhenUnsatisfiable: corev1.ScheduleAnyway,
 					LabelSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"app": "zone-pinned-api"},
+						MatchLabels: map[string]string{"app": "affinity-pinned-api"},
 					},
 				}},
 			},
@@ -343,11 +366,11 @@ func buildSeededDCluster() kubernetes.Interface {
 		})
 	}
 
-	// 3. zone-bound-store: StatefulSet with 2 pods bound to GKE PD CSI zonal PVs (topology.gke.io/zone)
+	// 3. zonal-pv-store: StatefulSet with 2 pods bound to GKE PD CSI zonal PVs (topology.gke.io/zone)
 	for i := 0; i < 2; i++ {
 		suffix := string(rune('0' + i))
-		pvcName := "data-zone-bound-store-" + suffix
-		pvName := "pv-zone-bound-store-" + suffix
+		pvcName := "data-zonal-pv-store-" + suffix
+		pvName := "pv-zonal-pv-store-" + suffix
 		objs = append(objs,
 			&corev1.PersistentVolumeClaim{
 				ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: ns},
@@ -371,14 +394,14 @@ func buildSeededDCluster() kubernetes.Interface {
 			},
 			&corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "zone-bound-store-" + suffix,
+					Name:      "zonal-pv-store-" + suffix,
 					Namespace: ns,
 					UID:       types.UID("store-" + suffix),
-					Labels:    map[string]string{"app": "zone-bound-store"},
+					Labels:    map[string]string{"app": "zonal-pv-store"},
 					OwnerReferences: []metav1.OwnerReference{{
 						APIVersion: "apps/v1",
 						Kind:       "StatefulSet",
-						Name:       "zone-bound-store",
+						Name:       "zonal-pv-store",
 						UID:        types.UID("sts-store"),
 						Controller: &isController,
 					}},
@@ -396,7 +419,7 @@ func buildSeededDCluster() kubernetes.Interface {
 						TopologyKey:       corev1.LabelHostname,
 						WhenUnsatisfiable: corev1.ScheduleAnyway,
 						LabelSelector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{"app": "zone-bound-store"},
+							MatchLabels: map[string]string{"app": "zonal-pv-store"},
 						},
 					}},
 				},
@@ -405,17 +428,17 @@ func buildSeededDCluster() kubernetes.Interface {
 		)
 	}
 
-	// 4. capacity-starved-worker: 1 Running pod in us-central1-b + 3 Pending Unschedulable pods
+	// 4. cpu-starved-worker: 1 Running pod in us-central1-b + 3 Pending Unschedulable pods
 	objs = append(objs, &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "capacity-starved-worker-running",
+			Name:      "cpu-starved-worker-running",
 			Namespace: ns,
 			UID:       types.UID("worker-run-0"),
-			Labels:    map[string]string{"app": "capacity-starved-worker"},
+			Labels:    map[string]string{"app": "cpu-starved-worker"},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1",
 				Kind:       "ReplicaSet",
-				Name:       "capacity-starved-worker-rs",
+				Name:       "cpu-starved-worker-rs",
 				UID:        types.UID("rs-worker"),
 				Controller: &isController,
 			}},
@@ -427,7 +450,7 @@ func buildSeededDCluster() kubernetes.Interface {
 				TopologyKey:       corev1.LabelTopologyZone,
 				WhenUnsatisfiable: corev1.DoNotSchedule,
 				LabelSelector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{"app": "capacity-starved-worker"},
+					MatchLabels: map[string]string{"app": "cpu-starved-worker"},
 				},
 			}},
 		},
@@ -436,14 +459,14 @@ func buildSeededDCluster() kubernetes.Interface {
 	for i := 0; i < 3; i++ {
 		objs = append(objs, &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "capacity-starved-worker-pending-" + string(rune('a'+i)),
+				Name:      "cpu-starved-worker-pending-" + string(rune('a'+i)),
 				Namespace: ns,
 				UID:       types.UID("worker-pend-" + string(rune('a'+i))),
-				Labels:    map[string]string{"app": "capacity-starved-worker"},
+				Labels:    map[string]string{"app": "cpu-starved-worker"},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: "apps/v1",
 					Kind:       "ReplicaSet",
-					Name:       "capacity-starved-worker-rs",
+					Name:       "cpu-starved-worker-rs",
 					UID:        types.UID("rs-worker"),
 					Controller: &isController,
 				}},
@@ -454,7 +477,7 @@ func buildSeededDCluster() kubernetes.Interface {
 					TopologyKey:       corev1.LabelTopologyZone,
 					WhenUnsatisfiable: corev1.DoNotSchedule,
 					LabelSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"app": "capacity-starved-worker"},
+						MatchLabels: map[string]string{"app": "cpu-starved-worker"},
 					},
 				}},
 			},
