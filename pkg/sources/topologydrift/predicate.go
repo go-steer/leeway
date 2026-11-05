@@ -15,7 +15,10 @@
 package topologydrift
 
 import (
+	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -338,4 +341,60 @@ func sameTopologyAxis(labelKey string, axis leeway.TopologyKey) bool {
 		}
 	}
 	return false
+}
+
+// withoutSelectorAndAffinity returns a copy of c with NodeSelector and
+// RequiredNodeAffinity cleared (retaining Tolerations) and reports whether
+// anything was removed.
+func (c Constraints) withoutSelectorAndAffinity() (Constraints, bool) {
+	if len(c.NodeSelector) == 0 && c.RequiredNodeAffinity == nil {
+		return c, false
+	}
+	return Constraints{Tolerations: c.Tolerations}, true
+}
+
+// selectorDescription renders a deterministic human-readable summary of the
+// pod's nodeSelector and required nodeAffinity keys for evidence/factor lines.
+func (c Constraints) selectorDescription() string {
+	var parts []string
+	if len(c.NodeSelector) > 0 {
+		keys := make([]string, 0, len(c.NodeSelector))
+		for k := range c.NodeSelector {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		kv := make([]string, 0, len(keys))
+		for _, k := range keys {
+			kv = append(kv, fmt.Sprintf("%s=%s", k, c.NodeSelector[k]))
+		}
+		parts = append(parts, "nodeSelector "+strings.Join(kv, ","))
+	}
+	if c.RequiredNodeAffinity != nil {
+		seen := make(map[string]bool)
+		var keys []string
+		for _, term := range c.RequiredNodeAffinity.NodeSelectorTerms {
+			for _, req := range term.MatchExpressions {
+				if !seen[req.Key] {
+					seen[req.Key] = true
+					keys = append(keys, req.Key)
+				}
+			}
+			for _, req := range term.MatchFields {
+				if !seen[req.Key] {
+					seen[req.Key] = true
+					keys = append(keys, req.Key)
+				}
+			}
+		}
+		sort.Strings(keys)
+		if len(keys) > 0 {
+			parts = append(parts, fmt.Sprintf("required nodeAffinity (%s)", strings.Join(keys, ",")))
+		} else {
+			parts = append(parts, "required nodeAffinity")
+		}
+	}
+	if len(parts) == 0 {
+		return "nodeSelector/nodeAffinity"
+	}
+	return strings.Join(parts, " and ")
 }

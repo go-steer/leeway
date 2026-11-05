@@ -337,3 +337,93 @@ func maybeCaps(r *rand.Rand, m int, n int64) []int64 {
 	}
 	return caps
 }
+
+func TestApportionAligned_PermutationsHaveZeroRelocation(t *testing.T) {
+	tests := []struct {
+		name    string
+		actual  []int64
+		weights []float64
+		wantExp []int64
+		wantR   int64
+	}{
+		{"2 over 3 zones [1,1,0]", []int64{1, 1, 0}, EqualWeights(3), []int64{1, 1, 0}, 0},
+		{"2 over 3 zones [1,0,1]", []int64{1, 0, 1}, EqualWeights(3), []int64{1, 0, 1}, 0},
+		{"2 over 3 zones [0,1,1]", []int64{0, 1, 1}, EqualWeights(3), []int64{0, 1, 1}, 0},
+		{"4 over 3 zones [2,1,1]", []int64{2, 1, 1}, EqualWeights(3), []int64{2, 1, 1}, 0},
+		{"4 over 3 zones [1,2,1]", []int64{1, 2, 1}, EqualWeights(3), []int64{1, 2, 1}, 0},
+		{"4 over 3 zones [1,1,2]", []int64{1, 1, 2}, EqualWeights(3), []int64{1, 1, 2}, 0},
+		{"6 over 4 zones [1,1,2,2]", []int64{1, 1, 2, 2}, EqualWeights(4), []int64{1, 1, 2, 2}, 0},
+		{"6 over 4 zones [2,1,2,1]", []int64{2, 1, 2, 1}, EqualWeights(4), []int64{2, 1, 2, 1}, 0},
+		{"skewed [3,1,0] gets R=1", []int64{3, 1, 0}, EqualWeights(3), []int64{2, 1, 1}, 1},
+		{"skewed [0,1,3] gets R=1", []int64{0, 1, 3}, EqualWeights(3), []int64{1, 1, 2}, 1},
+		{"equal millicores [0,1,1]", []int64{0, 1, 1}, []float64{4000, 4000, 4000}, []int64{0, 1, 1}, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var n int64
+			for _, a := range tc.actual {
+				n += a
+			}
+			got := ApportionAligned(n, tc.weights, nil, tc.actual)
+			if !reflect.DeepEqual(got.Expected, tc.wantExp) {
+				t.Errorf("Expected = %v, want %v", got.Expected, tc.wantExp)
+			}
+			var reloc int64
+			for i := range tc.actual {
+				if tc.actual[i] > got.Expected[i] {
+					reloc += tc.actual[i] - got.Expected[i]
+				}
+			}
+			if reloc != tc.wantR {
+				t.Errorf("Relocation = %d, want %d (actual=%v expected=%v)", reloc, tc.wantR, tc.actual, got.Expected)
+			}
+		})
+	}
+}
+
+func TestApportionAligned_PreservesInvariantsAndNeverWorsensRelocation(t *testing.T) {
+	r := propRand()
+	for i := 0; i < 2000; i++ {
+		m := 1 + r.IntN(8)
+		actual := make([]int64, m)
+		var n int64
+		for j := range actual {
+			actual[j] = int64(r.IntN(25))
+			n += actual[j]
+		}
+		w := randomWeights(r, m)
+		caps := maybeCaps(r, m, n)
+
+		base := Apportion(n, w, caps)
+		aligned := ApportionAligned(n, w, caps, actual)
+
+		if aligned.Placed != base.Placed || aligned.Unplaceable != base.Unplaceable {
+			t.Fatalf("Placed/Unplaceable diverged: aligned=(%d,%d) base=(%d,%d) n=%d w=%v caps=%v actual=%v",
+				aligned.Placed, aligned.Unplaceable, base.Placed, base.Unplaceable, n, w, caps, actual)
+		}
+		var sum int64
+		for j, e := range aligned.Expected {
+			sum += e
+			if caps != nil && caps[j] >= 0 && e > caps[j] {
+				t.Fatalf("cap violated at %d: got %d > %d", j, e, caps[j])
+			}
+		}
+		if sum != aligned.Placed {
+			t.Fatalf("sum=%d != Placed=%d", sum, aligned.Placed)
+		}
+		if caps == nil && n > 0 {
+			var relocBase, relocAligned int64
+			for j := range actual {
+				if actual[j] > base.Expected[j] {
+					relocBase += actual[j] - base.Expected[j]
+				}
+				if actual[j] > aligned.Expected[j] {
+					relocAligned += actual[j] - aligned.Expected[j]
+				}
+			}
+			if relocAligned > relocBase {
+				t.Fatalf("aligned relocation %d > base relocation %d for actual=%v w=%v", relocAligned, relocBase, actual, w)
+			}
+		}
+	}
+}

@@ -18,6 +18,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -724,5 +727,209 @@ func makeReadyNode(name, zone, region, cc, priorityIdx, instanceType string) *co
 				corev1.ResourceMemory: resource.MustParse("16Gi"),
 			},
 		},
+	}
+}
+
+func TestCollect_SelectorConfinedTierC(t *testing.T) {
+	now := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	client := buildAttributionCluster()
+	targets := []clusters.Cluster{
+		{Identity: clusters.Identity{Cluster: "gke-two-zone"}, Profile: "flag"},
+	}
+
+	// Default (TopologyTierC=false) with All=true: pool-pinned-filler stays out
+	// of TopologyFindings, while Subjects records selector_confined with empty
+	// tier/severity.
+	defaultRep, err := Collect(context.Background(), targets, Options{
+		Now:     now,
+		All:     true,
+		Timeout: 10 * time.Second,
+		ClientBuilder: func(c clusters.Cluster) (kubernetes.Interface, dynamic.Interface, error) {
+			return client, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Collect (default): %v", err)
+	}
+	for _, f := range defaultRep.Clusters[0].TopologyFindings {
+		if f.Subject.Name == "pool-pinned-filler" {
+			t.Fatalf("pool-pinned-filler unexpectedly emitted with TopologyTierC=false: %+v", f)
+		}
+	}
+	var foundSubject bool
+	for _, f := range defaultRep.Clusters[0].Subjects {
+		if f.Subject.Name == "pool-pinned-filler" && f.TopologyKey == corev1.LabelTopologyZone {
+			foundSubject = true
+			if f.SuspectedCause != leeway.CauseSelectorConfined {
+				t.Errorf("Subjects pool-pinned-filler SuspectedCause = %q, want %q", f.SuspectedCause, leeway.CauseSelectorConfined)
+			}
+			if f.Tier != "" || f.Severity != "" || f.Remediation != nil {
+				t.Errorf("Subjects non-signaled row should keep empty tier/severity and nil remediation, got tier=%q sev=%q rem=%+v",
+					f.Tier, f.Severity, f.Remediation)
+			}
+		}
+	}
+	if !foundSubject {
+		t.Error("expected pool-pinned-filler zone row in Subjects when All=true")
+	}
+
+	// Opt-in (TopologyTierC=true): pool-pinned-filler surfaces in TopologyFindings
+	// at Tier C / info with CauseSelectorConfined and RemediationClusterNodes.
+	tierCRep, err := Collect(context.Background(), targets, Options{
+		Now:           now,
+		TopologyTierC: true,
+		Timeout:       10 * time.Second,
+		ClientBuilder: func(c clusters.Cluster) (kubernetes.Interface, dynamic.Interface, error) {
+			return client, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Collect (TopologyTierC=true): %v", err)
+	}
+	var confined *leeway.Finding
+	for i := range tierCRep.Clusters[0].TopologyFindings {
+		f := &tierCRep.Clusters[0].TopologyFindings[i]
+		if f.Subject.Name == "pool-pinned-filler" && f.TopologyKey == corev1.LabelTopologyZone {
+			confined = f
+			break
+		}
+	}
+	if confined == nil {
+		t.Fatalf("expected pool-pinned-filler zone finding when TopologyTierC=true, got: %+v", tierCRep.Clusters[0].TopologyFindings)
+	}
+	if confined.Kind != leeway.KindPlacementDrift {
+		t.Errorf("Kind = %q, want %q", confined.Kind, leeway.KindPlacementDrift)
+	}
+	if confined.Tier != "C" || confined.Severity != "info" {
+		t.Errorf("Tier/Severity = %q/%q, want C/info", confined.Tier, confined.Severity)
+	}
+	if confined.SuspectedCause != leeway.CauseSelectorConfined {
+		t.Errorf("SuspectedCause = %q, want %q", confined.SuspectedCause, leeway.CauseSelectorConfined)
+	}
+	if len(confined.UntestedCauses) != 0 {
+		t.Errorf("UntestedCauses = %v, want empty", confined.UntestedCauses)
+	}
+	wantFactor := "nodeSelector cloud.google.com/gke-nodepool=default-pool confines placement to 1 of 2 usable domains on topology.kubernetes.io/zone"
+	if len(confined.ContributingFactors) == 0 || confined.ContributingFactors[0] != wantFactor {
+		t.Errorf("ContributingFactors = %v, want first factor %q", confined.ContributingFactors, wantFactor)
+	}
+	if confined.Remediation == nil || confined.Remediation.Kind != leeway.RemediationClusterNodes {
+		t.Errorf("Remediation = %+v, want %q", confined.Remediation, leeway.RemediationClusterNodes)
+	}
+}
+
+func TestCollect_FetchViaKubectlTruncationFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	logFile := filepath.Join(tmpDir, "kubectl.log")
+	kubectlBin := filepath.Join(tmpDir, "kubectl")
+
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >> "` + logFile + `"
+
+args="$*"
+case "$args" in
+  *"get nodes -o json"*)
+    cat <<'EOF'
+{"apiVersion":"v1","kind":"NodeList","items":[
+  {"metadata":{"name":"node-a","labels":{"topology.kubernetes.io/zone":"us-central1-a","topology.kubernetes.io/region":"us-central1","kubernetes.io/hostname":"node-a"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"allocatable":{"cpu":"4","memory":"16Gi"}}},
+  {"metadata":{"name":"node-b","labels":{"topology.kubernetes.io/zone":"us-central1-b","topology.kubernetes.io/region":"us-central1","kubernetes.io/hostname":"node-b"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"allocatable":{"cpu":"4","memory":"16Gi"}}}
+]}
+EOF
+    ;;
+  *"get namespaces -o json"*)
+    cat <<'EOF'
+{"apiVersion":"v1","kind":"NamespaceList","items":[
+  {"metadata":{"name":"ns-a"}},
+  {"metadata":{"name":"ns-b"}}
+]}
+EOF
+    ;;
+  *"get pods -A -o json"*)
+    # Simulate credential-proxy 8 MiB stdout truncation mid-JSON
+    printf '{"apiVersion":"v1","kind":"PodList","items":[{"metadata":{"name":"truncated'
+    echo "credential proxy output truncated" >&2
+    ;;
+  *"get pods -n ns-a -o json"*)
+    cat <<'EOF'
+{"apiVersion":"v1","kind":"PodList","items":[
+  {"metadata":{"name":"api-0","namespace":"ns-a","uid":"p0","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+  {"metadata":{"name":"api-1","namespace":"ns-a","uid":"p1","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+  {"metadata":{"name":"api-2","namespace":"ns-a","uid":"p2","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+  {"metadata":{"name":"api-3","namespace":"ns-a","uid":"p3","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}}
+]}
+EOF
+    ;;
+  *"get pods -n ns-b -o json"*)
+    cat <<'EOF'
+{"apiVersion":"v1","kind":"PodList","items":[]}
+EOF
+    ;;
+  *"get events -A --field-selector=involvedObject.kind=Pod -o json"*)
+    # Simulate truncation even when JSON looks syntactically valid, caught via stderr notice
+    echo '{"apiVersion":"v1","kind":"EventList","items":[]}'
+    echo "credential proxy output truncated" >&2
+    ;;
+  *"get events -n "*" --field-selector=involvedObject.kind=Pod -o json"*)
+    echo '{"apiVersion":"v1","kind":"EventList","items":[]}'
+    ;;
+  *"get replicasets -A -o json"*)
+    cat <<'EOF'
+{"apiVersion":"apps/v1","kind":"ReplicaSetList","items":[
+  {"metadata":{"name":"api-rs","namespace":"ns-a","uid":"rs-api","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"api","uid":"dep-api","controller":true}]},"spec":{"selector":{"matchLabels":{"app":"api"}}}}
+]}
+EOF
+    ;;
+  *)
+    echo '{"apiVersion":"v1","kind":"List","items":[]}'
+    ;;
+esac
+`
+	if err := os.WriteFile(kubectlBin, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake kubectl: %v", err)
+	}
+
+	t.Setenv("PATH", tmpDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("CREDENTIAL_PROXY_URL", "http://127.0.0.1:18080")
+	t.Setenv("WATCHER_BROKER_URL", "")
+	t.Setenv("WATCHER_BROKER_TOKEN_FILE", "")
+
+	targets := []clusters.Cluster{
+		{Identity: clusters.Identity{Cluster: "proxied-cluster"}, Context: "gke_p_r_c"},
+	}
+	rep, err := Collect(context.Background(), targets, Options{
+		Now:     time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC),
+		Timeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(rep.Clusters) != 1 || rep.Clusters[0].Status != StatusOK {
+		t.Fatalf("cluster result = %+v, want StatusOK", rep.Clusters)
+	}
+	rawLog, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("read kubectl log: %v", err)
+	}
+	calls := string(rawLog)
+
+	if len(rep.Clusters[0].TopologyFindings) != 1 || rep.Clusters[0].TopologyFindings[0].Subject.Name != "api" {
+		t.Fatalf("TopologyFindings = %+v (Domains=%+v), want 1 finding for Deployment/ns-a/api; kubectl log:\n%s",
+			rep.Clusters[0].TopologyFindings, rep.Clusters[0].Domains, calls)
+	}
+	for _, want := range []string{
+		"--context=gke_p_r_c get pods -A -o json",
+		"--context=gke_p_r_c get namespaces -o json",
+		"--context=gke_p_r_c get pods -n ns-a -o json",
+		"--context=gke_p_r_c get pods -n ns-b -o json",
+		"--context=gke_p_r_c get events -A --field-selector=involvedObject.kind=Pod -o json",
+		"--context=gke_p_r_c get events -n ns-a --field-selector=involvedObject.kind=Pod -o json",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("kubectl calls missing %q; full log:\n%s", want, calls)
+		}
+	}
+	if count := strings.Count(calls, "get namespaces -o json"); count != 1 {
+		t.Errorf("expected namespaces to be listed once across truncated resources, got %d:\n%s", count, calls)
 	}
 }

@@ -154,6 +154,14 @@ func SuggestRemediation(f Finding, selectorLabels map[string]string) *FindingRem
 				deficits, deficits, f.Subject,
 			),
 		}
+	case CauseSelectorConfined:
+		return &FindingRemediation{
+			Kind: RemediationClusterNodes,
+			Summary: fmt.Sprintf(
+				"Placement of %s is confined to a single %s domain by nodeSelector or required nodeAffinity; expand the target node pool across multiple domains or move %s to a multi-domain pool rather than adding DoNotSchedule spread constraints or widening affinity onto domains without matching nodes.",
+				f.Subject, f.TopologyKey, f.Subject,
+			),
+		}
 	}
 
 	// 4. Workload / scheduler causes (constraint_ignored, rollout_bias, unknown).

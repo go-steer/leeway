@@ -46,6 +46,7 @@ const (
 	CauseVolumePinning     SuspectedCause = "volume_pinning"
 	CauseRolloutBias       SuspectedCause = "rollout_bias"
 	CauseConstraintIgnored SuspectedCause = "constraint_ignored"
+	CauseSelectorConfined  SuspectedCause = "selector_confined"
 )
 
 // DomainFacts is what the rest of the pipeline knows about one domain.
@@ -329,8 +330,10 @@ func causeRank(c SuspectedCause) int {
 		return 5
 	case CauseConstraintIgnored:
 		return 6
-	default:
+	case CauseSelectorConfined:
 		return 7
+	default:
+		return 8
 	}
 }
 
