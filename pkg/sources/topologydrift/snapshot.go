@@ -16,6 +16,8 @@ package topologydrift
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -111,6 +113,9 @@ type SnapshotResult struct {
 func (r *SnapshotResult) FindingFor(sub leeway.SubjectRef, ev *Evaluation, dist *leeway.Distribution) leeway.Finding {
 	if r == nil || r.source == nil || ev == nil {
 		return leeway.Finding{}
+	}
+	if factor, ok := selectorConfinedFactor(r.source, sub, ev); ok {
+		return buildSelectorConfinedFinding(r.source, sub, ev, dist, factor, r.now, r.source.cfg.TierCSignals)
 	}
 	phase := leeway.PhaseOK
 	if ev.Verdict.Breached {
@@ -255,6 +260,11 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 		for i := range evals {
 			ev := &evals[i]
 			if !ev.Verdict.Breached {
+				if s.cfg.TierCSignals {
+					if factor, ok := selectorConfinedFactor(s, sub, ev); ok {
+						res.Findings = append(res.Findings, buildSelectorConfinedFinding(s, sub, ev, snap[ev.Key], factor, now, true))
+					}
+				}
 				continue
 			}
 			f, delivery := s.findingFor(sub, ev, leeway.AlertState{
@@ -270,6 +280,105 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 	}
 
 	return res, nil
+}
+
+// selectorConfinedFactor reports whether a non-breaching workload evaluation on
+// a failure-domain axis is confined to a single domain by its own nodeSelector
+// or required nodeAffinity while the cluster has two or more usable domains.
+func selectorConfinedFactor(s *Source, sub leeway.SubjectRef, ev *Evaluation) (string, bool) {
+	if s == nil || ev == nil || ev.Verdict.Breached {
+		return "", false
+	}
+	switch sub.Kind {
+	case leeway.SubjectNodeGroup, leeway.SubjectDomain, leeway.SubjectPreferenceAxis, "":
+		return "", false
+	}
+	if !isSelectorConfinedAxis(ev.Key, s.cfg.DomainUnavailableKeys) {
+		return "", false
+	}
+	if ev.Intent != nil && (ev.Intent.Mode == leeway.ModeColocate || ev.Intent.Mode == leeway.ModeIgnore) {
+		return "", false
+	}
+	if s.cfg.Thresholds != nil && ev.Scores.Total < s.cfg.Thresholds.MinReplicasForScoring {
+		return "", false
+	}
+	if len(ev.Eligible.Domains) != 1 || ev.Eligible.Domains[0] == leeway.DomainUnknown {
+		return "", false
+	}
+	if len(ev.Scores.Actual) != 1 || ev.Scores.Actual[0] != ev.Scores.Total {
+		return "", false
+	}
+	if ev.Intent.EligibilityPolicies().NodeAffinityPolicy != corev1.NodeInclusionPolicyHonor {
+		return "", false
+	}
+
+	pod := s.subjectPod(sub)
+	if pod == nil {
+		return "", false
+	}
+	c := ConstraintsOf(pod)
+	stripped, changed := c.withoutSelectorAndAffinity()
+	if !changed {
+		return "", false
+	}
+	opts := leeway.DefaultEligibilityOptions()
+	opts.Policies = ev.Intent.EligibilityPolicies()
+	unconstrained := leeway.EligibleDomains(s.inv.NodeViews(ev.Key, stripped), opts)
+	usable := realUsableDomains(unconstrained)
+	if usable < 2 {
+		return "", false
+	}
+	return fmt.Sprintf("%s confines placement to 1 of %d usable domains on %s", c.selectorDescription(), usable, ev.Key), true
+}
+
+func isSelectorConfinedAxis(key leeway.TopologyKey, configured []leeway.TopologyKey) bool {
+	if len(configured) > 0 {
+		return slices.Contains(configured, key)
+	}
+	return key == corev1.LabelTopologyZone || key == corev1.LabelTopologyRegion
+}
+
+func realUsableDomains(el leeway.Eligibility) int {
+	limit := len(el.Domains) - el.SyntheticDomains
+	if limit < 0 {
+		limit = 0
+	}
+	count := 0
+	for _, d := range el.Domains[:limit] {
+		if d != leeway.DomainUnknown {
+			count++
+		}
+	}
+	return count
+}
+
+func buildSelectorConfinedFinding(s *Source, sub leeway.SubjectRef, ev *Evaluation, dist *leeway.Distribution, factor string, now time.Time, signal bool) leeway.Finding {
+	phase := leeway.PhaseOK
+	if signal {
+		phase = leeway.PhaseFiring
+	}
+	f, _ := s.findingFor(sub, ev, leeway.AlertState{
+		Phase:       phase,
+		FirstSeenAt: now,
+		Since:       now,
+	}, dist, now)
+	f.SuspectedCause = leeway.CauseSelectorConfined
+	f.UntestedCauses = nil
+	f.ContributingFactors = append([]string{factor}, f.ContributingFactors...)
+	if f.Intent != nil {
+		f.Intent.Evidence = append(f.Intent.Evidence, factor)
+	}
+	if signal {
+		f.Kind = leeway.KindPlacementDrift
+		f.Tier = leeway.TierC.String()
+		f.Severity = "info"
+		if ev.Intent != nil && ev.Intent.Severity != "" {
+			f.Severity = ev.Intent.Severity
+			f.SeverityFromPolicy = true
+		}
+		f.Remediation = leeway.SuggestRemediation(f, s.selectorLabelsFor(sub, ev.Key))
+	}
+	return f
 }
 
 // BuildCapacityOracle constructs a CapacityOracle from a point-in-time list of

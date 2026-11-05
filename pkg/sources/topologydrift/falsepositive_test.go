@@ -255,12 +255,15 @@ func falsePositiveCorpus(t *testing.T) []fpFixture {
 		deliberateColocation(t),
 		heterogeneousCapacity(t),
 		satisfiedMaxSkew(t),
+		hamiltonTieBreak(t),
+		evenSpreadOnUnequalZones(t),
 	}
 }
 
-// satisfiedMaxSkew: seven pods placed [1,3,3] under a DoNotSchedule zone
-// constraint with maxSkew 2. Found on a kind soak (3 zones × 2 workers), where
-// it raised Tier B placement_drift at ρ = 2/7 against the even [3,2,2].
+// satisfiedMaxSkew: eight pods placed [1,1,3,3] under a DoNotSchedule zone
+// constraint with maxSkew 2 across four equal zones. Against the even
+// expectation [2,2,2,2], two pods are off their share so ρ = 2/8 = 0.25 and
+// R = 2 — both above the default thresholds.
 //
 // The observed skew of 2 is exactly what the author declared acceptable, and
 // the scheduler is honouring it. §7.3 says E supersedes ρ where a hard
@@ -274,16 +277,17 @@ func satisfiedMaxSkew(t *testing.T) fpFixture {
 		zoneSpec{zone: "zone-a", nodes: 2},
 		zoneSpec{zone: "zone-b", nodes: 2},
 		zoneSpec{zone: "zone-c", nodes: 2},
+		zoneSpec{zone: "zone-d", nodes: 2},
 	)
 	rep := tscPod(zoneSpread(2, corev1.DoNotSchedule))
 
 	return fpFixture{
-		name: "satisfied maxSkew: [1,3,3] under DoNotSchedule maxSkew 2",
+		name: "satisfied maxSkew: [1,1,3,3] under DoNotSchedule maxSkew 2",
 		inv:  inv,
 		rep:  rep,
-		pods: replicas(rep, "zone-a-0",
-			"zone-b-0", "zone-b-1", "zone-b-1",
-			"zone-c-0", "zone-c-0", "zone-c-1"),
+		pods: replicas(rep, "zone-a-0", "zone-b-0",
+			"zone-c-0", "zone-c-1", "zone-c-1",
+			"zone-d-0", "zone-d-0", "zone-d-1"),
 		also: func(t *testing.T, got fpResult) {
 			if got.intent == nil || !got.intent.HardSkewContract() {
 				t.Fatalf("intent = %+v, want a hard skew contract — the fixture is not testing what it claims", got.intent)
@@ -559,14 +563,10 @@ func midRollout(t *testing.T) fpFixture {
 	}
 }
 
-// smallN is §7.4: four pods, one of them somewhere other than where the
-// expectation put it. ρ is 0.25, comfortably over the 0.2 threshold, and R is
-// 1 — below the small-n relocation floor, so nobody is paged.
-//
-// The misplacement is also the mildest kind there is. The expectation is
-// [2,1,1] only because Hamilton hands the single remainder to the lowest index;
-// [1,1,2] is an equally good placement and the model charges it R=1 purely for
-// the tie-break. That is the exact shape §7.4's floor exists to absorb.
+// smallN is §7.4: four pods placed [3,1,0] across three equal zones, so one pod
+// genuinely sits off the nearest balanced placement [2,1,1]. ρ is 0.25,
+// comfortably over the 0.2 threshold, and R is 1 — below the default small-n
+// relocation floor (2), so daemon mode does not page on a single misplaced pod.
 func smallN(t *testing.T) fpFixture {
 	inv := zonedInventory(t,
 		zoneSpec{zone: "zone-a", nodes: 2},
@@ -579,7 +579,7 @@ func smallN(t *testing.T) fpFixture {
 		name: "small n: 4 pods, one off the expectation",
 		inv:  inv,
 		rep:  rep,
-		pods: replicas(rep, "zone-a-0", "zone-b-0", "zone-c-0", "zone-c-1"),
+		pods: replicas(rep, "zone-a-0", "zone-a-0", "zone-a-1", "zone-b-0"),
 		also: func(t *testing.T, got fpResult) {
 			if drift := leeway.DefaultThresholds().Drift; got.scores.Drift <= drift {
 				t.Errorf("rho = %.3f, want it over the %.2f threshold — otherwise the small-n floor "+
@@ -587,6 +587,65 @@ func smallN(t *testing.T) fpFixture {
 			}
 			if want := "small-n: relocation below floor"; got.reason != want {
 				t.Errorf("reason = %q, want %q: %s", got.reason, want, got)
+			}
+		},
+	}
+}
+
+// hamiltonTieBreak: six pods placed [1,1,2,2] across four equal zones.
+// Unaligned Hamilton tie-breaking picks [2,2,1,1] by ascending index, which
+// charges R=2 and ρ=0.333 — breaching both DefaultThresholds() and
+// ReportThresholds() on an already-optimal placement.
+func hamiltonTieBreak(t *testing.T) fpFixture {
+	inv := zonedInventory(t,
+		zoneSpec{zone: "zone-a", nodes: 2},
+		zoneSpec{zone: "zone-b", nodes: 2},
+		zoneSpec{zone: "zone-c", nodes: 2},
+		zoneSpec{zone: "zone-d", nodes: 2},
+	)
+	rep := tscPod(zoneSpread(1, corev1.ScheduleAnyway))
+
+	return fpFixture{
+		name: "hamilton tie-break: [1,1,2,2] over 4 equal zones",
+		inv:  inv,
+		rep:  rep,
+		pods: replicas(rep, "zone-a-0", "zone-b-0", "zone-c-0", "zone-c-1", "zone-d-0", "zone-d-1"),
+		also: func(t *testing.T, got fpResult) {
+			if got.scores.Relocation != 0 || got.scores.Drift != 0 {
+				t.Errorf("R = %d, rho = %.3f, want 0 and 0: %s", got.scores.Relocation, got.scores.Drift, got)
+			}
+			if v := got.scores.Judge(got.intent, leeway.ReportThresholds()); v.Breached {
+				t.Errorf("ReportThresholds() breached on [1,1,2,2]: %+v (%s)", v, got)
+			}
+		},
+	}
+}
+
+// evenSpreadOnUnequalZones is the live GKE kube-dns false positive: two pods
+// with preferred zone anti-affinity placed [0,1,1] across three zones whose
+// node counts are [2,1,1] (a temporary 1-node pool in zone-a pushed the CPU
+// ratio to 2.0×, over the 1.25× trigger). Capacity weighting exists to excuse
+// overflow into zone-a, never to penalise a workload that already achieved
+// optimal 1-per-zone HA spread.
+func evenSpreadOnUnequalZones(t *testing.T) fpFixture {
+	inv := zonedInventory(t,
+		zoneSpec{zone: "zone-a", nodes: 2},
+		zoneSpec{zone: "zone-b", nodes: 1},
+		zoneSpec{zone: "zone-c", nodes: 1},
+	)
+	rep := affPod(antiPreferred(100, selfTerm(corev1.LabelTopologyZone)))
+
+	return fpFixture{
+		name: "even HA spread on unequal zones: [0,1,1] on [2,1,1] nodes",
+		inv:  inv,
+		rep:  rep,
+		pods: replicas(rep, "zone-b-0", "zone-c-0"),
+		also: func(t *testing.T, got fpResult) {
+			if got.scores.Relocation != 0 || got.scores.Drift != 0 {
+				t.Errorf("R = %d, rho = %.3f, want 0 and 0: %s", got.scores.Relocation, got.scores.Drift, got)
+			}
+			if v := got.scores.Judge(got.intent, leeway.ReportThresholds()); v.Breached {
+				t.Errorf("ReportThresholds() breached on [0,1,1] across [2,1,1] nodes: %+v (%s)", v, got)
 			}
 		},
 	}
@@ -985,5 +1044,70 @@ func TestResolve_HostnameColocationLeavesDeclaredZoneSpreadStanding(t *testing.T
 	declared := &[]corev1.TopologySpreadConstraint{{TopologyKey: corev1.LabelTopologyZone, MaxSkew: 5, WhenUnsatisfiable: corev1.ScheduleAnyway}}
 	if got := Resolve(rep, inv, ResolveConfig{ClusterDefaults: declared}).Intents[zoneKey]; got == nil || got.Source != leeway.SourceClusterDefaultDeclared {
 		t.Errorf("zone intent = %+v, want the operator-declared cluster default", got)
+	}
+}
+
+func TestReportThresholds_NoFalseAlarmsOnEvenSpreads(t *testing.T) {
+	inv3 := zonedInventory(t,
+		zoneSpec{zone: "zone-a", nodes: 1},
+		zoneSpec{zone: "zone-b", nodes: 1},
+		zoneSpec{zone: "zone-c", nodes: 1},
+	)
+	invUnequal := zonedInventory(t,
+		zoneSpec{zone: "zone-a", nodes: 4},
+		zoneSpec{zone: "zone-b", nodes: 1},
+		zoneSpec{zone: "zone-c", nodes: 1},
+	)
+	bare := undeclared(tscPod(zoneSpread(1, corev1.ScheduleAnyway)))
+
+	evenCases := []struct {
+		name string
+		inv  *Inventory
+		pods []*corev1.Pod
+	}{
+		{"2 pods [1,1,0]", inv3, replicas(bare, "zone-a-0", "zone-b-0")},
+		{"2 pods [1,0,1]", inv3, replicas(bare, "zone-a-0", "zone-c-0")},
+		{"2 pods [0,1,1]", inv3, replicas(bare, "zone-b-0", "zone-c-0")},
+		{"4 pods [2,1,1]", inv3, replicas(bare, "zone-a-0", "zone-a-0", "zone-b-0", "zone-c-0")},
+		{"4 pods [1,2,1]", inv3, replicas(bare, "zone-a-0", "zone-b-0", "zone-b-0", "zone-c-0")},
+		{"4 pods [1,1,2]", inv3, replicas(bare, "zone-a-0", "zone-b-0", "zone-c-0", "zone-c-0")},
+		{"2 pods [1,1,0] on [4,1,1] unequal zones", invUnequal, replicas(bare, "zone-a-0", "zone-b-0")},
+		{"2 pods [0,1,1] on [4,1,1] unequal zones", invUnequal, replicas(bare, "zone-b-0", "zone-c-0")},
+	}
+	for _, tc := range evenCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := Resolve(bare, tc.inv, ResolveConfig{})
+			dist := leeway.NewDistribution()
+			for _, p := range tc.pods {
+				dist.Add(domainOf(tc.inv, zoneKey, p.Spec.NodeName), leeway.StateRunning, false)
+			}
+			ev := ScoreAxis(zoneKey, res.Intents[zoneKey], res.Eligible[zoneKey], dist, leeway.ReportThresholds(), leeway.Suppression{})
+			if ev.Verdict.Breached || ev.Scores.Relocation != 0 || ev.Scores.Drift != 0 {
+				t.Errorf("unexpected drift under ReportThresholds(): breached=%v R=%d rho=%.3f expected=%v actual=%v",
+					ev.Verdict.Breached, ev.Scores.Relocation, ev.Scores.Drift, ev.Scores.Expected, ev.Scores.Actual)
+			}
+		})
+	}
+
+	skewedCases := []struct {
+		name string
+		pods []*corev1.Pod
+	}{
+		{"2 pods stacked [2,0,0]", replicas(bare, "zone-a-0", "zone-a-0")},
+		{"4 pods skewed [3,1,0]", replicas(bare, "zone-a-0", "zone-a-0", "zone-a-0", "zone-b-0")},
+		{"4 pods stacked [4,0,0]", replicas(bare, "zone-a-0", "zone-a-0", "zone-a-0", "zone-a-0")},
+	}
+	for _, tc := range skewedCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := Resolve(bare, inv3, ResolveConfig{})
+			dist := leeway.NewDistribution()
+			for _, p := range tc.pods {
+				dist.Add(domainOf(inv3, zoneKey, p.Spec.NodeName), leeway.StateRunning, false)
+			}
+			ev := ScoreAxis(zoneKey, res.Intents[zoneKey], res.Eligible[zoneKey], dist, leeway.ReportThresholds(), leeway.Suppression{})
+			if !ev.Verdict.Breached {
+				t.Errorf("expected ReportThresholds() to breach on %s, got %+v (scores=%+v)", tc.name, ev.Verdict, ev.Scores)
+			}
+		})
 	}
 }

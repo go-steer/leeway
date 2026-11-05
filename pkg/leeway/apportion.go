@@ -64,8 +64,33 @@ type Apportionment struct {
 //
 // Determinism: fractional-remainder ties are broken by ascending domain index,
 // never by map order. Callers must therefore present domains in the canonical
-// order from SortDomains.
+// order from SortDomains. Callers that already hold an observed placement
+// should call ApportionAligned so equal-remainder ties align with actual counts
+// rather than charging relocation distance for an arbitrary domain-name order.
 func Apportion(n int64, weights []float64, caps []int64) Apportionment {
+	return apportion(n, weights, caps, nil)
+}
+
+// ApportionAligned is Apportion with fractional-remainder ties broken toward
+// domains holding more objects in actual (and then by ascending domain index).
+//
+// Why this exists: when 2 pods sit across 3 equal zones as [0,1,1] or 4 pods
+// sit as [1,1,2], every permutation of that multiset is an equally valid
+// Hamilton apportionment with the exact same MinAchievableSkew (S* = 1).
+// Breaking ties by domain index alone picks [1,1,0] and [2,1,1], charging
+// [0,1,1] with R = 1 (ρ = 0.50) and [1,1,2] with R = 1 (ρ = 0.25) — and on 4
+// zones, [1,1,2,2] with R = 2 (ρ = 0.333), breaching even DefaultThresholds().
+// Aligning tied remainders at the cutoff against actual selects the valid
+// Hamilton expectation at minimum L1 distance from actual while preserving
+// Placed, Unplaceable, and MinAchievableSkew.
+func ApportionAligned(n int64, weights []float64, caps []int64, actual []int64) Apportionment {
+	if len(actual) != len(weights) {
+		actual = nil
+	}
+	return apportion(n, weights, caps, actual)
+}
+
+func apportion(n int64, weights []float64, caps []int64, actual []int64) Apportionment {
 	m := len(weights)
 	res := Apportionment{
 		Expected:  make([]int64, m),
@@ -92,10 +117,17 @@ func Apportion(n int64, weights []float64, caps []int64) Apportionment {
 	for {
 		idx := make([]int, 0, m)
 		w := make([]float64, 0, m)
+		var act []int64
+		if actual != nil {
+			act = make([]int64, 0, m)
+		}
 		for i := 0; i < m; i++ {
 			if active[i] {
 				idx = append(idx, i)
 				w = append(w, clean[i])
+				if actual != nil {
+					act = append(act, actual[i])
+				}
 			}
 		}
 		if len(idx) == 0 {
@@ -105,7 +137,7 @@ func Apportion(n int64, weights []float64, caps []int64) Apportionment {
 			break
 		}
 
-		share := hamilton(budget, w)
+		share := hamiltonAligned(budget, w, act)
 
 		froze := false
 		for j, i := range idx {
@@ -132,6 +164,11 @@ func Apportion(n int64, weights []float64, caps []int64) Apportionment {
 	return res
 }
 
+// remTieEps bounds floating-point noise when comparing identical fractional
+// remainders derived from equal capacity weights (for example, identical
+// millicore totals summed across nodes).
+const remTieEps = 1e-12
+
 // hamilton apportions n across weights by largest remainder. It assumes
 // weights are already sanitised and len(weights) > 0.
 //
@@ -140,6 +177,10 @@ func Apportion(n int64, weights []float64, caps []int64) Apportionment {
 // unit of it is handed out below. Float error in qᵢ cannot break the sum: it
 // can only move a unit between the floor phase and the remainder phase.
 func hamilton(n int64, weights []float64) []int64 {
+	return hamiltonAligned(n, weights, nil)
+}
+
+func hamiltonAligned(n int64, weights []float64, actual []int64) []int64 {
 	m := len(weights)
 	out := make([]int64, m)
 	if n <= 0 {
@@ -188,6 +229,32 @@ func hamilton(n int64, weights []float64) []int64 {
 		}
 		return rems[a].idx < rems[b].idx
 	})
+
+	// When actual counts are supplied and the deficit cutoff splits a band of
+	// tied fractional remainders, award those tied slots to the domains with
+	// higher actual counts first (breaking remaining ties by ascending index).
+	if len(actual) == m && int(deficit) < m {
+		cutoff := rems[int(deficit)-1].rem
+		bandStart := int(deficit) - 1
+		for bandStart > 0 && math.Abs(rems[bandStart-1].rem-cutoff) <= remTieEps {
+			bandStart--
+		}
+		bandEnd := int(deficit)
+		for bandEnd < m && math.Abs(rems[bandEnd].rem-cutoff) <= remTieEps {
+			bandEnd++
+		}
+		if bandEnd > int(deficit) {
+			band := rems[bandStart:bandEnd]
+			sort.Slice(band, func(a, b int) bool {
+				aa, ab := actual[band[a].idx], actual[band[b].idx]
+				if aa != ab {
+					return aa > ab
+				}
+				return band[a].idx < band[b].idx
+			})
+		}
+	}
+
 	for k := int64(0); k < deficit; k++ {
 		out[rems[int(k)%m].idx]++
 	}

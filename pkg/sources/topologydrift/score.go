@@ -142,13 +142,34 @@ func ScoreAxis(key leeway.TopologyKey, intent *leeway.Intent, eligible leeway.El
 			targetN = m
 		}
 	}
-	ev.Apportionment = leeway.Apportion(targetN, eligible.WeightsFor(intent), capsFor(intent, eligible))
+	caps := capsFor(intent, eligible)
+	ev.Apportionment = leeway.ApportionAligned(targetN, eligible.WeightsFor(intent), caps, actual)
 	ev.Scores = leeway.Score(eligible.Domains, actual, ev.Apportionment, maxSkew, t)
+	if ev.Scores.Relocation > 0 && isAutoCapacityWeighted(intent, eligible) {
+		// Capacity weighting exists to excuse overflow into larger domains when
+		// smaller ones lack room, never to penalise a workload that is already
+		// evenly spread across fault domains (for example, a 2-replica HA
+		// service sitting [0,1,1] when zone-a temporarily holds twice the CPU).
+		evenAp := leeway.ApportionAligned(targetN, leeway.EqualWeights(len(eligible.Domains)), caps, actual)
+		evenScores := leeway.Score(eligible.Domains, actual, evenAp, maxSkew, t)
+		if evenScores.Relocation == 0 {
+			ev.Apportionment = evenAp
+			ev.Scores = evenScores
+		}
+	}
 	if unsched > 0 && n > 0 && len(eligible.Domains) >= 2 && hasEmptyDomain(actual) && n+unsched >= t.MinReplicasForScoring {
 		applyUnschedulableShortfall(&ev.Scores, unsched, targetN, maxSkew)
 	}
 	ev.Verdict = ev.Scores.JudgeTransient(intent, t, sup)
 	return ev
+}
+
+func isAutoCapacityWeighted(intent *leeway.Intent, eligible leeway.Eligibility) bool {
+	if intent != nil {
+		return intent.WeightingInferred && len(intent.ExplicitShares) == 0
+	}
+	return eligible.UndeclaredWeighting == leeway.WeightAuto &&
+		eligible.EffectiveWeighting(nil) != leeway.WeightEqual
 }
 
 func unschedulableCount(dist *leeway.Distribution) int64 {

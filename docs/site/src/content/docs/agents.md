@@ -104,7 +104,7 @@ leeway report --context=my-cluster --topology-tier-c-signals --all --pretty=fals
     - `score` (`drift`, `observedSkew`, `minAchievableSkew`, `excessSkew`, `relocationDistance`, `maxDomainShare`)
     - `intent` (`source`, `confidence`, `weighting`, `maxSkew`, `evidence[]`), omitted when the subject declared nothing
     - `domains[]` (`domain`, `actual`, `expected`, `delta`, `readyNodes`, `note`)
-    - `suspectedCause` (`unknown`, `domain_outage`, `domain_capacity_shortfall`, `taint_exclusion`, `consolidation`, `volume_pinning`, `rollout_bias`, `constraint_ignored`), `contributingFactors[]`, and `untestedCauses[]` for causes `leeway report` had no evidence source for
+    - `suspectedCause` (`unknown`, `domain_outage`, `domain_capacity_shortfall`, `taint_exclusion`, `consolidation`, `volume_pinning`, `rollout_bias`, `constraint_ignored`, `selector_confined`), `contributingFactors[]`, and `untestedCauses[]` for causes `leeway report` had no evidence source for
     - `remediation` (`kind` of `manifest_patch`, `rollout_restart`, `cluster_capacity`, `cluster_nodes`, `storage_topology`; `summary`; optional `command` and `yaml`). Read `summary` before applying `yaml`: a `manifest_patch` can be the second half of a two-step fix.
   - `compute_classes[]`: One row per ComputeClass (`name`, `scorable`, `ordering`, `podsByRank`, `pendingPods`, `pendingProvisioning`, `pendingDeclined`).
   - `rank_findings[]`: [`leeway.RankFinding`](/reference/finding-kinds/#computeclass-rank-findings) objects (`leeway.rank_wedged`, `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`).

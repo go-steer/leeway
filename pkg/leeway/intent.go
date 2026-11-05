@@ -261,9 +261,10 @@ type Intent struct {
 	MaxPerDomain *int64
 
 	// Expectation shaping.
-	Weighting       Weighting
-	EligibleDomains sets.Set[Domain]
-	DomainCaps      map[Domain]int64
+	Weighting         Weighting
+	WeightingInferred bool
+	EligibleDomains   sets.Set[Domain]
+	DomainCaps        map[Domain]int64
 
 	// ExplicitShares is §10.1's expectedDistribution: the operator naming the
 	// split they want rather than a rule for deriving one. Nothing in the

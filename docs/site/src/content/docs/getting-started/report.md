@@ -57,7 +57,7 @@ When none of the multi-cluster flags are set, `leeway report` falls back to a si
 leeway report --kubeconfig=~/.kube/config --context=prod-us-central1
 ```
 
-When `WATCHER_BROKER_URL` and `WATCHER_BROKER_TOKEN_FILE` are both set in the environment, cluster API connections and GKE API calls are routed through the credential-proxy broker. When only `CREDENTIAL_PROXY_URL` is set (inside the agent-sandbox container), objects are read through the sandbox's `kubectl` instead of a direct client.
+When `WATCHER_BROKER_URL` and `WATCHER_BROKER_TOKEN_FILE` are both set in the environment, cluster API connections and GKE API calls are routed through the credential-proxy broker. When only `CREDENTIAL_PROXY_URL` is set (inside the agent-sandbox container), objects are read through the sandbox's `kubectl` instead of a direct client (filtering `events` to `involvedObject.kind=Pod` and automatically falling back from `-A` to per-namespace `kubectl get -n <ns>` queries if a response hits the proxy's stdout cap).
 
 ## Scoping the evaluation
 

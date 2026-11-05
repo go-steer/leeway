@@ -215,6 +215,7 @@ func applyWeighting(in *leeway.Intent, eligible leeway.Eligibility) {
 		// happened.
 		return
 	}
+	in.WeightingInferred = true
 	in.Evidence = append(in.Evidence, leeway.EvidenceItem{
 		Source: in.Source,
 		Detail: fmt.Sprintf(
