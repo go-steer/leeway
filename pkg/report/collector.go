@@ -233,8 +233,10 @@ func collectCluster(ctx context.Context, target clusters.Cluster, opts Options, 
 		stss = snapData.stss
 		pvcs = snapData.pvcs
 		pvs = snapData.pvs
+		policies = snapData.policies
+		clusterPolicies = snapData.clusterPolicies
 		classes = snapData.classes
-		ccServed = len(classes) > 0
+		ccServed = snapData.ccServed
 	} else {
 		client, dyn, err := buildClients(target, opts)
 		if err != nil {
@@ -555,15 +557,18 @@ func listComputeClasses(ctx context.Context, dyn dynamic.Interface) ([]*unstruct
 }
 
 type kubectlSnapshot struct {
-	nodes   []*corev1.Node
-	pods    []*corev1.Pod
-	events  []*corev1.Event
-	rs      []*appsv1.ReplicaSet
-	deps    []*appsv1.Deployment
-	stss    []*appsv1.StatefulSet
-	pvcs    []*corev1.PersistentVolumeClaim
-	pvs     []*corev1.PersistentVolume
-	classes []*unstructured.Unstructured
+	nodes           []*corev1.Node
+	pods            []*corev1.Pod
+	events          []*corev1.Event
+	rs              []*appsv1.ReplicaSet
+	deps            []*appsv1.Deployment
+	stss            []*appsv1.StatefulSet
+	pvcs            []*corev1.PersistentVolumeClaim
+	pvs             []*corev1.PersistentVolume
+	policies        []*unstructured.Unstructured
+	clusterPolicies []*unstructured.Unstructured
+	classes         []*unstructured.Unstructured
+	ccServed        bool
 }
 
 func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []string, runTopo, runCC bool) (*kubectlSnapshot, error) {
@@ -589,9 +594,11 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 	}
 
 	podEventsSelector := []string{"--field-selector=involvedObject.kind=Pod"}
+	policyResource := topologydrift.PolicyGVR().Resource + "." + topologydrift.PolicyGroup
+	clusterPolicyResource := topologydrift.ClusterPolicyGVR().Resource + "." + topologydrift.PolicyGroup
 
 	for _, ns := range namespaces {
-		if err := kubectlGetNamespacedJSON(ctx, baseArgs, "pods", ns, nil, &fallbackNS, func(podList *corev1.PodList) {
+		if err := kubectlGetNamespacedJSON(ctx, baseArgs, "pods", ns, nil, false, &fallbackNS, func(podList *corev1.PodList) {
 			for i := range podList.Items {
 				p := &podList.Items[i]
 				_, _ = kube.Transform(p)
@@ -601,14 +608,14 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 			return nil, fmt.Errorf("list pods: %w", err)
 		}
 
-		_ = kubectlGetNamespacedJSON(ctx, baseArgs, "events", ns, podEventsSelector, &fallbackNS, func(evList *corev1.EventList) {
+		_ = kubectlGetNamespacedJSON(ctx, baseArgs, "events", ns, podEventsSelector, true, &fallbackNS, func(evList *corev1.EventList) {
 			for i := range evList.Items {
 				out.events = append(out.events, &evList.Items[i])
 			}
 		})
 
 		if runTopo {
-			if err := kubectlGetNamespacedJSON(ctx, baseArgs, "replicasets", ns, nil, &fallbackNS, func(rsList *appsv1.ReplicaSetList) {
+			if err := kubectlGetNamespacedJSON(ctx, baseArgs, "replicasets", ns, nil, false, &fallbackNS, func(rsList *appsv1.ReplicaSetList) {
 				for i := range rsList.Items {
 					r := &rsList.Items[i]
 					_, _ = kube.Transform(r)
@@ -618,7 +625,7 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 				return nil, fmt.Errorf("list replicasets: %w", err)
 			}
 
-			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "deployments", ns, nil, &fallbackNS, func(depList *appsv1.DeploymentList) {
+			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "deployments", ns, nil, true, &fallbackNS, func(depList *appsv1.DeploymentList) {
 				for i := range depList.Items {
 					d := &depList.Items[i]
 					_, _ = kube.Transform(d)
@@ -626,7 +633,7 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 				}
 			})
 
-			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "statefulsets", ns, nil, &fallbackNS, func(stsList *appsv1.StatefulSetList) {
+			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "statefulsets", ns, nil, true, &fallbackNS, func(stsList *appsv1.StatefulSetList) {
 				for i := range stsList.Items {
 					s := &stsList.Items[i]
 					_, _ = kube.Transform(s)
@@ -634,9 +641,15 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 				}
 			})
 
-			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "persistentvolumeclaims", ns, nil, &fallbackNS, func(pvcList *corev1.PersistentVolumeClaimList) {
+			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "persistentvolumeclaims", ns, nil, true, &fallbackNS, func(pvcList *corev1.PersistentVolumeClaimList) {
 				for i := range pvcList.Items {
 					out.pvcs = append(out.pvcs, &pvcList.Items[i])
+				}
+			})
+
+			_ = kubectlGetNamespacedJSON(ctx, baseArgs, policyResource, ns, nil, true, &fallbackNS, func(polList *unstructured.UnstructuredList) {
+				for i := range polList.Items {
+					out.policies = append(out.policies, &polList.Items[i])
 				}
 			})
 		}
@@ -649,11 +662,21 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 				out.pvs = append(out.pvs, &pvList.Items[i])
 			}
 		}
+
+		if slices.Contains(namespaces, metav1.NamespaceAll) {
+			var cpolList unstructured.UnstructuredList
+			if err := kubectlGetJSON(ctx, baseArgs, clusterPolicyResource, "", false, nil, &cpolList); err == nil {
+				for i := range cpolList.Items {
+					out.clusterPolicies = append(out.clusterPolicies, &cpolList.Items[i])
+				}
+			}
+		}
 	}
 
 	if runCC {
 		var ccList unstructured.UnstructuredList
 		if err := kubectlGetJSON(ctx, baseArgs, "computeclasses.cloud.google.com", "", false, nil, &ccList); err == nil {
+			out.ccServed = true
 			for i := range ccList.Items {
 				out.classes = append(out.classes, &ccList.Items[i])
 			}
@@ -680,6 +703,7 @@ func kubectlGetNamespacedJSON[L any](
 	resource string,
 	ns string,
 	extraArgs []string,
+	bestEffort bool,
 	cachedNamespaces *namespaceFallbackCache,
 	consume func(*L),
 ) error {
@@ -711,11 +735,22 @@ func kubectlGetNamespacedJSON[L any](
 	for _, singleNS := range cachedNamespaces.names {
 		var nsItems L
 		if nsErr := kubectlGetJSON(ctx, baseArgs, resource, singleNS, false, extraArgs, &nsItems); nsErr != nil {
+			if isKubectlNotFound(nsErr) || bestEffort {
+				continue
+			}
 			return nsErr
 		}
 		consume(&nsItems)
 	}
 	return nil
+}
+
+func isKubectlNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "(notfound)") || strings.Contains(lower, "not found")
 }
 
 func isKubectlOutputTruncated(err error) bool {
@@ -745,6 +780,9 @@ func kubectlGetJSON(ctx context.Context, baseArgs []string, resource, ns string,
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if strings.Contains(stderr.String(), "credential proxy output truncated") {
+			return fmt.Errorf("kubectl get %s: %w", resource, errKubectlOutputTruncated)
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg != "" {
 			return fmt.Errorf("kubectl get %s: %s", resource, msg)

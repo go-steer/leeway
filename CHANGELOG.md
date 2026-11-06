@@ -4,6 +4,15 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-06
+
+### Fixed
+
+- **DaemonSet `metadata.name` Node Affinity & Asymmetric Zone Scoring (`pkg/sources/topologydrift`, `pkg/leeway`)**: Stripped the controller-injected `metadata.name` `matchFields` requirement from `DaemonSet` pods in `ConstraintsOf`, skipped `ClusterDefaultIntents` on `DaemonSet` pods, apportioned undeclared `DaemonSet` expectations by `WeightNodeCount` (`RequireSchedulable = false`, `NodeTaintsPolicy = Honor`), and excluded `SubjectDaemonSet` from `selector_confined` and `topologySpreadConstraints` manifest-patch remediations, eliminating false-positive `selector_confined` and Tier B drift findings on live GKE clusters.
+- **API-Defaulted `NodeAffinityPolicy: Honor` Conflicting-Affinity Detection (`pkg/sources/topologydrift/resolve.go`)**: Checked resolved `opts.Policies.NodeAffinityPolicy == Honor` and `realUsableDomains` rather than `intent.Policies.NodeAffinityPolicy == ""` so conflicting `nodeAffinity` / `nodeSelector` rules under `topologySpreadConstraints` are detected on Kubernetes >=1.26 clusters where `kube-apiserver` defaults `nodeAffinityPolicy: Honor`.
+- **`selector_confined` Rollout & Taint Counterfactual Guards (`pkg/sources/topologydrift/snapshot.go`, `pkg/sources/topologydrift/predicate.go`)**: Verified all `Running` pods across the distribution reside in the single eligible domain (`runningCount(dist) == Actual[0]`), honoured `NodeTaintsPolicy = Honor` when computing counterfactual unconstrained usable domains, and included `RequiredNodeAffinity` operators/values in `selectorDescription()`.
+- **Proxied `kubectl` Non-Zero Truncation, Namespace Races & `LeewayPolicy` Collection (`pkg/report/collector.go`)**: Detected `credential proxy output truncated` even when `kubectl` exits non-zero, skipped vanishing `NotFound` namespaces and per-namespace `Forbidden` errors on best-effort resources during per-namespace fallback, and collected `LeewayPolicy` / `ClusterLeewayPolicy` CRDs in `fetchViaKubectl`.
+
 ## [0.1.4] - 2026-11-05
 
 ### Added

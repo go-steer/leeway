@@ -34,7 +34,7 @@ sidebar:
 | `--topology-keys` | `topology.kubernetes.io/zone,topology.kubernetes.io/region` | Node labels treated as topology axes, in precedence order. |
 | `--topology-domain-unavailable-keys` | `topology.kubernetes.io/zone,topology.kubernetes.io/region` | Axes on which a domain with no usable node raises `leeway.domain_unavailable`. Pass an empty string to disable. |
 | `--topology-cluster-defaults` | `""` | Cluster kube-scheduler `PodTopologySpread` `defaultConstraints`, as `key=maxSkew[:DoNotSchedule\|ScheduleAnyway]` comma-separated, or `none`. Empty means the system defaults are assumed. |
-| `--topology-tier-c-signals` | `false` | Include Tier C topology-drift findings (`report`: in `topology_findings`; `watch`: in the signals counter and sink). |
+| `--topology-tier-c-signals` | `false` | Include Tier C topology-drift findings (`report`: in `topology_findings`, including single-domain `selector_confined` confinement; `watch`: in the signals counter and sink for breaching Tier C drift). |
 | `--compute-class-tier-c-signals` | `false` | Include Tier C compute-class findings (`leeway.rank_tier_unused`) (`report`: in `rank_findings`; `watch`: in the signals counter and sink). |
 
 ## `leeway report` flags

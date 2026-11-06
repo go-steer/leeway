@@ -76,9 +76,60 @@ func ConstraintsOf(pod *corev1.Pod) Constraints {
 		Tolerations:  pod.Spec.Tolerations,
 	}
 	if a := pod.Spec.Affinity; a != nil && a.NodeAffinity != nil {
-		c.RequiredNodeAffinity = a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		req := a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution
+		if isDaemonSetPod(pod) {
+			req = stripDaemonSetNodeNameAffinity(req)
+		}
+		c.RequiredNodeAffinity = req
 	}
 	return c
+}
+
+// stripDaemonSetNodeNameAffinity removes the `metadata.name` field-selector
+// requirement that Kubernetes's DaemonSetController injects onto each admitted
+// DaemonSet pod (`ReplaceDaemonSetPodNodeNameNodeAffinity`) so that domain
+// eligibility reflects the DaemonSet's actual nodeSelector / nodeAffinity
+// rather than a single bound pod's target node.
+func stripDaemonSetNodeNameAffinity(sel *corev1.NodeSelector) *corev1.NodeSelector {
+	if sel == nil {
+		return nil
+	}
+	hasNodeNameField := false
+	for i := range sel.NodeSelectorTerms {
+		for j := range sel.NodeSelectorTerms[i].MatchFields {
+			if sel.NodeSelectorTerms[i].MatchFields[j].Key == "metadata.name" {
+				hasNodeNameField = true
+				break
+			}
+		}
+		if hasNodeNameField {
+			break
+		}
+	}
+	if !hasNodeNameField {
+		return sel
+	}
+	terms := make([]corev1.NodeSelectorTerm, 0, len(sel.NodeSelectorTerms))
+	for _, t := range sel.NodeSelectorTerms {
+		hadContent := len(t.MatchExpressions) > 0 || len(t.MatchFields) > 0
+		var fields []corev1.NodeSelectorRequirement
+		for _, req := range t.MatchFields {
+			if req.Key != "metadata.name" {
+				fields = append(fields, req)
+			}
+		}
+		if hadContent && len(t.MatchExpressions) == 0 && len(fields) == 0 {
+			// Removing the controller-injected metadata.name left an
+			// unconstrained OR-branch, meaning the DaemonSet template itself
+			// declared no required nodeAffinity restriction.
+			return nil
+		}
+		terms = append(terms, corev1.NodeSelectorTerm{
+			MatchExpressions: t.MatchExpressions,
+			MatchFields:      fields,
+		})
+	}
+	return &corev1.NodeSelector{NodeSelectorTerms: terms}
 }
 
 // MatchesNode reports whether the subject's nodeSelector and required node
@@ -371,24 +422,26 @@ func (c Constraints) selectorDescription() string {
 	}
 	if c.RequiredNodeAffinity != nil {
 		seen := make(map[string]bool)
-		var keys []string
+		var exprs []string
 		for _, term := range c.RequiredNodeAffinity.NodeSelectorTerms {
 			for _, req := range term.MatchExpressions {
-				if !seen[req.Key] {
-					seen[req.Key] = true
-					keys = append(keys, req.Key)
+				s := formatSelectorRequirement(req)
+				if !seen[s] {
+					seen[s] = true
+					exprs = append(exprs, s)
 				}
 			}
 			for _, req := range term.MatchFields {
-				if !seen[req.Key] {
-					seen[req.Key] = true
-					keys = append(keys, req.Key)
+				s := formatSelectorRequirement(req)
+				if !seen[s] {
+					seen[s] = true
+					exprs = append(exprs, s)
 				}
 			}
 		}
-		sort.Strings(keys)
-		if len(keys) > 0 {
-			parts = append(parts, fmt.Sprintf("required nodeAffinity (%s)", strings.Join(keys, ",")))
+		sort.Strings(exprs)
+		if len(exprs) > 0 {
+			parts = append(parts, fmt.Sprintf("required nodeAffinity (%s)", strings.Join(exprs, ", ")))
 		} else {
 			parts = append(parts, "required nodeAffinity")
 		}
@@ -397,4 +450,18 @@ func (c Constraints) selectorDescription() string {
 		return "nodeSelector/nodeAffinity"
 	}
 	return strings.Join(parts, " and ")
+}
+
+func formatSelectorRequirement(req corev1.NodeSelectorRequirement) string {
+	switch req.Operator {
+	case corev1.NodeSelectorOpIn, corev1.NodeSelectorOpNotIn, corev1.NodeSelectorOpGt, corev1.NodeSelectorOpLt:
+		if len(req.Values) == 1 && req.Operator == corev1.NodeSelectorOpIn {
+			return fmt.Sprintf("%s=%s", req.Key, req.Values[0])
+		}
+		return fmt.Sprintf("%s %s [%s]", req.Key, req.Operator, strings.Join(req.Values, ","))
+	case corev1.NodeSelectorOpExists, corev1.NodeSelectorOpDoesNotExist:
+		return fmt.Sprintf("%s %s", req.Key, req.Operator)
+	default:
+		return req.Key
+	}
 }
