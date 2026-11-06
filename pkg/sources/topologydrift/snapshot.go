@@ -114,7 +114,7 @@ func (r *SnapshotResult) FindingFor(sub leeway.SubjectRef, ev *Evaluation, dist 
 	if r == nil || r.source == nil || ev == nil {
 		return leeway.Finding{}
 	}
-	if factor, ok := selectorConfinedFactor(r.source, sub, ev); ok {
+	if factor, ok := selectorConfinedFactor(r.source, sub, ev, dist); ok {
 		return buildSelectorConfinedFinding(r.source, sub, ev, dist, factor, r.now, r.source.cfg.TierCSignals)
 	}
 	phase := leeway.PhaseOK
@@ -261,7 +261,7 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 			ev := &evals[i]
 			if !ev.Verdict.Breached {
 				if s.cfg.TierCSignals {
-					if factor, ok := selectorConfinedFactor(s, sub, ev); ok {
+					if factor, ok := selectorConfinedFactor(s, sub, ev, snap[ev.Key]); ok {
 						res.Findings = append(res.Findings, buildSelectorConfinedFinding(s, sub, ev, snap[ev.Key], factor, now, true))
 					}
 				}
@@ -285,12 +285,12 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 // selectorConfinedFactor reports whether a non-breaching workload evaluation on
 // a failure-domain axis is confined to a single domain by its own nodeSelector
 // or required nodeAffinity while the cluster has two or more usable domains.
-func selectorConfinedFactor(s *Source, sub leeway.SubjectRef, ev *Evaluation) (string, bool) {
+func selectorConfinedFactor(s *Source, sub leeway.SubjectRef, ev *Evaluation, dist *leeway.Distribution) (string, bool) {
 	if s == nil || ev == nil || ev.Verdict.Breached {
 		return "", false
 	}
 	switch sub.Kind {
-	case leeway.SubjectNodeGroup, leeway.SubjectDomain, leeway.SubjectPreferenceAxis, "":
+	case leeway.SubjectDaemonSet, leeway.SubjectNodeGroup, leeway.SubjectDomain, leeway.SubjectPreferenceAxis, "":
 		return "", false
 	}
 	if !isSelectorConfinedAxis(ev.Key, s.cfg.DomainUnavailableKeys) {
@@ -302,10 +302,13 @@ func selectorConfinedFactor(s *Source, sub leeway.SubjectRef, ev *Evaluation) (s
 	if s.cfg.Thresholds != nil && ev.Scores.Total < s.cfg.Thresholds.MinReplicasForScoring {
 		return "", false
 	}
-	if len(ev.Eligible.Domains) != 1 || ev.Eligible.Domains[0] == leeway.DomainUnknown {
+	if realUsableDomains(ev.Eligible) != 1 || len(ev.Eligible.Domains) == 0 || ev.Eligible.Domains[0] == leeway.DomainUnknown {
 		return "", false
 	}
-	if len(ev.Scores.Actual) != 1 || ev.Scores.Actual[0] != ev.Scores.Total {
+	if len(ev.Scores.Actual) == 0 || ev.Scores.Actual[0] != ev.Scores.Total {
+		return "", false
+	}
+	if dist != nil && runningCount(dist) != ev.Scores.Actual[0] {
 		return "", false
 	}
 	if ev.Intent.EligibilityPolicies().NodeAffinityPolicy != corev1.NodeInclusionPolicyHonor {
@@ -323,12 +326,26 @@ func selectorConfinedFactor(s *Source, sub leeway.SubjectRef, ev *Evaluation) (s
 	}
 	opts := leeway.DefaultEligibilityOptions()
 	opts.Policies = ev.Intent.EligibilityPolicies()
+	opts.Policies.NodeTaintsPolicy = corev1.NodeInclusionPolicyHonor
 	unconstrained := leeway.EligibleDomains(s.inv.NodeViews(ev.Key, stripped), opts)
 	usable := realUsableDomains(unconstrained)
 	if usable < 2 {
 		return "", false
 	}
 	return fmt.Sprintf("%s confines placement to 1 of %d usable domains on %s", c.selectorDescription(), usable, ev.Key), true
+}
+
+func runningCount(dist *leeway.Distribution) int64 {
+	if dist == nil {
+		return 0
+	}
+	var total int64
+	for _, c := range dist.ByDomain {
+		if c != nil {
+			total += c.Running
+		}
+	}
+	return total
 }
 
 func isSelectorConfinedAxis(key leeway.TopologyKey, configured []leeway.TopologyKey) bool {

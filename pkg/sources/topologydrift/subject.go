@@ -92,3 +92,12 @@ func controllerOf(refs []metav1.OwnerReference) *metav1.OwnerReference {
 	}
 	return nil
 }
+
+// isDaemonSetPod reports whether pod is controlled directly by a DaemonSet.
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	if pod == nil {
+		return false
+	}
+	ctrl := controllerOf(pod.OwnerReferences)
+	return ctrl != nil && ctrl.Kind == "DaemonSet"
+}

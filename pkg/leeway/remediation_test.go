@@ -307,3 +307,27 @@ func TestSuggestRemediation_DomainUnavailableFinding(t *testing.T) {
 		t.Errorf("Remediation.Summary = %q, want domain name", f.Remediation.Summary)
 	}
 }
+
+func TestSuggestRemediation_DaemonSetNeverSuggestsTopologySpreadConstraint(t *testing.T) {
+	t.Parallel()
+
+	f := Finding{
+		Kind:           KindPlacementDrift,
+		Subject:        SubjectRef{Kind: SubjectDaemonSet, Namespace: "kube-system", Name: "fluentbit"},
+		TopologyKey:    "topology.kubernetes.io/zone",
+		Tier:           TierC.String(),
+		Severity:       "warning",
+		SuspectedCause: CauseUnknown,
+		Domains: []FindingDomain{
+			{Domain: "us-central1-a", Actual: 2, Expected: 4, Delta: -2, ReadyNodes: 4},
+			{Domain: "us-central1-b", Actual: 1, Expected: 1, Delta: 0, ReadyNodes: 1},
+		},
+	}
+	got := SuggestRemediation(f, map[string]string{"k8s-app": "fluentbit"})
+	if got == nil {
+		t.Fatal("SuggestRemediation returned nil")
+	}
+	if got.Kind == RemediationManifestPatch || got.YAML != "" {
+		t.Fatalf("DaemonSet remediation = %+v, must never suggest manifest_patch topologySpreadConstraints", got)
+	}
+}

@@ -146,6 +146,7 @@ func Resolve(pod *corev1.Pod, inv *Inventory, cfg ResolveConfig) Resolution {
 	candidates = dropAssumedDefaultsContradicted(candidates)
 	res.Intents = leeway.ResolveIntents(candidates)
 
+	daemonSet := isDaemonSetPod(pod)
 	constraints := ConstraintsOf(pod)
 	for _, key := range inv.Keys() {
 		intent := res.Intents[key]
@@ -162,21 +163,29 @@ func Resolve(pod *corev1.Pod, inv *Inventory, cfg ResolveConfig) Resolution {
 		if intent != nil {
 			opts.MinDomains = intent.MinDomains
 		}
+		if daemonSet {
+			opts.UndeclaredWeighting = leeway.WeightNodeCount
+			opts.RequireSchedulable = false
+			if intent == nil || intent.Policies.NodeTaintsPolicy == "" {
+				opts.Policies.NodeTaintsPolicy = corev1.NodeInclusionPolicyHonor
+			}
+		}
 
 		eligible := leeway.EligibleDomains(inv.NodeViews(key, constraints), opts)
+		usableEligible := realUsableDomains(eligible)
 		if intent != nil &&
 			intent.Source == leeway.SourceTopologySpreadConstraint &&
 			intent.Mode == leeway.ModeSpread &&
-			intent.Policies.NodeAffinityPolicy == "" &&
-			len(eligible.Domains) <= 1 {
+			opts.Policies.NodeAffinityPolicy == corev1.NodeInclusionPolicyHonor &&
+			usableEligible <= 1 {
 			if stripped, changed := constraints.withoutKey(key); changed {
 				unconstrained := leeway.EligibleDomains(inv.NodeViews(key, stripped), opts)
-				if len(unconstrained.Domains) > len(eligible.Domains) {
+				if realUsableDomains(unconstrained) > usableEligible {
 					intent.Evidence = append(intent.Evidence, leeway.EvidenceItem{
 						Source: intent.Source,
 						Detail: fmt.Sprintf(
 							"conflicting nodeAffinity/nodeSelector on %s restricts placement to %d domain(s), contradicting the spread constraint on %s",
-							key, len(eligible.Domains), key,
+							key, usableEligible, key,
 						),
 					})
 					eligible = unconstrained
@@ -209,10 +218,9 @@ func applyWeighting(in *leeway.Intent, eligible leeway.Eligibility) {
 		return
 	}
 	in.Weighting = eligible.EffectiveWeighting(in)
-	if in.Weighting == leeway.WeightEqual {
-		// The common case, and silent on purpose. An evidence line on every
-		// homogeneous cluster in the world would say only that nothing
-		// happened.
+	if in.Weighting != leeway.WeightAllocatableCPU {
+		// Equal (and NodeCount on DaemonSets) needs neither the CPU-trigger
+		// fallback marker nor a CPU-ratio evidence line.
 		return
 	}
 	in.WeightingInferred = true

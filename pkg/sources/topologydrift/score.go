@@ -155,6 +155,11 @@ func ScoreAxis(key leeway.TopologyKey, intent *leeway.Intent, eligible leeway.El
 		if evenScores.Relocation == 0 {
 			ev.Apportionment = evenAp
 			ev.Scores = evenScores
+			if intent != nil {
+				intentCopy := *intent
+				intentCopy.Weighting = leeway.WeightEqual
+				ev.Intent = &intentCopy
+			}
 		}
 	}
 	if unsched > 0 && n > 0 && len(eligible.Domains) >= 2 && hasEmptyDomain(actual) && n+unsched >= t.MinReplicasForScoring {

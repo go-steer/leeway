@@ -15,13 +15,16 @@
 package topologydrift
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/go-steer/leeway/pkg/leeway"
 )
@@ -1109,5 +1112,198 @@ func TestReportThresholds_NoFalseAlarmsOnEvenSpreads(t *testing.T) {
 				t.Errorf("expected ReportThresholds() to breach on %s, got %+v (scores=%+v)", tc.name, ev.Verdict, ev.Scores)
 			}
 		})
+	}
+}
+
+func makeDaemonSetPod(dsName, podName, nodeName string, extraSelector map[string]string) *corev1.Pod {
+	isController := true
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: "kube-system",
+			UID:       types.UID("uid-" + podName),
+			Labels:    map[string]string{"k8s-app": dsName},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "DaemonSet",
+				Name:       dsName,
+				UID:        types.UID("ds-" + dsName),
+				Controller: &isController,
+			}},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:     nodeName,
+			NodeSelector: extraSelector,
+			Affinity: &corev1.Affinity{
+				NodeAffinity: &corev1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+						NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+							MatchFields: []corev1.NodeSelectorRequirement{{
+								Key:      "metadata.name",
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{nodeName},
+							}},
+						}},
+					},
+				},
+			},
+			Tolerations: []corev1.Toleration{{
+				Key:      corev1.TaintNodeUnschedulable,
+				Operator: corev1.TolerationOpExists,
+				Effect:   corev1.TaintEffectNoSchedule,
+			}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func TestDaemonSet_MetadataNameNodeAffinityAndAsymmetricZones(t *testing.T) {
+	nodes := []*corev1.Node{
+		node("zone-a-0", "zone-a", withAllocatable("32", "128Gi"), withLabel("gpu", "nvidia")),
+		node("zone-a-1", "zone-a", withAllocatable("32", "128Gi"), withLabel("gpu", "nvidia")),
+		node("zone-a-2", "zone-a", withAllocatable("4", "16Gi")),
+		node("zone-a-cordoned", "zone-a", withAllocatable("4", "16Gi"), cordoned()),
+		node("zone-a-tainted", "zone-a", withAllocatable("4", "16Gi"), withTaint("dedicated", "special", corev1.TaintEffectNoSchedule)),
+		node("zone-b-0", "zone-b", withAllocatable("4", "16Gi")),
+		node("zone-c-0", "zone-c", withAllocatable("4", "16Gi")),
+	}
+	pods := []*corev1.Pod{
+		// Cluster-wide DaemonSet running on all 6 matching Ready nodes ([4, 1, 1],
+		// including cordoned zone-a-cordoned, excluding untolerated zone-a-tainted).
+		makeDaemonSetPod("fluentbit", "fb-0", "zone-a-0", nil),
+		makeDaemonSetPod("fluentbit", "fb-1", "zone-a-1", nil),
+		makeDaemonSetPod("fluentbit", "fb-2", "zone-a-2", nil),
+		makeDaemonSetPod("fluentbit", "fb-3", "zone-a-cordoned", nil),
+		makeDaemonSetPod("fluentbit", "fb-4", "zone-b-0", nil),
+		makeDaemonSetPod("fluentbit", "fb-5", "zone-c-0", nil),
+		// Single-zone GPU-pool DaemonSet ([2] in zone-a) — must NOT emit selector_confined!
+		makeDaemonSetPod("nvidia-driver", "nv-0", "zone-a-0", map[string]string{"gpu": "nvidia"}),
+		makeDaemonSetPod("nvidia-driver", "nv-1", "zone-a-1", map[string]string{"gpu": "nvidia"}),
+	}
+
+	snap, err := EvaluateSnapshot(context.Background(), Config{
+		Cluster:      "gke-test",
+		TopologyKeys: DefaultTopologyKeys,
+		TierCSignals: true,
+	}, SnapshotInput{
+		Nodes: nodes,
+		Pods:  pods,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateSnapshot: %v", err)
+	}
+	if len(snap.Findings) != 0 {
+		t.Fatalf("expected 0 DaemonSet findings across cluster-wide [4,1,1] and GPU-pool [2] DaemonSets, got: %+v", snap.Findings)
+	}
+}
+
+func TestResolve_ConflictingAffinityWithAPIDefaultedHonorPolicy(t *testing.T) {
+	inv := zonedInventory(t,
+		zoneSpec{zone: "zone-a", nodes: 1},
+		zoneSpec{zone: "zone-b", nodes: 1},
+	)
+	honor := corev1.NodeInclusionPolicyHonor
+	tsc := zoneSpread(1, corev1.ScheduleAnyway)
+	tsc.NodeAffinityPolicy = &honor
+	tsc.NodeTaintsPolicy = &honor
+	rep := tscPod(tsc)
+	rep.Spec.NodeSelector = map[string]string{corev1.LabelTopologyZone: "zone-a"}
+
+	res := Resolve(rep, inv, ResolveConfig{})
+	el := res.Eligible[zoneKey]
+	if len(el.Domains) != 2 {
+		t.Fatalf("Eligible.Domains = %v, want 2 domains after conflicting-affinity widening under API-defaulted Honor policy", el.Domains)
+	}
+	in := res.Intents[zoneKey]
+	if in == nil || len(in.Evidence) < 2 || !strings.Contains(in.Evidence[1].Detail, "conflicting nodeAffinity/nodeSelector") {
+		t.Fatalf("Intent.Evidence = %+v, want conflicting nodeAffinity/nodeSelector evidence", in)
+	}
+}
+
+func TestSelectorConfined_MidRolloutAndTaintedCounterfactual(t *testing.T) {
+	isController := true
+	rsRollout := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rollout-rs",
+			Namespace: "default",
+			UID:       "rs-rollout",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "mid-rollout",
+				UID:        "dep-rollout",
+				Controller: &isController,
+			}},
+		},
+	}
+	rsTaint := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "taint-rs",
+			Namespace: "default",
+			UID:       "rs-taint",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1",
+				Kind:       "Deployment",
+				Name:       "taint-bound",
+				UID:        "dep-taint",
+				Controller: &isController,
+			}},
+		},
+	}
+	nodes := []*corev1.Node{
+		node("zone-a-0", "zone-a", withLabel("pool", "cpu")),
+		node("zone-b-0", "zone-b", withTaint("gpu", "only", corev1.TaintEffectNoSchedule)),
+	}
+	mkDepPod := func(name, rsName, nodeName string, sel map[string]string, tol []corev1.Toleration) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "default",
+				UID:       types.UID("uid-" + name),
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1",
+					Kind:       "ReplicaSet",
+					Name:       rsName,
+					UID:        types.UID("uid-" + rsName),
+					Controller: &isController,
+				}},
+			},
+			Spec: corev1.PodSpec{
+				NodeName:     nodeName,
+				NodeSelector: sel,
+				Tolerations:  tol,
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+	}
+	tolGPU := []corev1.Toleration{{Key: "gpu", Operator: corev1.TolerationOpEqual, Value: "only", Effect: corev1.TaintEffectNoSchedule}}
+	pods := []*corev1.Pod{
+		// mid-rollout: representative pod selects pool=cpu (zone-a only), 2 pods in zone-a,
+		// PLUS 1 older revision Running pod still in zone-b -> NOT single-domain confined!
+		mkDepPod("aaa-new-0", "rollout-rs", "zone-a-0", map[string]string{"pool": "cpu"}, tolGPU),
+		mkDepPod("aaa-new-1", "rollout-rs", "zone-a-0", map[string]string{"pool": "cpu"}, tolGPU),
+		mkDepPod("zzz-old-0", "rollout-rs", "zone-b-0", nil, tolGPU),
+		// taint-bound: selects pool=cpu (zone-a), does NOT tolerate zone-b's gpu=only:NoSchedule taint ->
+		// counterfactual without pool=cpu still has only 1 usable domain (zone-a)!
+		mkDepPod("tb-0", "taint-rs", "zone-a-0", map[string]string{"pool": "cpu"}, nil),
+		mkDepPod("tb-1", "taint-rs", "zone-a-0", map[string]string{"pool": "cpu"}, nil),
+	}
+
+	snap, err := EvaluateSnapshot(context.Background(), Config{
+		Cluster:      "gke-test",
+		TopologyKeys: DefaultTopologyKeys,
+		TierCSignals: true,
+	}, SnapshotInput{
+		Nodes:       nodes,
+		ReplicaSets: []*appsv1.ReplicaSet{rsRollout, rsTaint},
+		Pods:        pods,
+	})
+	if err != nil {
+		t.Fatalf("EvaluateSnapshot: %v", err)
+	}
+	for _, f := range snap.Findings {
+		if f.SuspectedCause == leeway.CauseSelectorConfined {
+			t.Fatalf("unexpected selector_confined finding: %+v", f)
+		}
 	}
 }

@@ -188,7 +188,7 @@ func SuggestRemediation(f Finding, selectorLabels map[string]string) *FindingRem
 			),
 		}
 	}
-	if needsExplicitSpreadConstraint(f.Intent) {
+	if f.Subject.Kind != SubjectDaemonSet && needsExplicitSpreadConstraint(f.Intent) {
 		return &FindingRemediation{
 			Kind: RemediationManifestPatch,
 			Summary: fmt.Sprintf(
