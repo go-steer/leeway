@@ -818,7 +818,13 @@ func TestCollect_SelectorConfinedTierC(t *testing.T) {
 	}
 }
 
-func TestCollect_FetchViaKubectlTruncationFallback(t *testing.T) {
+// TestCollect_FetchViaKubectlPagedReads drives fetchViaKubectl against a fake
+// kubectl: built-in kinds are paged through `get --raw` (a continue token
+// carried across pages, a proxy-truncated page and a page whose JSON ends
+// early each retried at half the size, a forbidden best-effort list skipped),
+// while the LeewayPolicy CRD keeps the typed read and its per-namespace
+// fallback.
+func TestCollect_FetchViaKubectlPagedReads(t *testing.T) {
 	tmpDir := t.TempDir()
 	logFile := filepath.Join(tmpDir, "kubectl.log")
 	kubectlBin := filepath.Join(tmpDir, "kubectl")
@@ -829,15 +835,55 @@ echo "$*" >> "` + logFile + `"
 
 args="$*"
 case "$args" in
-  *"get nodes -o json"*)
+  *"get --raw /api/v1/nodes?limit=250")
     cat <<'EOF'
-{"apiVersion":"v1","kind":"NodeList","items":[
+{"apiVersion":"v1","kind":"NodeList","metadata":{},"items":[
   {"metadata":{"name":"node-a","labels":{"topology.kubernetes.io/zone":"us-central1-a","topology.kubernetes.io/region":"us-central1","kubernetes.io/hostname":"node-a"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"allocatable":{"cpu":"4","memory":"16Gi"}}},
   {"metadata":{"name":"node-b","labels":{"topology.kubernetes.io/zone":"us-central1-b","topology.kubernetes.io/region":"us-central1","kubernetes.io/hostname":"node-b"}},"status":{"conditions":[{"type":"Ready","status":"True"}],"allocatable":{"cpu":"4","memory":"16Gi"}}}
 ]}
 EOF
     ;;
-  *"get namespaces -o json"*)
+  *"get --raw /api/v1/pods?limit=250")
+    cat <<'EOF'
+{"apiVersion":"v1","kind":"PodList","metadata":{"continue":"c1+/="},"items":[
+  {"metadata":{"name":"api-0","namespace":"ns-a","uid":"uid-api-0","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+  {"metadata":{"name":"api-1","namespace":"ns-a","uid":"uid-api-1","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+  {"metadata":{"name":"ignored-0","namespace":"ns-a","uid":"uid-ignored-0","labels":{"app":"ignored"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"ignored-rs","uid":"rs-ignored","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"ignored"}}}]},"status":{"phase":"Running"}}
+]}
+EOF
+    ;;
+  *"get --raw /api/v1/pods?continue=c1%2B%2F%3D&limit=250")
+    cat <<'EOF'
+{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[
+  {"metadata":{"name":"api-2","namespace":"ns-a","uid":"uid-api-2","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+  {"metadata":{"name":"api-3","namespace":"ns-a","uid":"uid-api-3","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+  {"metadata":{"name":"ignored-1","namespace":"ns-a","uid":"uid-ignored-1","labels":{"app":"ignored"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"ignored-rs","uid":"rs-ignored","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"ignored"}}}]},"status":{"phase":"Running"}}
+]}
+EOF
+    ;;
+  *"get --raw /api/v1/events?fieldSelector=involvedObject.kind%3DPod&limit=250")
+    # The credential proxy cut the page: retried at half the size.
+    printf '{"apiVersion":"v1","kind":"EventList","items":[{"metadata":{"name":"trunc'
+    echo "credential proxy output truncated" >&2
+    exit 1
+    ;;
+  *"get --raw /apis/apps/v1/replicasets?limit=250")
+    # JSON that ends early with no marker is treated as truncation too.
+    printf '{"apiVersion":"apps/v1","kind":"ReplicaSetList","items":[{"metadata":{"name":"api-rs"'
+    ;;
+  *"get --raw /apis/apps/v1/replicasets?limit=125")
+    cat <<'EOF'
+{"apiVersion":"apps/v1","kind":"ReplicaSetList","metadata":{},"items":[
+  {"metadata":{"name":"api-rs","namespace":"ns-a","uid":"rs-api","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"api","uid":"dep-api","controller":true}]},"spec":{"selector":{"matchLabels":{"app":"api"}}}},
+  {"metadata":{"name":"ignored-rs","namespace":"ns-a","uid":"rs-ignored","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"ignored","uid":"dep-ignored","controller":true}]},"spec":{"selector":{"matchLabels":{"app":"ignored"}}}}
+]}
+EOF
+    ;;
+  *"get --raw /apis/apps/v1/deployments?limit=250")
+    echo 'Error from server (Forbidden): deployments.apps is forbidden' >&2
+    exit 1
+    ;;
+  *"get namespaces -o json")
     cat <<'EOF'
 {"apiVersion":"v1","kind":"NamespaceList","items":[
   {"metadata":{"name":"ns-a"}},
@@ -846,62 +892,24 @@ EOF
 ]}
 EOF
     ;;
-  *"get pods -A -o json"*)
-    # Simulate credential-proxy 8 MiB stdout truncation with non-zero exit code!
-    printf '{"apiVersion":"v1","kind":"PodList","items":[{"metadata":{"name":"truncated'
+  *"get leewaypolicies.leeway.lookout.go-steer.io -A -o json")
+    printf '{"apiVersion":"leeway.lookout.go-steer.io/v1alpha1","kind":"LeewayPolicyList","items":[{"metadata":{"name":"trunc'
     echo "credential proxy output truncated" >&2
     exit 1
     ;;
-  *"get pods -n ns-a -o json"*)
-    cat <<'EOF'
-{"apiVersion":"v1","kind":"PodList","items":[
-  {"metadata":{"name":"api-0","namespace":"ns-a","uid":"p0","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
-  {"metadata":{"name":"api-1","namespace":"ns-a","uid":"p1","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
-  {"metadata":{"name":"api-2","namespace":"ns-a","uid":"p2","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
-  {"metadata":{"name":"api-3","namespace":"ns-a","uid":"p3","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs-api","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
-  {"metadata":{"name":"ignored-0","namespace":"ns-a","uid":"ig0","labels":{"app":"ignored"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"ignored-rs","uid":"rs-ignored","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"ignored"}}}]},"status":{"phase":"Running"}},
-  {"metadata":{"name":"ignored-1","namespace":"ns-a","uid":"ig1","labels":{"app":"ignored"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"ignored-rs","uid":"rs-ignored","controller":true}]},"spec":{"nodeName":"node-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"ignored"}}}]},"status":{"phase":"Running"}}
-]}
-EOF
-    ;;
-  *"get pods -n ns-b -o json"*)
-    cat <<'EOF'
-{"apiVersion":"v1","kind":"PodList","items":[]}
-EOF
-    ;;
-  *"get pods -n ns-vanished -o json"*)
-    echo 'Error from server (NotFound): namespaces "ns-vanished" not found' >&2
-    exit 1
-    ;;
-  *"get events -A --field-selector=involvedObject.kind=Pod -o json"*)
-    # Simulate truncation even when JSON looks syntactically valid, caught via stderr notice
-    echo '{"apiVersion":"v1","kind":"EventList","items":[]}'
-    echo "credential proxy output truncated" >&2
-    ;;
-  *"get events -n ns-a --field-selector=involvedObject.kind=Pod -o json"*)
-    echo 'Error from server (Forbidden): events is forbidden in namespace "ns-a"' >&2
-    exit 1
-    ;;
-  *"get events -n "*" --field-selector=involvedObject.kind=Pod -o json"*)
-    echo '{"apiVersion":"v1","kind":"EventList","items":[]}'
-    ;;
-  *"get replicasets -A -o json"*)
-    cat <<'EOF'
-{"apiVersion":"apps/v1","kind":"ReplicaSetList","items":[
-  {"metadata":{"name":"api-rs","namespace":"ns-a","uid":"rs-api","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"api","uid":"dep-api","controller":true}]},"spec":{"selector":{"matchLabels":{"app":"api"}}}},
-  {"metadata":{"name":"ignored-rs","namespace":"ns-a","uid":"rs-ignored","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"ignored","uid":"dep-ignored","controller":true}]},"spec":{"selector":{"matchLabels":{"app":"ignored"}}}}
-]}
-EOF
-    ;;
-  *"get leewaypolicies.leeway.lookout.go-steer.io -A -o json"*)
+  *"get leewaypolicies.leeway.lookout.go-steer.io -n ns-a -o json")
     cat <<'EOF'
 {"apiVersion":"leeway.lookout.go-steer.io/v1alpha1","kind":"LeewayPolicyList","items":[
   {"apiVersion":"leeway.lookout.go-steer.io/v1alpha1","kind":"LeewayPolicy","metadata":{"name":"ignore-ignored","namespace":"ns-a"},"spec":{"selector":{"matchLabels":{"app":"ignored"}},"topologyKeys":[{"key":"topology.kubernetes.io/zone","mode":"Ignore"}]}}
 ]}
 EOF
     ;;
+  *"get leewaypolicies.leeway.lookout.go-steer.io -n ns-vanished -o json")
+    echo 'Error from server (NotFound): namespaces "ns-vanished" not found' >&2
+    exit 1
+    ;;
   *)
-    echo '{"apiVersion":"v1","kind":"List","items":[]}'
+    echo '{"apiVersion":"v1","kind":"List","metadata":{},"items":[]}'
     ;;
 esac
 `
@@ -924,32 +932,39 @@ esac
 	if err != nil {
 		t.Fatalf("Collect: %v", err)
 	}
-	if len(rep.Clusters) != 1 || rep.Clusters[0].Status != StatusOK {
-		t.Fatalf("cluster result = %+v, want StatusOK", rep.Clusters)
-	}
 	rawLog, err := os.ReadFile(logFile)
 	if err != nil {
 		t.Fatalf("read kubectl log: %v", err)
 	}
 	calls := string(rawLog)
+	if len(rep.Clusters) != 1 || rep.Clusters[0].Status != StatusOK {
+		t.Fatalf("cluster result = %+v, want StatusOK; kubectl log:\n%s", rep.Clusters, calls)
+	}
 
+	// All four api pods, two from each page, are needed for the finding; the
+	// ignored workload is dropped only if the per-namespace policy read ran.
 	if len(rep.Clusters[0].TopologyFindings) != 1 || rep.Clusters[0].TopologyFindings[0].Subject.Name != "api" {
 		t.Fatalf("TopologyFindings = %+v (Domains=%+v), want 1 finding for Deployment/ns-a/api; kubectl log:\n%s",
 			rep.Clusters[0].TopologyFindings, rep.Clusters[0].Domains, calls)
 	}
 	for _, want := range []string{
-		"--context=gke_p_r_c get pods -A -o json",
-		"--context=gke_p_r_c get namespaces -o json",
-		"--context=gke_p_r_c get pods -n ns-a -o json",
-		"--context=gke_p_r_c get pods -n ns-b -o json",
-		"--context=gke_p_r_c get events -A --field-selector=involvedObject.kind=Pod -o json",
-		"--context=gke_p_r_c get events -n ns-a --field-selector=involvedObject.kind=Pod -o json",
+		"--context=gke_p_r_c get --raw /api/v1/nodes?limit=250",
+		"--context=gke_p_r_c get --raw /api/v1/pods?limit=250",
+		"--context=gke_p_r_c get --raw /api/v1/pods?continue=c1%2B%2F%3D&limit=250",
+		"--context=gke_p_r_c get --raw /api/v1/events?fieldSelector=involvedObject.kind%3DPod&limit=125",
+		"--context=gke_p_r_c get --raw /apis/apps/v1/replicasets?limit=125",
+		"--context=gke_p_r_c get leewaypolicies.leeway.lookout.go-steer.io -n ns-a -o json",
 	} {
 		if !strings.Contains(calls, want) {
 			t.Errorf("kubectl calls missing %q; full log:\n%s", want, calls)
 		}
 	}
+	for _, unwanted := range []string{"get pods", "get events", "get replicasets", "get nodes"} {
+		if strings.Contains(calls, unwanted) {
+			t.Errorf("kubectl calls include a whole-list %q read; full log:\n%s", unwanted, calls)
+		}
+	}
 	if count := strings.Count(calls, "get namespaces -o json"); count != 1 {
-		t.Errorf("expected namespaces to be listed once across truncated resources, got %d:\n%s", count, calls)
+		t.Errorf("expected namespaces to be listed once, got %d:\n%s", count, calls)
 	}
 }
