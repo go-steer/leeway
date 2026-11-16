@@ -65,6 +65,17 @@ jobs:
           examples/kwok/scale-up 150 450 3
           examples/kwok/leeway-scale
 
+      # The one-shot snapshot, read through client-go and through the
+      # kube-agents sandbox's kubectl path, on the same padded fleet.
+      # Ceilings from a calibration on this rung (~1.4k pods): main peaked
+      # at 113-122 MiB (client-go) and 145-154 MiB (kubectl, children
+      # included); the kubectl path before #12 peaked at 550 MiB.
+      - name: Rung 2 — leeway report (client-go and kubectl paths)
+        env:
+          LEEWAY_REPORT_MAX_MB_CLIENT_GO: '200'
+          LEEWAY_REPORT_MAX_MB_KUBECTL: '250'
+        run: examples/kwok/leeway-report-scale
+
       - name: Rung 3 — 150 fake nodes, ~1,350 padded pods (churn)
         env:
           LEEWAY_SCALE_CHURN: '4'
@@ -75,5 +86,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: leeway-scale-ladder
-          path: /tmp/leeway-examples/leeway-scale.tsv
+          path: |
+            /tmp/leeway-examples/leeway-scale.tsv
+            /tmp/leeway-examples/leeway-report-scale.tsv
           if-no-files-found: ignore
