@@ -21,8 +21,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +48,21 @@ const (
 	DefaultParallelism = 8
 	// DefaultClusterTimeout is the default per-cluster collection timeout.
 	DefaultClusterTimeout = 60 * time.Second
+)
+
+const (
+	// rawPageLimit is the page size of a `kubectl get --raw` list read. A pod
+	// runs to about 13-17 KB of JSON, so a page of 250 stays near 4 MiB, under
+	// the credential proxy's 8 MiB output cap.
+	rawPageLimit = 250
+	// minRawPageLimit is the smallest page a truncated read is retried at.
+	minRawPageLimit = 1
+
+	coreV1Prefix = "/api/v1"
+	appsV1Prefix = "/apis/apps/v1"
+
+	podEventsFieldSelector = "involvedObject.kind=Pod"
+	proxyTruncatedMarker   = "credential proxy output truncated"
 )
 
 // Options configures a multi-cluster report collection run.
@@ -571,6 +588,12 @@ type kubectlSnapshot struct {
 	ccServed        bool
 }
 
+// fetchViaKubectl reads a cluster snapshot through the kubectl binary. Every
+// built-in collection is paged through `kubectl get --raw` (see
+// kubectlListPaged), so neither kubectl nor leeway ever holds a whole
+// cluster's list at once and each page is trimmed by kube.Transform before
+// the next is read. The LeewayPolicy and ComputeClass CRDs, which are small,
+// keep the typed `kubectl get -o json` read.
 func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []string, runTopo, runCC bool) (*kubectlSnapshot, error) {
 	var baseArgs []string
 	if strings.TrimSpace(target.Kubeconfig) != "" {
@@ -583,69 +606,44 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 	var out kubectlSnapshot
 	var fallbackNS namespaceFallbackCache
 
-	var nodeList corev1.NodeList
-	if err := kubectlGetJSON(ctx, baseArgs, "nodes", "", false, nil, &nodeList); err != nil {
+	nodes, err := kubectlListPaged(ctx, baseArgs, rawNodes, metav1.NamespaceAll, "", trimmed[corev1.Node])
+	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
-	for i := range nodeList.Items {
-		n := &nodeList.Items[i]
-		_, _ = kube.Transform(n)
-		out.nodes = append(out.nodes, n)
-	}
+	out.nodes = nodes
 
-	podEventsSelector := []string{"--field-selector=involvedObject.kind=Pod"}
 	policyResource := topologydrift.PolicyGVR().Resource + "." + topologydrift.PolicyGroup
 	clusterPolicyResource := topologydrift.ClusterPolicyGVR().Resource + "." + topologydrift.PolicyGroup
 
 	for _, ns := range namespaces {
-		if err := kubectlGetNamespacedJSON(ctx, baseArgs, "pods", ns, nil, false, &fallbackNS, func(podList *corev1.PodList) {
-			for i := range podList.Items {
-				p := &podList.Items[i]
-				_, _ = kube.Transform(p)
-				out.pods = append(out.pods, p)
-			}
-		}); err != nil {
+		pods, err := kubectlListPaged(ctx, baseArgs, rawPods, ns, "", trimmed[corev1.Pod])
+		if err != nil {
 			return nil, fmt.Errorf("list pods: %w", err)
 		}
+		out.pods = append(out.pods, pods...)
 
-		_ = kubectlGetNamespacedJSON(ctx, baseArgs, "events", ns, podEventsSelector, true, &fallbackNS, func(evList *corev1.EventList) {
-			for i := range evList.Items {
-				out.events = append(out.events, &evList.Items[i])
-			}
-		})
+		// Best-effort lists: an error drops that list for this namespace and
+		// keeps nothing from its earlier pages.
+		if events, err := kubectlListPaged(ctx, baseArgs, rawEvents, ns, podEventsFieldSelector, kept[corev1.Event]); err == nil {
+			out.events = append(out.events, events...)
+		}
 
 		if runTopo {
-			if err := kubectlGetNamespacedJSON(ctx, baseArgs, "replicasets", ns, nil, false, &fallbackNS, func(rsList *appsv1.ReplicaSetList) {
-				for i := range rsList.Items {
-					r := &rsList.Items[i]
-					_, _ = kube.Transform(r)
-					out.rs = append(out.rs, r)
-				}
-			}); err != nil {
+			rs, err := kubectlListPaged(ctx, baseArgs, rawReplicaSets, ns, "", trimmed[appsv1.ReplicaSet])
+			if err != nil {
 				return nil, fmt.Errorf("list replicasets: %w", err)
 			}
+			out.rs = append(out.rs, rs...)
 
-			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "deployments", ns, nil, true, &fallbackNS, func(depList *appsv1.DeploymentList) {
-				for i := range depList.Items {
-					d := &depList.Items[i]
-					_, _ = kube.Transform(d)
-					out.deps = append(out.deps, d)
-				}
-			})
-
-			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "statefulsets", ns, nil, true, &fallbackNS, func(stsList *appsv1.StatefulSetList) {
-				for i := range stsList.Items {
-					s := &stsList.Items[i]
-					_, _ = kube.Transform(s)
-					out.stss = append(out.stss, s)
-				}
-			})
-
-			_ = kubectlGetNamespacedJSON(ctx, baseArgs, "persistentvolumeclaims", ns, nil, true, &fallbackNS, func(pvcList *corev1.PersistentVolumeClaimList) {
-				for i := range pvcList.Items {
-					out.pvcs = append(out.pvcs, &pvcList.Items[i])
-				}
-			})
+			if deps, err := kubectlListPaged(ctx, baseArgs, rawDeployments, ns, "", trimmed[appsv1.Deployment]); err == nil {
+				out.deps = append(out.deps, deps...)
+			}
+			if stss, err := kubectlListPaged(ctx, baseArgs, rawStatefulSets, ns, "", trimmed[appsv1.StatefulSet]); err == nil {
+				out.stss = append(out.stss, stss...)
+			}
+			if pvcs, err := kubectlListPaged(ctx, baseArgs, rawPVCs, ns, "", kept[corev1.PersistentVolumeClaim]); err == nil {
+				out.pvcs = append(out.pvcs, pvcs...)
+			}
 
 			_ = kubectlGetNamespacedJSON(ctx, baseArgs, policyResource, ns, nil, true, &fallbackNS, func(polList *unstructured.UnstructuredList) {
 				for i := range polList.Items {
@@ -656,11 +654,8 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 	}
 
 	if runTopo {
-		var pvList corev1.PersistentVolumeList
-		if err := kubectlGetJSON(ctx, baseArgs, "persistentvolumes", "", false, nil, &pvList); err == nil {
-			for i := range pvList.Items {
-				out.pvs = append(out.pvs, &pvList.Items[i])
-			}
+		if pvs, err := kubectlListPaged(ctx, baseArgs, rawPVs, metav1.NamespaceAll, "", kept[corev1.PersistentVolume]); err == nil {
+			out.pvs = pvs
 		}
 
 		if slices.Contains(namespaces, metav1.NamespaceAll) {
@@ -684,6 +679,112 @@ func fetchViaKubectl(ctx context.Context, target clusters.Cluster, namespaces []
 	}
 
 	return &out, nil
+}
+
+// rawCollection is a built-in list endpoint `kubectl get --raw` can page.
+type rawCollection struct {
+	prefix     string
+	resource   string
+	namespaced bool
+}
+
+var (
+	rawNodes        = rawCollection{coreV1Prefix, "nodes", false}
+	rawPods         = rawCollection{coreV1Prefix, "pods", true}
+	rawEvents       = rawCollection{coreV1Prefix, "events", true}
+	rawPVCs         = rawCollection{coreV1Prefix, "persistentvolumeclaims", true}
+	rawPVs          = rawCollection{coreV1Prefix, "persistentvolumes", false}
+	rawReplicaSets  = rawCollection{appsV1Prefix, "replicasets", true}
+	rawDeployments  = rawCollection{appsV1Prefix, "deployments", true}
+	rawStatefulSets = rawCollection{appsV1Prefix, "statefulsets", true}
+)
+
+// path is the collection's URL path, scoped to ns when the kind is namespaced
+// and ns is not NamespaceAll.
+func (c rawCollection) path(ns string) string {
+	if c.namespaced && ns != metav1.NamespaceAll {
+		return c.prefix + "/namespaces/" + url.PathEscape(ns) + "/" + c.resource
+	}
+	return c.prefix + "/" + c.resource
+}
+
+// rawListPage is the part of a list response a paged read needs.
+type rawListPage[T any] struct {
+	Metadata metav1.ListMeta `json:"metadata"`
+	Items    []T             `json:"items"`
+}
+
+// trimmed keeps an item after kube.Transform has dropped the fields no
+// evaluation reads.
+func trimmed[T any](item *T) *T {
+	_, _ = kube.Transform(item)
+	return item
+}
+
+// kept keeps an item as decoded, for kinds kube.Transform does not trim.
+func kept[T any](item *T) *T {
+	return item
+}
+
+// kubectlListPaged lists collection c one page at a time through
+// `kubectl get --raw <path>?limit=N&continue=...` and returns every item
+// after keep has seen it.
+//
+// A single `kubectl get -A -o json` makes kubectl decode and re-encode the
+// whole list, and makes leeway buffer and decode all of it, before
+// kube.Transform can trim one object: on a 23k-pod cluster that is several
+// GiB, which takes down a 2 GiB sandbox. `--raw` passes each page's bytes
+// through untouched, and each page is decoded and trimmed before the next is
+// read, so peak memory is the trimmed snapshot plus one page.
+//
+// A page that comes back truncated (the credential proxy's marker, or JSON
+// that ends early) is read again at half the size from the same continue
+// token. Any other error is returned, with nothing kept from earlier pages.
+func kubectlListPaged[T any](
+	ctx context.Context,
+	baseArgs []string,
+	c rawCollection,
+	ns string,
+	fieldSelector string,
+	keep func(*T) *T,
+) ([]*T, error) {
+	var out []*T
+	limit := rawPageLimit
+	continueToken := ""
+	for {
+		query := url.Values{}
+		query.Set("limit", strconv.Itoa(limit))
+		if continueToken != "" {
+			query.Set("continue", continueToken)
+		}
+		if fieldSelector != "" {
+			query.Set("fieldSelector", fieldSelector)
+		}
+		args := slices.Concat(baseArgs, []string{"get", "--raw", c.path(ns) + "?" + query.Encode()})
+
+		stdout, err := runKubectl(ctx, args, c.resource)
+		var page rawListPage[T]
+		if err == nil {
+			if decodeErr := json.Unmarshal(stdout, &page); decodeErr != nil {
+				err = fmt.Errorf("decode kubectl get --raw %s: %w", c.resource, decodeErr)
+			}
+		}
+		if err != nil {
+			if isKubectlOutputTruncated(err) && limit > minRawPageLimit {
+				limit = max(limit/2, minRawPageLimit)
+				continue
+			}
+			return nil, err
+		}
+
+		for i := range page.Items {
+			out = append(out, keep(&page.Items[i]))
+		}
+		continueToken = page.Metadata.Continue
+		if continueToken == "" {
+			return out, nil
+		}
+	}
 }
 
 type namespaceFallbackCache struct {
@@ -775,25 +876,36 @@ func kubectlGetJSON(ctx context.Context, baseArgs []string, resource, ns string,
 	args = append(args, extraArgs...)
 	args = append(args, "-o", "json")
 
-	cmd := exec.CommandContext(ctx, "kubectl", args...) // #nosec G204 -- args are fixed resource nouns and validated kubeconfig/context flags
+	stdout, err := runKubectl(ctx, args, resource)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(stdout, into); err != nil {
+		return fmt.Errorf("decode kubectl get %s: %w", resource, err)
+	}
+	return nil
+}
+
+// runKubectl runs kubectl with args and returns its stdout, or an error
+// wrapping errKubectlOutputTruncated when the credential proxy reports that
+// it cut the output.
+func runKubectl(ctx context.Context, args []string, resource string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "kubectl", args...) // #nosec G204 -- args are fixed resource nouns or collection paths and validated kubeconfig/context flags
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		if strings.Contains(stderr.String(), "credential proxy output truncated") {
-			return fmt.Errorf("kubectl get %s: %w", resource, errKubectlOutputTruncated)
+		if strings.Contains(stderr.String(), proxyTruncatedMarker) {
+			return nil, fmt.Errorf("kubectl get %s: %w", resource, errKubectlOutputTruncated)
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg != "" {
-			return fmt.Errorf("kubectl get %s: %s", resource, msg)
+			return nil, fmt.Errorf("kubectl get %s: %s", resource, msg)
 		}
-		return fmt.Errorf("kubectl get %s: %w", resource, err)
+		return nil, fmt.Errorf("kubectl get %s: %w", resource, err)
 	}
-	if strings.Contains(stderr.String(), "credential proxy output truncated") {
-		return fmt.Errorf("kubectl get %s: %w", resource, errKubectlOutputTruncated)
+	if strings.Contains(stderr.String(), proxyTruncatedMarker) {
+		return nil, fmt.Errorf("kubectl get %s: %w", resource, errKubectlOutputTruncated)
 	}
-	if err := json.Unmarshal(stdout.Bytes(), into); err != nil {
-		return fmt.Errorf("decode kubectl get %s: %w", resource, err)
-	}
-	return nil
+	return stdout.Bytes(), nil
 }
