@@ -417,122 +417,125 @@ func sourceEnabled(sources []string, name string) bool {
 	return slices.Contains(sources, name)
 }
 
-func listNodes(ctx context.Context, client kubernetes.Interface) ([]*corev1.Node, error) {
-	list, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*corev1.Node, len(list.Items))
-	for i := range list.Items {
-		n := &list.Items[i]
-		_, _ = kube.Transform(n)
-		out[i] = n
+// pageLister lists one page of a collection for kube.CollectPages.
+type pageLister[T any] func(context.Context, metav1.ListOptions) ([]T, string, error)
+
+// collectNamespaced pages lister(ns) for each namespace in turn and returns
+// every item keep returned. Each page is trimmed by keep before the next is
+// requested, so a large namespace never sits in memory untrimmed.
+func collectNamespaced[T any](ctx context.Context, namespaces []string, lister func(ns string) pageLister[T], keep func(*T) *T) ([]*T, error) {
+	var out []*T
+	for _, ns := range namespaces {
+		items, err := kube.CollectPages(ctx, lister(ns), keep)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
 	}
 	return out, nil
+}
+
+func listNodes(ctx context.Context, client kubernetes.Interface) ([]*corev1.Node, error) {
+	return kube.CollectPages(ctx, func(ctx context.Context, opts metav1.ListOptions) ([]corev1.Node, string, error) {
+		list, err := client.CoreV1().Nodes().List(ctx, opts)
+		if err != nil {
+			return nil, "", err
+		}
+		return list.Items, list.Continue, nil
+	}, trimmed[corev1.Node])
 }
 
 func listPods(ctx context.Context, client kubernetes.Interface, namespaces []string) ([]*corev1.Pod, error) {
-	var out []*corev1.Pod
-	for _, ns := range namespaces {
-		list, err := client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
+	return collectNamespaced(ctx, namespaces, func(ns string) pageLister[corev1.Pod] {
+		return func(ctx context.Context, opts metav1.ListOptions) ([]corev1.Pod, string, error) {
+			list, err := client.CoreV1().Pods(ns).List(ctx, opts)
+			if err != nil {
+				return nil, "", err
+			}
+			return list.Items, list.Continue, nil
 		}
-		for i := range list.Items {
-			p := &list.Items[i]
-			_, _ = kube.Transform(p)
-			out = append(out, p)
-		}
-	}
-	return out, nil
+	}, trimmed[corev1.Pod])
 }
 
 func listReplicaSets(ctx context.Context, client kubernetes.Interface, namespaces []string) ([]*appsv1.ReplicaSet, error) {
-	var out []*appsv1.ReplicaSet
-	for _, ns := range namespaces {
-		list, err := client.AppsV1().ReplicaSets(ns).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
+	return collectNamespaced(ctx, namespaces, func(ns string) pageLister[appsv1.ReplicaSet] {
+		return func(ctx context.Context, opts metav1.ListOptions) ([]appsv1.ReplicaSet, string, error) {
+			list, err := client.AppsV1().ReplicaSets(ns).List(ctx, opts)
+			if err != nil {
+				return nil, "", err
+			}
+			return list.Items, list.Continue, nil
 		}
-		for i := range list.Items {
-			rs := &list.Items[i]
-			_, _ = kube.Transform(rs)
-			out = append(out, rs)
-		}
-	}
-	return out, nil
+	}, trimmed[appsv1.ReplicaSet])
 }
 
 func listDeployments(ctx context.Context, client kubernetes.Interface, namespaces []string) ([]*appsv1.Deployment, error) {
-	var out []*appsv1.Deployment
-	for _, ns := range namespaces {
-		list, err := client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
+	return collectNamespaced(ctx, namespaces, func(ns string) pageLister[appsv1.Deployment] {
+		return func(ctx context.Context, opts metav1.ListOptions) ([]appsv1.Deployment, string, error) {
+			list, err := client.AppsV1().Deployments(ns).List(ctx, opts)
+			if err != nil {
+				return nil, "", err
+			}
+			return list.Items, list.Continue, nil
 		}
-		for i := range list.Items {
-			d := &list.Items[i]
-			_, _ = kube.Transform(d)
-			out = append(out, d)
-		}
-	}
-	return out, nil
+	}, trimmed[appsv1.Deployment])
 }
 
 func listStatefulSets(ctx context.Context, client kubernetes.Interface, namespaces []string) ([]*appsv1.StatefulSet, error) {
-	var out []*appsv1.StatefulSet
-	for _, ns := range namespaces {
-		list, err := client.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
+	return collectNamespaced(ctx, namespaces, func(ns string) pageLister[appsv1.StatefulSet] {
+		return func(ctx context.Context, opts metav1.ListOptions) ([]appsv1.StatefulSet, string, error) {
+			list, err := client.AppsV1().StatefulSets(ns).List(ctx, opts)
+			if err != nil {
+				return nil, "", err
+			}
+			return list.Items, list.Continue, nil
 		}
-		for i := range list.Items {
-			sts := &list.Items[i]
-			_, _ = kube.Transform(sts)
-			out = append(out, sts)
-		}
-	}
-	return out, nil
+	}, trimmed[appsv1.StatefulSet])
 }
 
 func listPVCs(ctx context.Context, client kubernetes.Interface, namespaces []string) ([]*corev1.PersistentVolumeClaim, error) {
-	var out []*corev1.PersistentVolumeClaim
-	for _, ns := range namespaces {
-		list, err := client.CoreV1().PersistentVolumeClaims(ns).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, err
+	return collectNamespaced(ctx, namespaces, func(ns string) pageLister[corev1.PersistentVolumeClaim] {
+		return func(ctx context.Context, opts metav1.ListOptions) ([]corev1.PersistentVolumeClaim, string, error) {
+			list, err := client.CoreV1().PersistentVolumeClaims(ns).List(ctx, opts)
+			if err != nil {
+				return nil, "", err
+			}
+			return list.Items, list.Continue, nil
 		}
-		for i := range list.Items {
-			out = append(out, &list.Items[i])
-		}
-	}
-	return out, nil
+	}, kept[corev1.PersistentVolumeClaim])
 }
 
 func listPVs(ctx context.Context, client kubernetes.Interface) ([]*corev1.PersistentVolume, error) {
-	list, err := client.CoreV1().PersistentVolumes().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*corev1.PersistentVolume, len(list.Items))
-	for i := range list.Items {
-		out[i] = &list.Items[i]
-	}
-	return out, nil
+	return kube.CollectPages(ctx, func(ctx context.Context, opts metav1.ListOptions) ([]corev1.PersistentVolume, string, error) {
+		list, err := client.CoreV1().PersistentVolumes().List(ctx, opts)
+		if err != nil {
+			return nil, "", err
+		}
+		return list.Items, list.Continue, nil
+	}, kept[corev1.PersistentVolume])
 }
 
 func listEvents(ctx context.Context, client kubernetes.Interface, namespaces []string) ([]*corev1.Event, error) {
-	var out []*corev1.Event
-	for _, ns := range namespaces {
-		list, err := client.CoreV1().Events(ns).List(ctx, metav1.ListOptions{})
+	return collectNamespaced(ctx, namespaces, func(ns string) pageLister[corev1.Event] {
+		return func(ctx context.Context, opts metav1.ListOptions) ([]corev1.Event, string, error) {
+			list, err := client.CoreV1().Events(ns).List(ctx, opts)
+			if err != nil {
+				return nil, "", err
+			}
+			return list.Items, list.Continue, nil
+		}
+	}, kept[corev1.Event])
+}
+
+// unstructuredLister pages a dynamic resource for kube.CollectPages.
+func unstructuredLister(resource dynamic.ResourceInterface) pageLister[unstructured.Unstructured] {
+	return func(ctx context.Context, opts metav1.ListOptions) ([]unstructured.Unstructured, string, error) {
+		list, err := resource.List(ctx, opts)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		for i := range list.Items {
-			out = append(out, &list.Items[i])
-		}
+		return list.Items, list.GetContinue(), nil
 	}
-	return out, nil
 }
 
 func listPolicies(ctx context.Context, client kubernetes.Interface, dyn dynamic.Interface, namespaces []string) (policies, clusterPolicies []*unstructured.Unstructured) {
@@ -542,35 +545,23 @@ func listPolicies(ctx context.Context, client kubernetes.Interface, dyn dynamic.
 	namespaced, clusterScoped := topologydrift.PoliciesServed(client)
 	if namespaced {
 		for _, ns := range namespaces {
-			list, err := dyn.Resource(topologydrift.PolicyGVR()).Namespace(ns).List(ctx, metav1.ListOptions{})
+			items, err := kube.CollectPages(ctx, unstructuredLister(dyn.Resource(topologydrift.PolicyGVR()).Namespace(ns)), kept[unstructured.Unstructured])
 			if err != nil {
 				continue
 			}
-			for i := range list.Items {
-				policies = append(policies, &list.Items[i])
-			}
+			policies = append(policies, items...)
 		}
 	}
 	if clusterScoped && slices.Contains(namespaces, metav1.NamespaceAll) {
-		if list, err := dyn.Resource(topologydrift.ClusterPolicyGVR()).List(ctx, metav1.ListOptions{}); err == nil {
-			for i := range list.Items {
-				clusterPolicies = append(clusterPolicies, &list.Items[i])
-			}
+		if items, err := kube.CollectPages(ctx, unstructuredLister(dyn.Resource(topologydrift.ClusterPolicyGVR())), kept[unstructured.Unstructured]); err == nil {
+			clusterPolicies = items
 		}
 	}
 	return policies, clusterPolicies
 }
 
 func listComputeClasses(ctx context.Context, dyn dynamic.Interface) ([]*unstructured.Unstructured, error) {
-	list, err := dyn.Resource(computeclass.ComputeClassGVR()).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]*unstructured.Unstructured, len(list.Items))
-	for i := range list.Items {
-		out[i] = &list.Items[i]
-	}
-	return out, nil
+	return kube.CollectPages(ctx, unstructuredLister(dyn.Resource(computeclass.ComputeClassGVR())), kept[unstructured.Unstructured])
 }
 
 type kubectlSnapshot struct {

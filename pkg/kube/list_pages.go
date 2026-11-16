@@ -79,6 +79,48 @@ func ListAllPages[T any](
 	}
 }
 
+// CollectPages fetches every page from list using Limit/Continue pagination
+// and passes each item to keep as its page arrives, before the next page is
+// requested, returning what keep returned for every item in order. keep is
+// where a caller trims an object (kube.Transform), so the untrimmed form of
+// at most one page is alive at a time, unlike ListAllPages, which holds every
+// untrimmed page until the list ends.
+//
+// If the API server expires the continue token mid-stream (HTTP 410 Gone),
+// CollectPages discards what it has kept and restarts once from
+// Continue="", so the result is never a torn or duplicated object set; keep
+// may therefore see an item twice, and must not have side effects beyond
+// the item it is given.
+func CollectPages[T any](
+	ctx context.Context,
+	list func(context.Context, metav1.ListOptions) ([]T, string, error),
+	keep func(*T) *T,
+) ([]*T, error) {
+	opts := metav1.ListOptions{Limit: DefaultPageLimit}
+	var out []*T
+	restarted := false
+
+	for {
+		page, next, err := list(ctx, opts)
+		if err != nil {
+			if (apierrors.IsResourceExpired(err) || apierrors.IsGone(err)) && !restarted {
+				restarted = true
+				out = nil
+				opts = metav1.ListOptions{Limit: DefaultPageLimit}
+				continue
+			}
+			return nil, err
+		}
+		for i := range page {
+			out = append(out, keep(&page[i]))
+		}
+		if next == "" {
+			return out, nil
+		}
+		opts.Continue = next
+	}
+}
+
 type listCacheKey struct{}
 
 type podCacheKey struct {
