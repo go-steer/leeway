@@ -179,3 +179,110 @@ func TestWrapClientDeduplicatesPodAndNodeLists(t *testing.T) {
 		_ = schema.GroupResource{}
 	}
 }
+
+func TestCollectPagesKeepsEachPageBeforeRequestingTheNext(t *testing.T) {
+	var kept []string
+	var seenLimits []int64
+
+	listFn := func(_ context.Context, opts metav1.ListOptions) ([]string, string, error) {
+		seenLimits = append(seenLimits, opts.Limit)
+		switch opts.Continue {
+		case "":
+			return []string{"a", "b"}, "tok-1", nil
+		case "tok-1":
+			// Page 1 must already have been through keep.
+			if !reflect.DeepEqual(kept, []string{"a", "b"}) {
+				t.Errorf("page 2 requested with kept = %v, want page 1 kept first", kept)
+			}
+			return []string{"c"}, "", nil
+		default:
+			t.Fatalf("unexpected continue token %q", opts.Continue)
+			return nil, "", nil
+		}
+	}
+
+	got, err := CollectPages(context.Background(), listFn, func(item *string) *string {
+		kept = append(kept, *item)
+		trimmed := *item + "-trimmed"
+		return &trimmed
+	})
+	if err != nil {
+		t.Fatalf("CollectPages returned error: %v", err)
+	}
+	var values []string
+	for _, v := range got {
+		values = append(values, *v)
+	}
+	if want := []string{"a-trimmed", "b-trimmed", "c-trimmed"}; !reflect.DeepEqual(values, want) {
+		t.Fatalf("got %v, want %v", values, want)
+	}
+	if want := []int64{DefaultPageLimit, DefaultPageLimit}; !reflect.DeepEqual(seenLimits, want) {
+		t.Errorf("limits = %v, want %v", seenLimits, want)
+	}
+}
+
+func TestCollectPagesRestartsOnceOnGoneWithoutTornResults(t *testing.T) {
+	goneInjected := false
+	listFn := func(_ context.Context, opts metav1.ListOptions) ([]string, string, error) {
+		switch opts.Continue {
+		case "":
+			if !goneInjected {
+				return []string{"stale-a"}, "expired-token", nil
+			}
+			return []string{"fresh-a"}, "fresh-tok", nil
+		case "expired-token":
+			goneInjected = true
+			return nil, "", apierrors.NewResourceExpired("continue token expired")
+		case "fresh-tok":
+			return []string{"fresh-b"}, "", nil
+		default:
+			t.Fatalf("unexpected continue token %q", opts.Continue)
+			return nil, "", nil
+		}
+	}
+
+	got, err := CollectPages(context.Background(), listFn, func(item *string) *string { return item })
+	if err != nil {
+		t.Fatalf("expected one clean restart after 410 Gone, got error: %v", err)
+	}
+	var values []string
+	for _, v := range got {
+		values = append(values, *v)
+	}
+	if want := []string{"fresh-a", "fresh-b"}; !reflect.DeepEqual(values, want) {
+		t.Fatalf("got %v, want %v (stale page must be discarded)", values, want)
+	}
+}
+
+func TestCollectPagesFailsOnRepeatedGoneAndOtherErrors(t *testing.T) {
+	gone := func(_ context.Context, opts metav1.ListOptions) ([]string, string, error) {
+		if opts.Continue == "" {
+			return []string{"a"}, "tok", nil
+		}
+		return nil, "", apierrors.NewResourceExpired("still gone")
+	}
+	got, err := CollectPages(context.Background(), gone, func(item *string) *string { return item })
+	if !apierrors.IsResourceExpired(err) && !apierrors.IsGone(err) {
+		t.Fatalf("expected 410 Gone after one restart, got %v", err)
+	}
+	if got != nil {
+		t.Errorf("got %d items, want none on error", len(got))
+	}
+
+	forbidden := errors.New("forbidden")
+	calls := 0
+	failing := func(_ context.Context, opts metav1.ListOptions) ([]string, string, error) {
+		calls++
+		if opts.Continue == "" {
+			return []string{"a"}, "tok", nil
+		}
+		return nil, "", forbidden
+	}
+	got, err = CollectPages(context.Background(), failing, func(item *string) *string { return item })
+	if !errors.Is(err, forbidden) || got != nil {
+		t.Fatalf("got (%v, %v), want (nil, forbidden)", got, err)
+	}
+	if calls != 2 {
+		t.Errorf("list called %d times, want 2 (no restart on a non-410 error)", calls)
+	}
+}
