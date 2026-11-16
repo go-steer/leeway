@@ -6,6 +6,8 @@ All notable changes to `leeway` are documented in this file.
 
 ### Fixed
 
+- **Paged `kubectl` Limit Recovery & `410 Gone` Restart (`pkg/report/collector.go`)**: `kubectlListPaged` now doubles `limit` back toward `250` on each successful page after a truncated outlier page (so a single oversized object no longer pins the remainder of a large list at a tiny page size), and restarts once cleanly from page 1 when the API server expires a `continue` token (`410 Gone` / `Expired`), discarding partial results to match `pkg/kube.ListAllPages` (`#13`).
+- **Go 1.26.11 Toolchain Bump (`go.mod`, `Dockerfile`)**: Bumped Go from `1.26.10` to `1.26.11` to address stdlib `net/http` vulnerability `GO-2026-6859`.
 - **Paged `kubectl` Snapshot Reads (`pkg/report/collector.go`)**: `fetchViaKubectl` now reads nodes, pods, events, ReplicaSets, Deployments, StatefulSets, PersistentVolumeClaims and PersistentVolumes one page of 250 at a time through `kubectl get --raw <path>?limit=250&continue=...`, and trims each page with `kube.Transform` before reading the next. A single `kubectl get pods -A -o json` made kubectl decode and re-encode the whole list, and leeway buffer and decode all of it, before one object could be trimmed, so a 23k-pod cluster drove a 2 GiB sandbox to `OOMKilled` with no report. Paged, the same cluster peaks at 264 MiB. A page the credential proxy truncates, or whose JSON ends early, is read again at half the size from the same continue token, which replaces the whole-list namespace fallback for these kinds; the LeewayPolicy and ComputeClass CRDs keep the typed read and that fallback.
 
 ## [0.1.5] - 2026-11-06
