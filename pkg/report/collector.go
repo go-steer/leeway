@@ -739,7 +739,14 @@ func kept[T any](item *T) *T {
 //
 // A page that comes back truncated (the credential proxy's marker, or JSON
 // that ends early) is read again at half the size from the same continue
-// token. Any other error is returned, with nothing kept from earlier pages.
+// token. Once a page succeeds and advances, the page size doubles back toward
+// rawPageLimit so a single oversized outlier does not leave the remainder of a
+// large list stuck at limit=1.
+//
+// If the API server expires the continue token mid-list (HTTP 410 Gone /
+// Expired), partial results are discarded and the list restarts once cleanly
+// from the beginning, matching pkg/kube.ListAllPages. Any other error is
+// returned, with nothing kept from earlier pages.
 func kubectlListPaged[T any](
 	ctx context.Context,
 	baseArgs []string,
@@ -751,6 +758,7 @@ func kubectlListPaged[T any](
 	var out []*T
 	limit := rawPageLimit
 	continueToken := ""
+	restarted := false
 	for {
 		query := url.Values{}
 		query.Set("limit", strconv.Itoa(limit))
@@ -774,6 +782,13 @@ func kubectlListPaged[T any](
 				limit = max(limit/2, minRawPageLimit)
 				continue
 			}
+			if continueToken != "" && !restarted && isKubectlContinueExpired(err) {
+				restarted = true
+				out = nil
+				continueToken = ""
+				limit = rawPageLimit
+				continue
+			}
 			return nil, err
 		}
 
@@ -784,6 +799,7 @@ func kubectlListPaged[T any](
 		if continueToken == "" {
 			return out, nil
 		}
+		limit = min(limit*2, rawPageLimit)
 	}
 }
 
@@ -852,6 +868,17 @@ func isKubectlNotFound(err error) bool {
 	}
 	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "(notfound)") || strings.Contains(lower, "not found")
+}
+
+func isKubectlContinueExpired(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "(expired)") ||
+		strings.Contains(lower, "(gone)") ||
+		strings.Contains(lower, "continue parameter is too old") ||
+		strings.Contains(lower, "status code 410")
 }
 
 func isKubectlOutputTruncated(err error) bool {
