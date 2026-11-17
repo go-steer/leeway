@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	authv1 "k8s.io/api/authorization/v1"
@@ -262,5 +263,46 @@ func TestDynamicClientStaysJSON(t *testing.T) {
 		if got := h.header(t, http.MethodGet, path, "Accept"); strings.Contains(got, "protobuf") || !strings.HasPrefix(got, jsonType) {
 			t.Errorf("%s: GET Accept = %q, want JSON and no protobuf", c.name, got)
 		}
+	}
+}
+
+// TestDiscoveryDecodesProtobuf: discovery's group-version read is a raw
+// request on the typed client, so it is the one generated-client read whose
+// encoding the defaults change. The policy and ComputeClass sources treat a
+// discovery error as "not served", so a protobuf answer that failed to decode
+// would silently drop them.
+func TestDiscoveryDecodesProtobuf(t *testing.T) {
+	pb := protobuf.NewSerializer(scheme.Scheme, scheme.Scheme)
+	var accept atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accept.Store(r.Header.Get("Accept"))
+		list := &metav1.APIResourceList{
+			TypeMeta:     metav1.TypeMeta{Kind: "APIResourceList", APIVersion: "v1"},
+			GroupVersion: "cloud.google.com/v1",
+			APIResources: []metav1.APIResource{{Name: "computeclasses", Kind: "ComputeClass"}},
+		}
+		var buf bytes.Buffer
+		if err := pb.Encode(list, &buf); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", wantContentType)
+		_, _ = w.Write(buf.Bytes())
+	}))
+	defer srv.Close()
+
+	client, err := BuildClientFromConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatalf("BuildClientFromConfig: %v", err)
+	}
+	got, err := client.Discovery().ServerResourcesForGroupVersion("cloud.google.com/v1")
+	if err != nil {
+		t.Fatalf("ServerResourcesForGroupVersion: %v", err)
+	}
+	if got, _ := accept.Load().(string); got != wantAccept {
+		t.Errorf("discovery Accept = %q, want %q", got, wantAccept)
+	}
+	if len(got.APIResources) != 1 || got.APIResources[0].Name != "computeclasses" {
+		t.Errorf("APIResources = %+v, want [computeclasses]", got.APIResources)
 	}
 }
