@@ -189,6 +189,9 @@ type mockKubeCluster struct {
 	serveClasses    bool
 
 	podWatchers map[chan watchFrame]struct{}
+
+	// accepts records the Accept header of every GET, keyed by path.
+	accepts map[string][]string
 }
 
 type watchFrame struct {
@@ -201,6 +204,7 @@ func newMockKubeCluster(t *testing.T) *mockKubeCluster {
 	c := &mockKubeCluster{
 		rv:          100,
 		podWatchers: make(map[chan watchFrame]struct{}),
+		accepts:     make(map[string][]string),
 	}
 	c.srv = httptest.NewServer(http.HandlerFunc(c.handle))
 	t.Cleanup(c.srv.Close)
@@ -244,9 +248,24 @@ func (c *mockKubeCluster) deletePod(namespace, name string) {
 	}
 }
 
+// takeAccepts returns the Accept headers GETs of path carried since the
+// last call, and forgets every recorded header.
+func (c *mockKubeCluster) takeAccepts(path string) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	got := c.accepts[path]
+	c.accepts = make(map[string][]string)
+	return got
+}
+
 func (c *mockKubeCluster) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	path := r.URL.Path
+	if r.Method == http.MethodGet {
+		c.mu.Lock()
+		c.accepts[path] = append(c.accepts[path], r.Header.Get("Accept"))
+		c.mu.Unlock()
+	}
 
 	// SelfSubjectAccessReview: grant all read checks.
 	if r.Method == http.MethodPost && path == "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews" {
@@ -1253,6 +1272,7 @@ func TestE2E_MultiClusterReportAndWatch(t *testing.T) {
 	if rep.Summary.TopologyFindings != 1 || rep.Summary.RankFindings != 1 {
 		t.Fatalf("expected 1 topology finding and 1 rank finding across fleet, got %+v", rep.Summary)
 	}
+	assertNegotiation(t, "report", clusterA, clusterB)
 
 	// 2. Multi-cluster `leeway watch`.
 	webhook := newWebhookCapture(t)
@@ -1278,5 +1298,34 @@ func TestE2E_MultiClusterReportAndWatch(t *testing.T) {
 	metrics := scrapeMetrics(t, rw.metricsAddr)
 	if !strings.Contains(metrics, `cluster="cluster-a"`) || !strings.Contains(metrics, `cluster="cluster-b"`) {
 		t.Errorf("/metrics missing per-cluster labels for cluster-a and cluster-b")
+	}
+	assertNegotiation(t, "watch", clusterA, clusterB)
+}
+
+// assertNegotiation checks the Accept headers a command sent since the last
+// check: typed reads of built-in kinds ask for protobuf, the ComputeClass
+// CRD read asks for JSON only. client-go's generated calls would ask for
+// protobuf without pkg/kube's defaults, so this pins what the binary
+// negotiates, not which constructor built the client.
+func assertNegotiation(t *testing.T, phase string, typed, crd *mockKubeCluster) {
+	t.Helper()
+	const protobufFirst = "application/vnd.kubernetes.protobuf,application/json"
+	nodes := typed.takeAccepts("/api/v1/nodes")
+	if len(nodes) == 0 {
+		t.Errorf("%s: no node read reached the API server", phase)
+	}
+	for _, got := range nodes {
+		if got != protobufFirst {
+			t.Errorf("%s: node read Accept = %q, want %q", phase, got, protobufFirst)
+		}
+	}
+	classes := crd.takeAccepts("/apis/cloud.google.com/v1/computeclasses")
+	if len(classes) == 0 {
+		t.Errorf("%s: no ComputeClass read reached the API server", phase)
+	}
+	for _, got := range classes {
+		if strings.Contains(got, "protobuf") || !strings.HasPrefix(got, "application/json") {
+			t.Errorf("%s: ComputeClass read Accept = %q, want JSON and no protobuf", phase, got)
+		}
 	}
 }

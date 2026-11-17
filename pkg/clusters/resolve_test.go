@@ -92,6 +92,46 @@ func TestResolve_KubeconfigContextsAndFleet(t *testing.T) {
 	}
 }
 
+// TestResolve_ShellModeTargetsCarryNoRestConfig: inside the agent sandbox
+// (CREDENTIAL_PROXY_URL set) every target resolves to a kubeconfig context
+// and no rest.Config, so leeway report reads it through kubectl and the
+// credential proxy rather than through client-go.
+func TestResolve_ShellModeTargetsCarryNoRestConfig(t *testing.T) {
+	t.Setenv(CredentialProxyURLEnv, "http://127.0.0.1:18080")
+	t.Setenv(BrokerURLEnv, "")
+	t.Setenv(BrokerTokenFileEnv, "")
+	kc := writeTestKubeconfig(t, t.TempDir())
+
+	cases := []struct {
+		name        string
+		opts        Options
+		wantContext string
+	}{
+		{"GKE triple", Options{Clusters: "my-proj/us-central1/prod-a"}, "gke_my-proj_us-central1_prod-a"},
+		{"gke_ context name", Options{Kubeconfig: kc, Clusters: "gke_my-proj_us-central1_prod-a"}, "gke_my-proj_us-central1_prod-a"},
+		{"kubeconfig context name", Options{Kubeconfig: kc, Clusters: "ctx-west"}, "ctx-west"},
+		{"single cluster with --context", Options{Kubeconfig: kc, Context: "gke_my-proj_us-central1_prod-a"}, "gke_my-proj_us-central1_prod-a"},
+		{"single cluster, no cluster argument", Options{}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := Resolve(context.Background(), tc.opts)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d clusters, want 1: %+v", len(got), got)
+			}
+			if got[0].Config != nil {
+				t.Errorf("Config = %+v, want nil", got[0].Config)
+			}
+			if got[0].Context != tc.wantContext {
+				t.Errorf("Context = %q, want %q", got[0].Context, tc.wantContext)
+			}
+		})
+	}
+}
+
 func TestResolve_ExplicitGKETriplesAndEndpoints(t *testing.T) {
 	fakeTS := func(context.Context) (oauth2.TokenSource, error) {
 		return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "fake-adc"}), nil
