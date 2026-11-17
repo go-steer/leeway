@@ -4,6 +4,8 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-17
+
 ### Fixed
 
 - **Paged `client-go` Snapshot Reads (`pkg/report/collector.go`, `pkg/kube/list_pages.go`)**: The `client-go` and dynamic list helpers `leeway report` uses when a target carries a rest config (nodes, pods, ReplicaSets, Deployments, StatefulSets, PersistentVolumeClaims, PersistentVolumes, events, LeewayPolicy, ClusterLeewayPolicy and ComputeClass) now page with `kube.DefaultPageLimit` and `Continue` through the new `kube.CollectPages`, which passes each page through a keep function before requesting the next. For the kinds `kube.Transform` trims (nodes, pods, ReplicaSets, Deployments, StatefulSets) that trims each page as it arrives; they called `List` with no `Limit`, so the whole untrimmed list sat in memory before one object was trimmed, the same shape #12 removed from the `kubectl` path. The other kinds are kept as decoded, as before, so for them only the size of each API response is bounded. An expired continue token (`410 Gone`) restarts the list once from the start and discards what was kept, so the result is never torn or duplicated. `kube.ListPages` is unchanged: it still hands untrimmed items to its callback only after every page has arrived, because that is what lets it promise a callback never sees a discarded item.
