@@ -26,7 +26,7 @@ set -euo pipefail
 cd "$(repo_root)"
 
 scoped_paths() {
-  find README.md CONTRIBUTING.md SECURITY.md docs/site/src/content -type f \( -name '*.md' -o -name '*.mdx' \) 2>/dev/null | sort
+  find AGENTS.md README.md CONTRIBUTING.md SECURITY.md docs/site/src/content -type f \( -name '*.md' -o -name '*.mdx' \) 2>/dev/null | sort
 }
 
 check_pinned_installs() {
