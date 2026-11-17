@@ -35,9 +35,9 @@ jobs:
       LEEWAY_E2E_TIMEOUT_SCALE: '2'
       LEEWAY_IMAGE: leeway:examples-dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
