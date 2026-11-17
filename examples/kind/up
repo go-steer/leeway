@@ -32,6 +32,38 @@ for tool in kind kubectl docker; do
   }
 done
 
+# kind_load <image> — side-load one image into every kind node.
+#
+# `kind load docker-image` saves the image with `docker save` and imports it
+# on each node with `ctr images import --all-platforms`. On Docker with the
+# containerd image store (the default on ubuntu-26.04 runners), saving a
+# multi-platform image exports its whole index while only the host's
+# platform is present, so the import fails on the first missing digest
+# ("content digest ... not found"). Saving just the daemon's platform gives
+# ctr an archive it can import whole.
+#
+# If the platform can't be read or that save fails (a Docker before 28 has
+# no `docker save --platform`), it says so and falls back to the plain load,
+# which is what worked before the containerd store was the default.
+kind_archive=""
+trap 'rm -f "$kind_archive"' EXIT
+
+kind_load() {
+  local image="$1" platform
+  platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/dev/null || true)"
+  if [[ "$platform" == */?* ]]; then
+    kind_archive="$(mktemp)"
+    if docker save --platform "$platform" "$image" -o "$kind_archive"; then
+      kind load image-archive "$kind_archive" --name "$CLUSTER_NAME"
+      rm -f "$kind_archive"
+      return
+    fi
+    rm -f "$kind_archive"
+  fi
+  echo "  ⚠ could not save $image for one platform; falling back to kind load docker-image" >&2
+  kind load docker-image "$image" --name "$CLUSTER_NAME"
+}
+
 if kind get clusters 2>/dev/null | grep -qx "$CLUSTER_NAME"; then
   echo "▸ kind cluster '$CLUSTER_NAME' already exists — reusing"
 else
@@ -48,13 +80,13 @@ kubectl wait --for=condition=Ready nodes --all --timeout=180s
 echo "▸ pre-pulling demo images into the kind nodes"
 for img in python:3.12-alpine; do
   docker pull "$img"
-  kind load docker-image "$img" --name "$CLUSTER_NAME"
+  kind_load "$img"
 done
 
 if $build_image; then
   echo "▸ building leeway:examples-dev from HEAD"
   (cd "$(repo_root)" && docker build -t leeway:examples-dev --build-arg VERSION=examples-dev .)
-  kind load docker-image leeway:examples-dev --name "$CLUSTER_NAME"
+  kind_load leeway:examples-dev
   echo
   echo "Side-loaded. Deploy leeway + stub webhook with:"
   echo "  LEEWAY_IMAGE=leeway:examples-dev examples/watcher/up"

@@ -130,3 +130,126 @@ func TestKubectlListPaged_TruncatedAtTheSmallestPageFails(t *testing.T) {
 		t.Errorf("page size went below %d; log:\n%s", minRawPageLimit, calls)
 	}
 }
+
+func TestKubectlListPaged_RecoversLimitAfterTruncatedPage(t *testing.T) {
+	logFile := installFakeKubectl(t, `case "$args" in
+  *"/api/v1/pods?limit=250"|*"/api/v1/pods?limit=125")
+    echo "credential proxy output truncated" >&2; exit 1 ;;
+  *"/api/v1/pods?limit=62")
+    echo '{"metadata":{"continue":"p2"},"items":[{"metadata":{"name":"p0"}}]}' ;;
+  *"/api/v1/pods?continue=p2&limit=124")
+    echo '{"metadata":{"continue":"p3"},"items":[{"metadata":{"name":"p1"}}]}' ;;
+  *"/api/v1/pods?continue=p3&limit=248")
+    echo '{"metadata":{"continue":"p4"},"items":[{"metadata":{"name":"p2"}}]}' ;;
+  *"/api/v1/pods?continue=p4&limit=250")
+    echo '{"metadata":{},"items":[{"metadata":{"name":"p3"}}]}' ;;
+  *)
+    echo "unexpected: $args" >&2; exit 1 ;;
+esac
+`)
+	got, err := kubectlListPaged(context.Background(), nil, rawPods, metav1.NamespaceAll, "", kept[corev1.Pod])
+	if err != nil {
+		t.Fatalf("kubectlListPaged: %v (log:\n%s)", err, readKubectlLog(t, logFile))
+	}
+	var names []string
+	for _, p := range got {
+		names = append(names, p.Name)
+	}
+	if strings.Join(names, ",") != "p0,p1,p2,p3" {
+		t.Errorf("pods = %v, want p0,p1,p2,p3", names)
+	}
+	calls := readKubectlLog(t, logFile)
+	for _, want := range []string{
+		"/api/v1/pods?limit=62",
+		"/api/v1/pods?continue=p2&limit=124",
+		"/api/v1/pods?continue=p3&limit=248",
+		"/api/v1/pods?continue=p4&limit=250",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("kubectl calls missing %q; log:\n%s", want, calls)
+		}
+	}
+}
+
+func TestKubectlListPaged_RetriesOnceOnExpiredContinue(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "attempt")
+	logFile := installFakeKubectl(t, `count=0
+if [ -f "`+stateFile+`" ]; then count=$(cat "`+stateFile+`"); fi
+case "$args" in
+  *"/api/v1/pods?limit=250")
+    count=$((count + 1))
+    echo "$count" > "`+stateFile+`"
+    if [ "$count" -eq 1 ]; then
+      echo '{"metadata":{"continue":"stale"},"items":[{"metadata":{"name":"stale-p0"}}]}'
+    else
+      echo '{"metadata":{"continue":"fresh"},"items":[{"metadata":{"name":"fresh-p0"}}]}'
+    fi
+    ;;
+  *"/api/v1/pods?continue=stale&limit=250")
+    echo 'Error from server (Expired): The continue parameter is too old to display a consistent list result.' >&2
+    exit 1
+    ;;
+  *"/api/v1/pods?continue=fresh&limit=250")
+    echo '{"metadata":{},"items":[{"metadata":{"name":"fresh-p1"}}]}'
+    ;;
+  *)
+    echo "unexpected: $args" >&2; exit 1 ;;
+esac
+`)
+	got, err := kubectlListPaged(context.Background(), nil, rawPods, metav1.NamespaceAll, "", kept[corev1.Pod])
+	if err != nil {
+		t.Fatalf("kubectlListPaged: %v (log:\n%s)", err, readKubectlLog(t, logFile))
+	}
+	var names []string
+	for _, p := range got {
+		names = append(names, p.Name)
+	}
+	if strings.Join(names, ",") != "fresh-p0,fresh-p1" {
+		t.Errorf("pods = %v, want fresh-p0,fresh-p1 (stale items must be discarded)", names)
+	}
+	if calls := readKubectlLog(t, logFile); strings.Count(calls, "/api/v1/pods?limit=250\n") != 2 {
+		t.Errorf("expected exactly 2 page-1 reads (initial + restart); log:\n%s", calls)
+	}
+}
+
+func TestKubectlListPaged_SecondExpiredContinueFails(t *testing.T) {
+	logFile := installFakeKubectl(t, `case "$args" in
+  *"/api/v1/pods?limit=250")
+    echo '{"metadata":{"continue":"tok"},"items":[{"metadata":{"name":"p0"}}]}' ;;
+  *"/api/v1/pods?continue=tok&limit=250")
+    echo 'Error from server (Expired): The continue parameter is too old to display a consistent list result.' >&2
+    exit 1 ;;
+  *)
+    echo "unexpected: $args" >&2; exit 1 ;;
+esac
+`)
+	got, err := kubectlListPaged(context.Background(), nil, rawPods, metav1.NamespaceAll, "", kept[corev1.Pod])
+	if err == nil || !isKubectlContinueExpired(err) {
+		t.Fatalf("err = %v, want expired continue error", err)
+	}
+	if got != nil {
+		t.Errorf("items = %d, want nil on failed restart", len(got))
+	}
+	if calls := readKubectlLog(t, logFile); strings.Count(calls, "/api/v1/pods?limit=250\n") != 2 {
+		t.Errorf("expected exactly 2 page-1 reads (at most one restart); log:\n%s", calls)
+	}
+}
+
+func TestIsKubectlContinueExpired(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("kubectl get pods: Error from server (Forbidden): pods is forbidden"), false},
+		{errors.New("kubectl get pods: Error from server (NotFound): namespaces \"x\" not found"), false},
+		{errors.New("kubectl get pods: Error from server (Expired): The continue parameter is too old"), true},
+		{errors.New("kubectl get pods: Error from server (Gone): resource expired"), true},
+		{errors.New("kubectl get pods: the server responded with the status code 410"), true},
+		{errors.New("kubectl get pods: the continue parameter is too old to display a consistent list result"), true},
+	} {
+		if got := isKubectlContinueExpired(tc.err); got != tc.want {
+			t.Errorf("isKubectlContinueExpired(%v) = %v, want %v", tc.err, got, tc.want)
+		}
+	}
+}
