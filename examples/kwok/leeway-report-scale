@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# leeway-report-scale — what one `leeway report` costs at the current
+# cluster's size, read both ways it can read a cluster.
+#
+#   examples/kwok/scale-up 150 450 3
+#   examples/kwok/leeway-report-scale
+#   examples/kwok/leeway-report-scale --report
+#
+# leeway-scale measures `leeway` the long-running process: informers,
+# steady-state RSS, evaluation p99. This measures `leeway report`, the
+# one-shot snapshot, which reads the cluster by a different path and
+# whose cost is a peak, not a level. It reads a cluster one of two ways:
+#
+#   client-go   the target carries a rest config, so pkg/report lists
+#               through client-go (`listPods` and friends).
+#   kubectl     CREDENTIAL_PROXY_URL is set, as it is inside the
+#               kube-agents shell sandbox, so the target carries no rest
+#               config and `fetchViaKubectl` shells out to kubectl,
+#               paging through `kubectl get --raw`. The URL is never
+#               dialled on this path; it only selects it.
+#
+# Neither path had a scale guard, which is how a 23k-pod cluster OOMKilled
+# a 2 GiB sandbox before anyone measured it (#12).
+#
+# Per mode it records wall seconds and peak RSS of leeway AND its
+# descendants, sampled from `ps`: in kubectl mode the kubectl children
+# hold the list pages, and a ceiling on leeway alone would miss them.
+#
+# It fails when:
+#   - a mode exits non-zero or reports the cluster as anything but "ok";
+#   - the two modes disagree on the findings (the same cluster read two
+#     ways must give the same answer, so a disagreement is a read-path
+#     defect, not noise);
+#   - a mode's peak exceeds its ceiling.
+#
+# Env:
+#   LEEWAY_REPORT_MAX_MB_CLIENT_GO   fail if client-go mode's peak RSS
+#                                    exceeds this (default 0, report only)
+#   LEEWAY_REPORT_MAX_MB_KUBECTL     same, for kubectl mode, leeway plus
+#                                    its kubectl children (default 0)
+#   LEEWAY_REPORT_TIMEOUT            leeway's per-cluster --timeout
+#                                    (default 10m; the 60 s default is
+#                                    a production knob, not a harness one)
+#   LEEWAY_REPORT_SETTLE_TRIES       fingerprint checks, 5 s apart, to wait
+#                                    for the fleet to stop moving before
+#                                    reading it (default 36, three minutes)
+#
+# ON SETTLING. The two modes read the cluster seconds apart, so a fleet
+# still moving after scale-up (the pinned archetype's pods take a while
+# to land) gives them different snapshots and different findings. That
+# is not a read-path defect, and failing on it would make the rung flaky.
+# So it waits until what the evaluator counts per pod stops changing, and
+# if the modes still disagree while the fleet changed under them, it
+# settles and reads both once more. A disagreement on a fleet that did not
+# move, or a second one, fails.
+#
+# Like leeway-scale, the ceilings are off by default because a human
+# taking a reading wants the number; CI sets them. Each run appends one
+# row per mode to $STATE_DIR/leeway-report-scale.tsv.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+LADDER="$STATE_DIR/leeway-report-scale.tsv"
+TIMEOUT="${LEEWAY_REPORT_TIMEOUT:-10m}"
+MAX_MB_CLIENT_GO="${LEEWAY_REPORT_MAX_MB_CLIENT_GO:-0}"
+MAX_MB_KUBECTL="${LEEWAY_REPORT_MAX_MB_KUBECTL:-0}"
+# Placeholder that selects the kubectl path; see the header.
+SHELL_MODE_PROXY_URL="http://127.0.0.1:9"
+SAMPLE_SECONDS="0.2"
+SETTLE_TRIES="${LEEWAY_REPORT_SETTLE_TRIES:-36}"
+SETTLE_INTERVAL_SECONDS=5
+
+report() {
+  if [[ ! -s "$LADDER" ]]; then
+    echo "▸ no rungs recorded yet — run examples/kwok/leeway-report-scale after a scale-up"
+    return 0
+  fi
+  echo
+  echo "▸ ladder ($LADDER)"
+  echo
+  printf '%9s %9s %10s %9s %9s %9s\n' NODES PODS MODE WALL-S PEAK-MB FINDINGS
+  printf '%9s %9s %10s %9s %9s %9s\n' --------- --------- ---------- --------- --------- ---------
+  awk -F'\t' '{ printf "%9d %9d %10s %9.1f %9.1f %9d\n", $1, $2, $3, $4, $5, $6 }' "$LADDER"
+}
+
+if [[ "${1:-}" == "--report" ]]; then
+  report
+  exit
+fi
+
+require_examples_context
+require_kwok_installed
+
+for v in "$MAX_MB_CLIENT_GO" "$MAX_MB_KUBECTL" "$SETTLE_TRIES"; do
+  [[ "$v" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: LEEWAY_REPORT_MAX_MB_* and LEEWAY_REPORT_SETTLE_TRIES must be whole numbers (got '$v')" >&2
+    exit 2
+  }
+done
+
+bin="$(leeway_bin)"
+ctx="$(kubectl config current-context)"
+nodes="$(kubectl get nodes -o name | grep -c . || true)"
+pods="$(kubectl get pods -A -o name | grep -c . || true)"
+
+echo "▸ cluster: $nodes nodes, $pods pods ($(fake_node_count) faked by kwok)"
+echo "▸ binary:  $bin"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+# tree_rss_kb <pid> — resident KiB of pid and every descendant, from one
+# `ps` snapshot so the tree and the sizes are read at the same instant.
+tree_rss_kb() {
+  ps -e -o pid=,ppid=,rss= | awk -v root="$1" '
+    { parent[$1] = $2; rss[$1] = $3 }
+    END {
+      total = 0
+      for (p in rss) {
+        q = p
+        while (q != "" && q != 0 && q != 1) {
+          if (q == root) { total += rss[p]; break }
+          q = parent[q]
+        }
+      }
+      print total
+    }'
+}
+
+# run_mode <mode> — run one report, print "<wall-s> <peak-mb> <rc>".
+run_mode() {
+  local mode="$1" out="$work/$1.json" err="$work/$1.err"
+  local -a envs=(env -u WATCHER_BROKER_URL -u WATCHER_BROKER_TOKEN_FILE -u CREDENTIAL_PROXY_URL)
+  if [[ "$mode" == kubectl ]]; then
+    envs+=("CREDENTIAL_PROXY_URL=$SHELL_MODE_PROXY_URL")
+  fi
+
+  local started peak=0 rss rc=0 pid
+  started="$(date +%s.%N)"
+  # Only topology-drift, as in leeway-scale: compute-class needs a GKE
+  # CRD kind does not serve.
+  "${envs[@]}" "$bin" report \
+    --context="$ctx" \
+    --cluster-name=kwok-scale \
+    --sources=topology-drift \
+    --topology-tier-c-signals \
+    --timeout="$TIMEOUT" \
+    --pretty=false \
+    --output="$out" 2>"$err" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    rss="$(tree_rss_kb "$pid")"
+    ((rss > peak)) && peak="$rss"
+    sleep "$SAMPLE_SECONDS"
+  done
+  wait "$pid" || rc=$?
+  awk -v a="$started" -v b="$(date +%s.%N)" -v k="$peak" -v rc="$rc" \
+    'BEGIN { printf "%.1f %.1f %d\n", b - a, k / 1024, rc }'
+}
+
+# findings_of <mode> — one sorted line per finding, for comparing modes.
+findings_of() {
+  jq -r '.clusters[0].topology_findings // [] | .[]
+    | "\(.kind) \(.subject.kind)/\(.subject.namespace // "")/\(.subject.name) \(.topologyKey)"' \
+    "$work/$1.json" | sort
+}
+
+# fleet_fingerprint — a checksum of what the evaluator counts per pod:
+# identity, phase, node, whether it is terminating, and why it is unscheduled.
+fleet_fingerprint() {
+  kubectl get pods -A \
+    -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.phase} {.spec.nodeName} {.metadata.deletionTimestamp} {.status.conditions[?(@.type=="PodScheduled")].reason}{"\n"}{end}' |
+    sort | cksum
+}
+
+# settle — wait until two fingerprints in a row match.
+settle() {
+  local prev="" fp i
+  for ((i = 0; i < SETTLE_TRIES; i++)); do
+    fp="$(fleet_fingerprint)"
+    if [[ "$fp" == "$prev" ]]; then
+      echo "▸ fleet settled"
+      return 0
+    fi
+    prev="$fp"
+    sleep "$SETTLE_INTERVAL_SECONDS"
+  done
+  echo "  ⚠ the fleet was still changing after $((SETTLE_TRIES * SETTLE_INTERVAL_SECONDS))s; reading it anyway" >&2
+}
+
+failed=0
+declare -A peak_of wall_of count_of
+
+# measure — run both modes once; sets ok_modes to how many read "ok".
+measure() {
+  local mode wall peak_mb rc status cluster_err count
+  ok_modes=0
+  for mode in client-go kubectl; do
+    echo
+    echo "▸ $mode"
+    read -r wall peak_mb rc <<<"$(run_mode "$mode")"
+    peak_of[$mode]="$peak_mb"
+    wall_of[$mode]="$wall"
+
+    if ((rc != 0)) || [[ ! -s "$work/$mode.json" ]]; then
+      echo "  ✗ leeway report exited $rc with no report; stderr:" >&2
+      sed 's/^/    /' "$work/$mode.err" >&2
+      continue
+    fi
+    status="$(jq -r '.clusters[0].status' "$work/$mode.json")"
+    cluster_err="$(jq -r '.clusters[0].error // ""' "$work/$mode.json")"
+    count="$(findings_of "$mode" | grep -c . || true)"
+    count_of[$mode]="$count"
+
+    printf '  %-22s %s s\n' "wall clock" "$wall"
+    printf '  %-22s %s MiB\n' "peak RSS (with children)" "$peak_mb"
+    printf '  %-22s %s\n' "status" "$status${cluster_err:+ ($cluster_err)}"
+    printf '  %-22s %s\n' "topology findings" "$count"
+
+    if [[ "$status" != "ok" ]]; then
+      echo "  ✗ the cluster read as '$status', not ok" >&2
+      continue
+    fi
+    ok_modes=$((ok_modes + 1))
+  done
+}
+
+settle
+for attempt in 1 2; do
+  rm -f "$work"/*.json "$work"/*.err
+  before="$(fleet_fingerprint)"
+  measure
+  after="$(fleet_fingerprint)"
+
+  if ((ok_modes < 2)); then
+    failed=1
+    break
+  fi
+  echo
+  if diff <(findings_of client-go) <(findings_of kubectl) >"$work/findings.diff"; then
+    echo "▸ both modes report the same findings"
+    break
+  fi
+  if [[ "$before" != "$after" ]] && ((attempt == 1)); then
+    echo "  ⚠ the modes disagree, but the fleet changed while they ran; settling and reading again"
+    settle
+    continue
+  fi
+  echo "  ✗ the two read paths disagree on the findings (< client-go, > kubectl):" >&2
+  head -40 "$work/findings.diff" | sed 's/^/    /' >&2
+  failed=1
+  break
+done
+
+if ((failed == 0)); then
+  # Recounted: the fleet may have grown while it settled.
+  nodes="$(kubectl get nodes -o name | grep -c . || true)"
+  pods="$(kubectl get pods -A -o name | grep -c . || true)"
+  mkdir -p "$(dirname "$LADDER")"
+  for mode in client-go kubectl; do
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$nodes" "$pods" "$mode" \
+      "${wall_of[$mode]}" "${peak_of[$mode]}" "${count_of[$mode]}" >>"$LADDER"
+  done
+fi
+
+# ceiling <mode> <max-mb> — judge one mode's peak.
+ceiling() {
+  local mode="$1" max="$2" peak="${peak_of[$1]:-}"
+  ((max > 0)) && [[ -n "$peak" ]] || return 0
+  if awk -v p="$peak" -v m="$max" 'BEGIN { exit !(p > m) }'; then
+    echo "  ✗ REGRESSION: $mode peak RSS ${peak} MiB, ceiling ${max} MiB." >&2
+    echo "    Something on the $mode read path started holding more of the" >&2
+    echo "    cluster at once. The ceiling is a guard, not a target." >&2
+    failed=1
+  else
+    echo "  ✓ $mode peak ${peak} MiB, inside the ${max} MiB ceiling."
+  fi
+}
+echo
+ceiling client-go "$MAX_MB_CLIENT_GO"
+ceiling kubectl "$MAX_MB_KUBECTL"
+
+report
+exit "$failed"
