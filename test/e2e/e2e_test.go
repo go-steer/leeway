@@ -258,6 +258,16 @@ func (c *mockKubeCluster) takeAccepts(path string) []string {
 	return got
 }
 
+// takeAllAccepts returns every recorded Accept header by path since the last
+// take, and forgets them, so a caller can check several paths of one cluster.
+func (c *mockKubeCluster) takeAllAccepts() map[string][]string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	got := c.accepts
+	c.accepts = make(map[string][]string)
+	return got
+}
+
 func (c *mockKubeCluster) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	path := r.URL.Path
@@ -1303,10 +1313,11 @@ func TestE2E_MultiClusterReportAndWatch(t *testing.T) {
 }
 
 // assertNegotiation checks the Accept headers a command sent since the last
-// check: typed reads of built-in kinds ask for protobuf, the ComputeClass
-// CRD read asks for JSON only. client-go's generated calls would ask for
-// protobuf without pkg/kube's defaults, so this pins what the binary
-// negotiates, not which constructor built the client.
+// check: typed reads of built-in kinds and the ComputeClass discovery read ask
+// for protobuf, the ComputeClass CRD read asks for JSON only. client-go's
+// generated list calls would ask for protobuf without pkg/kube's defaults, but
+// its discovery read would not, so the discovery check is what pins that the
+// command built its clientset through pkg/kube.
 func assertNegotiation(t *testing.T, phase string, typed, crd *mockKubeCluster) {
 	t.Helper()
 	const protobufFirst = "application/vnd.kubernetes.protobuf,application/json"
@@ -1319,7 +1330,21 @@ func assertNegotiation(t *testing.T, phase string, typed, crd *mockKubeCluster) 
 			t.Errorf("%s: node read Accept = %q, want %q", phase, got, protobufFirst)
 		}
 	}
-	classes := crd.takeAccepts("/apis/cloud.google.com/v1/computeclasses")
+	crdAccepts := crd.takeAllAccepts()
+	// Discovery's group-version read checks whether ComputeClass is served. It
+	// goes through the typed clientset's discovery client, so it negotiates
+	// protobuf only when the clientset was built through pkg/kube; built
+	// directly, it sends client-go's JSON Accept.
+	discovery := crdAccepts["/apis/cloud.google.com/v1"]
+	if len(discovery) == 0 {
+		t.Errorf("%s: no ComputeClass discovery read reached the API server", phase)
+	}
+	for _, got := range discovery {
+		if got != protobufFirst {
+			t.Errorf("%s: ComputeClass discovery Accept = %q, want %q", phase, got, protobufFirst)
+		}
+	}
+	classes := crdAccepts["/apis/cloud.google.com/v1/computeclasses"]
 	if len(classes) == 0 {
 		t.Errorf("%s: no ComputeClass read reached the API server", phase)
 	}

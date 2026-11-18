@@ -225,7 +225,8 @@ func TestTypedClientDecodesBothEncodings(t *testing.T) {
 }
 
 // TestDynamicClientStaysJSON pins client-go's dynamic.ConfigFor, which
-// replaces both content types with JSON: CRDs have no protobuf encoding, so
+// replaces both content types with JSON (JSON and CBOR under client-go's CBOR
+// feature gates), never protobuf: CRDs have no protobuf encoding, so
 // a dynamic client that inherited the protobuf defaults would ask for one.
 func TestDynamicClientStaysJSON(t *testing.T) {
 	t.Setenv("KUBERNETES_SERVICE_HOST", "")

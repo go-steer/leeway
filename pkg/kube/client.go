@@ -49,8 +49,9 @@ const (
 	// requests included, and stops it depending on that default.
 	DefaultAcceptContentTypes = runtime.ContentTypeProtobuf + "," + runtime.ContentTypeJSON
 	// DefaultContentType encodes typed request bodies (SelfSubjectAccessReview)
-	// as protobuf. dynamic.ConfigFor resets both fields to JSON, so the
-	// dynamic client, and with it every CRD read, keeps speaking JSON.
+	// as protobuf. dynamic.ConfigFor resets both fields to JSON (JSON and CBOR
+	// under client-go's CBOR feature gates), never protobuf, so the dynamic
+	// client, and with it every CRD read, never asks for protobuf.
 	DefaultContentType = runtime.ContentTypeProtobuf
 )
 
