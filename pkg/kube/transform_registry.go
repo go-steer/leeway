@@ -251,6 +251,17 @@ func init() {
 	} {
 		sharedTransformRegistry = append(sharedTransformRegistry, workloadRegistryEntries(w.kind, w.prefix)...)
 	}
+	for _, kind := range []string{"Deployment", "StatefulSet"} {
+		sharedTransformRegistry = append(sharedTransformRegistry, fieldEntry{
+			Kind:   kind,
+			Path:   "metadata.labels",
+			Action: fieldPreserved,
+			Why:    "The addon manager's addonmanager.kubernetes.io/mode: Reconcile label on the workload object turns a manifest_patch remediation into platform_managed; stripping it would offer patches the platform can revert.",
+			Readers: []string{
+				"pkg/sources/topologydrift/emit.go:156,165 — platformReconciled reads the Deployment and StatefulSet labels",
+			},
+		})
+	}
 }
 
 func workloadRegistryEntries(kind, prefix string) []fieldEntry {

@@ -52,6 +52,13 @@ const (
 	// DoNotSchedule spread constraints without re-provisioning volumes will
 	// leave pods Pending.
 	RemediationStorageTopology RemediationKind = "storage_topology"
+
+	// RemediationPlatformManaged replaces a manifest_patch on a workload the
+	// cluster platform reconciles (its addon manager can revert a patch to
+	// it). It carries no yaml and no command: the change has to be made to
+	// what the platform places the workload on, or to the platform's own
+	// configuration for it.
+	RemediationPlatformManaged RemediationKind = "platform_managed"
 )
 
 // FindingRemediation is the optional deterministic remediation block on a
@@ -243,6 +250,33 @@ func SuggestRemediation(f Finding, selectorLabels map[string]string) *FindingRem
 		Kind:    RemediationRolloutRestart,
 		Summary: summary,
 		Command: cmd,
+	}
+}
+
+// PlatformManagedRemediation adjusts r for a workload the cluster platform
+// reconciles, such as an addon the platform's addon manager owns.
+//
+// Only a manifest_patch changes, to platform_managed with no yaml and no
+// command: the platform can revert the patch, and its rollout restart only
+// makes sense after a patch. Every other kind is returned as is.
+// cluster_capacity, cluster_nodes and storage_topology act on nodes, node
+// pools and volumes, which the workload's reconciler does not own.
+// rollout_restart needs no edit to survive: the restart reschedules the
+// replicas as it would for any other workload, whether or not the platform
+// later reverts the annotation it writes.
+//
+// The caller decides whether the workload is reconciled; pkg/leeway never
+// sees the workload object.
+func PlatformManagedRemediation(f Finding, r *FindingRemediation) *FindingRemediation {
+	if r == nil || r.Kind != RemediationManifestPatch {
+		return r
+	}
+	return &FindingRemediation{
+		Kind: RemediationPlatformManaged,
+		Summary: fmt.Sprintf(
+			"%s is reconciled by the cluster platform (addonmanager.kubernetes.io/mode: Reconcile), which can revert edits to it, so no workload patch is offered. To change how its replicas spread across %s, change what the platform places them on (the node pools and the domains they span), or the addon's own configuration where the platform exposes one.",
+			f.Subject, f.TopologyKey,
+		),
 	}
 }
 

@@ -476,6 +476,10 @@ type Source struct {
 	baselineGraceUntil time.Time
 	// replicaSets resolves the pod → ReplicaSet → Deployment hop. Set in Run.
 	replicaSets appslisters.ReplicaSetLister
+	// deployments and statefulSets answer whether a subject's workload is
+	// reconciled by the platform (see platformReconciled). Set in Run.
+	deployments  appslisters.DeploymentLister
+	statefulSets appslisters.StatefulSetLister
 	// pods is the verifier's view of the cache. Set in Run.
 	pods corelisters.PodLister
 	// claims and volumes resolve FR-8's pod → PVC → PV hop. Set in Run.
@@ -1542,6 +1546,8 @@ func (s *Source) Run(ctx context.Context, emit func(sources.Signal)) error {
 	// that ruled out a subject-keyed pod index in subjectPod.
 	s.mu.Lock()
 	s.replicaSets = rsInformer.Lister()
+	s.deployments = depInformer.Lister()
+	s.statefulSets = stsInformer.Lister()
 	s.pods = podInformer.Lister()
 	s.claims = pvcInformer.Lister()
 	s.volumes = pvInformer.Lister()

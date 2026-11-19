@@ -151,6 +151,18 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 			_ = rsIdx.Add(rs)
 		}
 	}
+	depIdx := newNamespaceIndexer()
+	for _, d := range in.Deployments {
+		if d != nil {
+			_ = depIdx.Add(d)
+		}
+	}
+	stsIdx := newNamespaceIndexer()
+	for _, sts := range in.StatefulSets {
+		if sts != nil {
+			_ = stsIdx.Add(sts)
+		}
+	}
 	podIdx := newNamespaceIndexer()
 	for _, pod := range in.Pods {
 		if pod != nil {
@@ -172,6 +184,8 @@ func EvaluateSnapshot(ctx context.Context, cfg Config, in SnapshotInput) (*Snaps
 
 	s.mu.Lock()
 	s.replicaSets = appslisters.NewReplicaSetLister(rsIdx)
+	s.deployments = appslisters.NewDeploymentLister(depIdx)
+	s.statefulSets = appslisters.NewStatefulSetLister(stsIdx)
 	s.pods = corelisters.NewPodLister(podIdx)
 	s.claims = corelisters.NewPersistentVolumeClaimLister(pvcIdx)
 	s.volumes = corelisters.NewPersistentVolumeLister(pvIdx)
@@ -393,7 +407,7 @@ func buildSelectorConfinedFinding(s *Source, sub leeway.SubjectRef, ev *Evaluati
 			f.Severity = ev.Intent.Severity
 			f.SeverityFromPolicy = true
 		}
-		f.Remediation = leeway.SuggestRemediation(f, s.selectorLabelsFor(sub, ev.Key))
+		f.Remediation = s.remediationFor(f, sub, ev.Key)
 	}
 	return f
 }

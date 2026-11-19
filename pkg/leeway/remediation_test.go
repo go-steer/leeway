@@ -331,3 +331,59 @@ func TestSuggestRemediation_DaemonSetNeverSuggestsTopologySpreadConstraint(t *te
 		t.Fatalf("DaemonSet remediation = %+v, must never suggest manifest_patch topologySpreadConstraints", got)
 	}
 }
+
+func TestPlatformManagedRemediation_ReplacesAManifestPatch(t *testing.T) {
+	t.Parallel()
+
+	sub := SubjectRef{Kind: SubjectDeployment, Namespace: "kube-system", Name: "kube-dns"}
+	f := Finding{
+		Kind:           KindPlacementDrift,
+		Subject:        sub,
+		TopologyKey:    "topology.kubernetes.io/zone",
+		SuspectedCause: CauseUnknown,
+		Domains: []FindingDomain{
+			{Domain: "us-central1-a", Actual: 2, Expected: 1, Delta: 1, ReadyNodes: 2},
+			{Domain: "us-central1-b", Actual: 1, Expected: 1, Delta: 0, ReadyNodes: 2},
+			{Domain: "us-central1-c", Actual: 0, Expected: 1, Delta: -1, ReadyNodes: 2},
+		},
+	}
+	patch := SuggestRemediation(f, map[string]string{"k8s-app": "kube-dns"})
+	if patch == nil || patch.Kind != RemediationManifestPatch || patch.YAML == "" {
+		t.Fatalf("precondition: SuggestRemediation = %+v, want a manifest_patch with yaml", patch)
+	}
+
+	got := PlatformManagedRemediation(f, patch)
+	want := FindingRemediation{
+		Kind:    RemediationPlatformManaged,
+		Summary: "Deployment/kube-system/kube-dns is reconciled by the cluster platform (addonmanager.kubernetes.io/mode: Reconcile), which can revert edits to it, so no workload patch is offered. To change how its replicas spread across topology.kubernetes.io/zone, change what the platform places them on (the node pools and the domains they span), or the addon's own configuration where the platform exposes one.",
+	}
+	if got == nil || *got != want {
+		t.Errorf("PlatformManagedRemediation = %+v, want %+v", got, want)
+	}
+}
+
+func TestPlatformManagedRemediation_LeavesEveryOtherKindAlone(t *testing.T) {
+	t.Parallel()
+
+	f := Finding{
+		Kind:        KindPlacementDrift,
+		Subject:     SubjectRef{Kind: SubjectDeployment, Namespace: "kube-system", Name: "kube-dns"},
+		TopologyKey: "topology.kubernetes.io/zone",
+	}
+	if got := PlatformManagedRemediation(f, nil); got != nil {
+		t.Errorf("PlatformManagedRemediation(nil) = %+v, want nil", got)
+	}
+	for _, kind := range []RemediationKind{
+		RemediationRolloutRestart,
+		RemediationClusterCapacity,
+		RemediationClusterNodes,
+		RemediationStorageTopology,
+	} {
+		in := &FindingRemediation{Kind: kind, Summary: "s", Command: "c"}
+		before := *in
+		got := PlatformManagedRemediation(f, in)
+		if got != in || *got != before {
+			t.Errorf("%s: PlatformManagedRemediation = %+v, want the input %+v unchanged", kind, got, before)
+		}
+	}
+}
