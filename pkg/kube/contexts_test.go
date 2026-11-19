@@ -116,6 +116,14 @@ func TestConfigForContext(t *testing.T) {
 		if cfg.Host != want {
 			t.Errorf("context %q host = %q, want %q", name, cfg.Host, want)
 		}
+		if cfg.AcceptContentTypes != DefaultAcceptContentTypes || cfg.ContentType != DefaultContentType {
+			t.Errorf("context %q content types = (%q, %q), want (%q, %q)",
+				name, cfg.AcceptContentTypes, cfg.ContentType, DefaultAcceptContentTypes, DefaultContentType)
+		}
+		if cfg.QPS != DefaultQPS || cfg.Burst != DefaultBurst {
+			t.Errorf("context %q rate limits = (%v, %d), want (%v, %d)",
+				name, cfg.QPS, cfg.Burst, DefaultQPS, DefaultBurst)
+		}
 	}
 }
 

@@ -4,6 +4,11 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Conflicting-Affinity Context in `platform_managed` Summaries (`pkg/leeway/remediation.go`)**: `PlatformManagedRemediation` now preserves the conflicting `nodeAffinity` / `nodeSelector` diagnosis in `remediation.summary` when rewriting a conflicting-affinity `manifest_patch` to `platform_managed`, so downstream consumers that render `remediation.summary` without `intent.evidence` still see why node-pool changes alone will not spread the replicas.
+- **`ShellMode` Kubeconfig Fleet Discovery & `ConfigForContext` Defaults (`pkg/clusters/resolve.go`, `pkg/kube/contexts.go`)**: `--clusters-from=kubeconfig[:path]` and direct management-cluster merges under `--profiles-dir` now keep `Config: nil` with explicit kubeconfig context routing when `CREDENTIAL_PROXY_URL` is set (matching `--clusters=<context>`), and `kube.ConfigForContext` now applies `BuildConfig`'s rate-limit and protobuf content-type defaults directly.
+
 ## [0.1.8] - 2026-11-24
 
 ### Added
