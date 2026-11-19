@@ -355,7 +355,7 @@ func TestPlatformManagedRemediation_ReplacesAManifestPatch(t *testing.T) {
 	got := PlatformManagedRemediation(f, patch)
 	want := FindingRemediation{
 		Kind:    RemediationPlatformManaged,
-		Summary: "Deployment/kube-system/kube-dns is reconciled by the cluster platform's addon manager, which reverts edits to its manifest, so no workload patch is offered. To change how its replicas spread across topology.kubernetes.io/zone, change what the platform places them on (the node pools and the domains they span), or the addon's own configuration where the platform exposes one.",
+		Summary: "Deployment/kube-system/kube-dns is reconciled by the cluster platform (addonmanager.kubernetes.io/mode: Reconcile), which can revert edits to it, so no workload patch is offered. To change how its replicas spread across topology.kubernetes.io/zone, change what the platform places them on (the node pools and the domains they span), or the addon's own configuration where the platform exposes one.",
 	}
 	if got == nil || *got != want {
 		t.Errorf("PlatformManagedRemediation = %+v, want %+v", got, want)

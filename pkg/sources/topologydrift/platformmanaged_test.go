@@ -38,49 +38,75 @@ import (
 // The tests in this file pin the platform_managed remediation: a workload
 // whose own metadata carries addonmanager.kubernetes.io/mode: Reconcile (GKE's
 // kube-system/kube-dns, for one) keeps its finding, but gets no manifest patch
-// the addon manager would revert.
+// the platform could revert.
 
-var addonSubject = leeway.SubjectRef{Kind: leeway.SubjectDeployment, Namespace: "payments", Name: "api"}
+// addonSubject is the workload addonCluster builds, as a kind of workload.
+func addonSubject(kind leeway.SubjectKind) leeway.SubjectRef {
+	return leeway.SubjectRef{Kind: kind, Namespace: "payments", Name: "api"}
+}
+
+// addonObjects is what addonCluster builds.
+type addonObjects struct {
+	nodes []*corev1.Node
+	pods  []*corev1.Pod
+	rss   []*appsv1.ReplicaSet
+	deps  []*appsv1.Deployment
+	stss  []*appsv1.StatefulSet
+}
 
 // addonCluster is #543's 8/1/1 cluster (a Tier B zone finding whose
-// remediation is a manifest_patch) plus the Deployment object above its
-// ReplicaSet, carrying mode as its addon manager label ("" for none).
-func addonCluster(mode string) (nodes []*corev1.Node, pods []*corev1.Pod, rss []*appsv1.ReplicaSet, deps []*appsv1.Deployment) {
+// remediation is a manifest_patch) with its pods owned by a workload of kind
+// (a Deployment through its ReplicaSet, or a StatefulSet directly), and that
+// workload's object carrying mode as its addon manager label ("" for none).
+func addonCluster(kind leeway.SubjectKind, mode string) addonObjects {
 	c := eightOneOne[0]
-	nodes = hostSpreadZones(c.perZone)
+	labels := map[string]string{"app": "api"}
+	if mode != "" {
+		labels[addonManagerModeLabel] = mode
+	}
+	meta := metav1.ObjectMeta{Name: "api", Namespace: "payments", Labels: labels}
+	o := addonObjects{nodes: hostSpreadZones(c.perZone)}
+	ownerKind, ownerName := "ReplicaSet", "api-7f9"
+	switch kind {
+	case leeway.SubjectDeployment:
+		o.rss = []*appsv1.ReplicaSet{replicaSet("api-7f9", "payments", "api")}
+		o.deps = []*appsv1.Deployment{{ObjectMeta: meta}}
+	case leeway.SubjectStatefulSet:
+		ownerKind, ownerName = "StatefulSet", "api"
+		o.stss = []*appsv1.StatefulSet{{ObjectMeta: meta}}
+	default:
+		panic("addonCluster: unsupported kind " + string(kind))
+	}
 	for i, p := range replicas(c.rep, c.nodes...) {
-		p.Name = fmt.Sprintf("api-7f9-%d", i)
+		p.Name = fmt.Sprintf("%s-%d", ownerName, i)
 		p.UID = types.UID("payments/" + p.Name)
 		p.Status.Phase = corev1.PodRunning
-		ownedBy("ReplicaSet", "api-7f9")(p)
-		pods = append(pods, p)
+		ownedBy(ownerKind, ownerName)(p)
+		o.pods = append(o.pods, p)
 	}
-	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{
-		Name: "api", Namespace: "payments", Labels: map[string]string{"app": "api"},
-	}}
-	if mode != "" {
-		dep.Labels[addonManagerModeLabel] = mode
-	}
-	return nodes, pods, []*appsv1.ReplicaSet{replicaSet("api-7f9", "payments", "api")}, []*appsv1.Deployment{dep}
+	return o
 }
 
 // watchRemediation runs addonCluster through Run (the informer path) and
 // returns the remediation on the one zone finding it emits.
-func watchRemediation(t *testing.T, mode string) *leeway.FindingRemediation {
+func watchRemediation(t *testing.T, kind leeway.SubjectKind, mode string) *leeway.FindingRemediation {
 	t.Helper()
-	nodes, pods, rss, deps := addonCluster(mode)
+	o := addonCluster(kind, mode)
 	var objs []runtime.Object
-	for _, n := range nodes {
+	for _, n := range o.nodes {
 		objs = append(objs, n)
 	}
-	for _, p := range pods {
+	for _, p := range o.pods {
 		objs = append(objs, p)
 	}
-	for _, rs := range rss {
+	for _, rs := range o.rss {
 		objs = append(objs, rs)
 	}
-	for _, d := range deps {
+	for _, d := range o.deps {
 		objs = append(objs, d)
+	}
+	for _, sts := range o.stss {
+		objs = append(objs, sts)
 	}
 
 	cfg := quickAlerts()
@@ -120,8 +146,8 @@ func watchRemediation(t *testing.T, mode string) *leeway.FindingRemediation {
 		t.Fatalf("%d signal(s), want exactly one zone finding with a LeewayFinding: %v", len(sigs), sigs)
 	}
 	f := sigs[0].LeewayFinding
-	if f.Subject != addonSubject || f.TopologyKey != zoneKey {
-		t.Fatalf("finding is on %s %s, want %s %s", f.Subject, f.TopologyKey, addonSubject, zoneKey)
+	if want := addonSubject(kind); f.Subject != want || f.TopologyKey != zoneKey {
+		t.Fatalf("finding is on %s %s, want %s %s", f.Subject, f.TopologyKey, want, zoneKey)
 	}
 	if f.Remediation == nil {
 		t.Fatal("the finding has no remediation")
@@ -131,43 +157,45 @@ func watchRemediation(t *testing.T, mode string) *leeway.FindingRemediation {
 
 // snapshotRemediation runs addonCluster through EvaluateSnapshot (the
 // `leeway report` path) and returns the zone finding's remediation.
-func snapshotRemediation(t *testing.T, mode string) *leeway.FindingRemediation {
+func snapshotRemediation(t *testing.T, kind leeway.SubjectKind, mode string) *leeway.FindingRemediation {
 	t.Helper()
-	nodes, pods, rss, deps := addonCluster(mode)
+	o := addonCluster(kind, mode)
 	snap, err := EvaluateSnapshot(context.Background(), Config{TopologyKeys: DefaultTopologyKeys}, SnapshotInput{
-		Nodes:       nodes,
-		Pods:        pods,
-		ReplicaSets: rss,
-		Deployments: deps,
+		Nodes:        o.nodes,
+		Pods:         o.pods,
+		ReplicaSets:  o.rss,
+		Deployments:  o.deps,
+		StatefulSets: o.stss,
 	})
 	if err != nil {
 		t.Fatalf("EvaluateSnapshot: %v", err)
 	}
+	want := addonSubject(kind)
 	for _, f := range snap.Findings {
-		if f.Subject == addonSubject && f.TopologyKey == zoneKey {
+		if f.Subject == want && f.TopologyKey == zoneKey {
 			if f.Remediation == nil {
 				t.Fatal("the zone finding has no remediation")
 			}
 			return f.Remediation
 		}
 	}
-	t.Fatalf("no zone finding for %s in %+v", addonSubject, snap.Findings)
+	t.Fatalf("no zone finding for %s in %+v", want, snap.Findings)
 	return nil
 }
 
-func assertPlatformManaged(t *testing.T, rem *leeway.FindingRemediation) {
+func assertPlatformManaged(t *testing.T, kind leeway.SubjectKind, rem *leeway.FindingRemediation) {
 	t.Helper()
 	if rem.Kind != leeway.RemediationPlatformManaged {
 		t.Errorf("Kind = %q, want %q", rem.Kind, leeway.RemediationPlatformManaged)
 	}
 	if rem.YAML != "" {
-		t.Errorf("YAML = %q, want empty: the addon manager reverts any patch", rem.YAML)
+		t.Errorf("YAML = %q, want empty: the platform can revert any patch", rem.YAML)
 	}
 	if rem.Command != "" {
 		t.Errorf("Command = %q, want empty", rem.Command)
 	}
-	if !strings.Contains(rem.Summary, addonSubject.String()) || !strings.Contains(rem.Summary, "reverts edits") {
-		t.Errorf("Summary = %q, want it to name %s and say edits are reverted", rem.Summary, addonSubject)
+	if sub := addonSubject(kind); !strings.Contains(rem.Summary, sub.String()) || !strings.Contains(rem.Summary, "can revert edits") {
+		t.Errorf("Summary = %q, want it to name %s and say edits can be reverted", rem.Summary, sub)
 	}
 }
 
@@ -181,32 +209,52 @@ func assertManifestPatch(t *testing.T, rem *leeway.FindingRemediation) {
 	}
 }
 
+// addonKinds are the workload kinds whose objects both paths hold, so both
+// paths can read their labels.
+var addonKinds = []leeway.SubjectKind{leeway.SubjectDeployment, leeway.SubjectStatefulSet}
+
 func TestPlatformManaged_WatchPathReplacesTheManifestPatch(t *testing.T) {
-	assertPlatformManaged(t, watchRemediation(t, addonManagerReconcile))
+	for _, kind := range addonKinds {
+		t.Run(string(kind), func(t *testing.T) {
+			assertPlatformManaged(t, kind, watchRemediation(t, kind, addonManagerReconcile))
+		})
+	}
 }
 
 func TestPlatformManaged_WatchPathKeepsTheManifestPatchWithoutTheLabel(t *testing.T) {
-	assertManifestPatch(t, watchRemediation(t, ""))
+	for _, kind := range addonKinds {
+		t.Run(string(kind), func(t *testing.T) {
+			assertManifestPatch(t, watchRemediation(t, kind, ""))
+		})
+	}
 }
 
 func TestPlatformManaged_SnapshotPathReplacesTheManifestPatch(t *testing.T) {
-	assertPlatformManaged(t, snapshotRemediation(t, addonManagerReconcile))
+	for _, kind := range addonKinds {
+		t.Run(string(kind), func(t *testing.T) {
+			assertPlatformManaged(t, kind, snapshotRemediation(t, kind, addonManagerReconcile))
+		})
+	}
 }
 
 func TestPlatformManaged_SnapshotPathKeepsTheManifestPatchWithoutTheLabel(t *testing.T) {
-	assertManifestPatch(t, snapshotRemediation(t, ""))
+	for _, kind := range addonKinds {
+		t.Run(string(kind), func(t *testing.T) {
+			assertManifestPatch(t, snapshotRemediation(t, kind, ""))
+		})
+	}
 }
 
 // EnsureExists only creates a missing object, so an edit survives and the
 // patch is still worth offering.
 func TestPlatformManaged_EnsureExistsKeepsTheManifestPatch(t *testing.T) {
-	assertManifestPatch(t, snapshotRemediation(t, "EnsureExists"))
+	assertManifestPatch(t, snapshotRemediation(t, leeway.SubjectDeployment, "EnsureExists"))
 }
 
 // TestPlatformManaged_ClusterAndStorageRemediationsAreUnchanged runs
 // remediationFor — the call both paths make — on a reconciled StatefulSet for
 // each cause whose remediation acts on nodes, node pools or volumes. Those
-// are not the addon manager's to revert, so the remediation must be the one
+// are not the workload's reconciler's to revert, so the remediation must be the one
 // an unlabelled workload gets.
 func TestPlatformManaged_ClusterAndStorageRemediationsAreUnchanged(t *testing.T) {
 	sub := leeway.SubjectRef{Kind: leeway.SubjectStatefulSet, Namespace: "kube-system", Name: "addon-store"}

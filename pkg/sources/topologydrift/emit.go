@@ -110,8 +110,9 @@ func (s *Source) findingFor(sub leeway.SubjectRef, ev *Evaluation, st leeway.Ale
 	return f, ev.Verdict.Route(s.cfg.TierCSignals)
 }
 
-// remediationFor is §8.5's remediation for a breached finding on sub, with a
-// manifest patch the platform would revert replaced by platform_managed.
+// remediationFor is leeway.SuggestRemediation for a breached finding on sub,
+// with a manifest patch the platform could revert replaced by
+// platform_managed.
 func (s *Source) remediationFor(f leeway.Finding, sub leeway.SubjectRef, key leeway.TopologyKey) *leeway.FindingRemediation {
 	rem := leeway.SuggestRemediation(f, s.selectorLabelsFor(sub, key))
 	if rem != nil && rem.Kind == leeway.RemediationManifestPatch && s.platformReconciled(sub) {
@@ -121,9 +122,8 @@ func (s *Source) remediationFor(f leeway.Finding, sub leeway.SubjectRef, key lee
 }
 
 // addonManagerModeLabel and addonManagerReconcile mark a workload the
-// cluster's addon manager reconciles: it restores the object's manifest on
-// every pass, so an edit to it does not survive. GKE's kube-system/kube-dns
-// Deployment carries it. EnsureExists, the label's other value, only
+// cluster's addon manager reconciles on every pass, so an edit to it can be
+// reverted. GKE's kube-system/kube-dns Deployment carries it. EnsureExists, the label's other value, only
 // creates the object when it is missing and leaves edits alone, so it is not
 // matched.
 const (

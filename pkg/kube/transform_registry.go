@@ -256,7 +256,7 @@ func init() {
 			Kind:   kind,
 			Path:   "metadata.labels",
 			Action: fieldPreserved,
-			Why:    "The addon manager's addonmanager.kubernetes.io/mode: Reconcile label on the workload object turns a manifest_patch remediation into platform_managed; stripping it would offer patches the platform reverts.",
+			Why:    "The addon manager's addonmanager.kubernetes.io/mode: Reconcile label on the workload object turns a manifest_patch remediation into platform_managed; stripping it would offer patches the platform can revert.",
 			Readers: []string{
 				"pkg/sources/topologydrift/emit.go:156,165 — platformReconciled reads the Deployment and StatefulSet labels",
 			},
