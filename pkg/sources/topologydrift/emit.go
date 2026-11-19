@@ -105,9 +105,68 @@ func (s *Source) findingFor(sub leeway.SubjectRef, ev *Evaluation, st leeway.Ale
 		State:       st,
 	})
 	if ev.Verdict.Breached {
-		f.Remediation = leeway.SuggestRemediation(f, s.selectorLabelsFor(sub, ev.Key))
+		f.Remediation = s.remediationFor(f, sub, ev.Key)
 	}
 	return f, ev.Verdict.Route(s.cfg.TierCSignals)
+}
+
+// remediationFor is §8.5's remediation for a breached finding on sub, with a
+// manifest patch the platform would revert replaced by platform_managed.
+func (s *Source) remediationFor(f leeway.Finding, sub leeway.SubjectRef, key leeway.TopologyKey) *leeway.FindingRemediation {
+	rem := leeway.SuggestRemediation(f, s.selectorLabelsFor(sub, key))
+	if rem != nil && rem.Kind == leeway.RemediationManifestPatch && s.platformReconciled(sub) {
+		rem = leeway.PlatformManagedRemediation(f, rem)
+	}
+	return rem
+}
+
+// addonManagerModeLabel and addonManagerReconcile mark a workload the
+// cluster's addon manager reconciles: it restores the object's manifest on
+// every pass, so an edit to it does not survive. GKE's kube-system/kube-dns
+// Deployment carries it. EnsureExists, the label's other value, only
+// creates the object when it is missing and leaves edits alone, so it is not
+// matched.
+const (
+	addonManagerModeLabel = "addonmanager.kubernetes.io/mode"
+	addonManagerReconcile = "Reconcile"
+)
+
+// platformReconciled reports whether sub's workload object carries the
+// addon manager's Reconcile label in its own metadata.
+//
+// The workload's labels, not the pod's: the addon manager labels the object
+// it applies, and a pod template is free to carry other labels. Deployments
+// and StatefulSets are the kinds this source holds the objects of; any other
+// kind, or a workload not in the cache, reads as not reconciled, which keeps
+// the remediation it had.
+func (s *Source) platformReconciled(sub leeway.SubjectRef) bool {
+	s.mu.Lock()
+	deps, stss := s.deployments, s.statefulSets
+	s.mu.Unlock()
+	var labels map[string]string
+	switch sub.Kind {
+	case leeway.SubjectDeployment:
+		if deps == nil {
+			return false
+		}
+		d, err := deps.Deployments(sub.Namespace).Get(sub.Name)
+		if err != nil {
+			return false
+		}
+		labels = d.Labels
+	case leeway.SubjectStatefulSet:
+		if stss == nil {
+			return false
+		}
+		sts, err := stss.StatefulSets(sub.Namespace).Get(sub.Name)
+		if err != nil {
+			return false
+		}
+		labels = sts.Labels
+	default:
+		return false
+	}
+	return labels[addonManagerModeLabel] == addonManagerReconcile
 }
 
 // ephemeralPodLabels are controller-injected per-revision or per-pod labels

@@ -241,7 +241,72 @@ func TestCollect_CauseAttribution(t *testing.T) {
 	}
 }
 
-func buildAttributionCluster() kubernetes.Interface {
+// TestCollect_PlatformManagedRemediation runs the cause-attribution cluster
+// with each workload object labelled addonmanager.kubernetes.io/mode:
+// Reconcile, through the client-go report path. Only the workload whose
+// remediation was a manifest patch changes: to platform_managed, with no yaml.
+// The storage and capacity remediations act on volumes and node pools, which
+// the addon manager does not revert, and stay as TestCollect_CauseAttribution
+// pins them without the label.
+func TestCollect_PlatformManagedRemediation(t *testing.T) {
+	reconciled := map[string]string{"addonmanager.kubernetes.io/mode": "Reconcile"}
+	meta := func(name string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, Namespace: "topology", Labels: reconciled}
+	}
+	client := buildAttributionCluster(
+		&appsv1.Deployment{ObjectMeta: meta("affinity-pinned-api")},
+		&appsv1.Deployment{ObjectMeta: meta("cpu-starved-worker")},
+		&appsv1.Deployment{ObjectMeta: meta("pool-pinned-filler")},
+		&appsv1.StatefulSet{ObjectMeta: meta("zonal-pv-store")},
+	)
+
+	rep, err := Collect(context.Background(), []clusters.Cluster{
+		{Identity: clusters.Identity{Cluster: "gke-two-zone"}, Profile: "flag"},
+	}, Options{
+		Now:     time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC),
+		Timeout: 10 * time.Second,
+		ClientBuilder: func(c clusters.Cluster) (kubernetes.Interface, dynamic.Interface, error) {
+			return client, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(rep.Clusters) != 1 || rep.Clusters[0].Status != StatusOK {
+		t.Fatalf("Clusters = %+v, want 1 OK cluster", rep.Clusters)
+	}
+	byWorkload := make(map[string]leeway.Finding)
+	for _, f := range rep.Clusters[0].TopologyFindings {
+		if f.TopologyKey == corev1.LabelTopologyZone {
+			byWorkload[f.Subject.Name] = f
+		}
+	}
+
+	for name, want := range map[string]leeway.RemediationKind{
+		"affinity-pinned-api": leeway.RemediationPlatformManaged,
+		"zonal-pv-store":      leeway.RemediationStorageTopology,
+		"cpu-starved-worker":  leeway.RemediationClusterCapacity,
+	} {
+		f, ok := byWorkload[name]
+		if !ok {
+			t.Errorf("no zone finding for %s; the label must not drop the finding", name)
+			continue
+		}
+		if f.Remediation == nil || f.Remediation.Kind != want {
+			t.Errorf("%s Remediation = %+v, want %q", name, f.Remediation, want)
+		}
+	}
+	if rem := byWorkload["affinity-pinned-api"].Remediation; rem != nil && (rem.YAML != "" || rem.Command != "") {
+		t.Errorf("affinity-pinned-api platform_managed carries yaml %q / command %q, want neither", rem.YAML, rem.Command)
+	}
+	if _, bad := byWorkload["pool-pinned-filler"]; bad {
+		t.Error("pool-pinned-filler is flagged; the label must not create a finding")
+	}
+}
+
+// buildAttributionCluster builds TestCollect_CauseAttribution's cluster, plus
+// any extra objects (the workload objects, which it otherwise omits).
+func buildAttributionCluster(extra ...runtime.Object) kubernetes.Interface {
 	nodeA := makeReadyNode("gke-two-zone-default-pool-1", "us-central1-a", "us-central1", "", "", "e2-small")
 	nodeA.Labels["cloud.google.com/gke-nodepool"] = "default-pool"
 	nodeA.Labels["topology.gke.io/zone"] = "us-central1-a"
@@ -496,6 +561,7 @@ func buildAttributionCluster() kubernetes.Interface {
 		})
 	}
 
+	objs = append(objs, extra...)
 	return kubefake.NewSimpleClientset(objs...)
 }
 

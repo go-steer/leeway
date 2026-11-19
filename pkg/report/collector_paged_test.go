@@ -22,6 +22,7 @@ import (
 	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -90,6 +91,32 @@ esac
 	}
 	if strings.Join(names, ",") != "p0,p1,p2" {
 		t.Errorf("pods = %v, want p0,p1,p2", names)
+	}
+}
+
+// TestKubectlListPaged_KeepsWorkloadLabels: the ShellMode path trims each
+// Deployment page, and the addon manager label that turns a manifest_patch
+// into platform_managed has to survive the trim.
+func TestKubectlListPaged_KeepsWorkloadLabels(t *testing.T) {
+	installFakeKubectl(t, `case "$args" in
+  *"/apis/apps/v1/namespaces/kube-system/deployments?limit=250")
+    echo '{"metadata":{},"items":[{"metadata":{"name":"kube-dns","namespace":"kube-system","labels":{"addonmanager.kubernetes.io/mode":"Reconcile"},"managedFields":[{"manager":"m"}]}}]}' ;;
+  *)
+    echo "unexpected: $args" >&2; exit 1 ;;
+esac
+`)
+	got, err := kubectlListPaged(context.Background(), nil, rawDeployments, "kube-system", "", trimmed[appsv1.Deployment])
+	if err != nil {
+		t.Fatalf("kubectlListPaged: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("deployments = %d, want 1", len(got))
+	}
+	if got[0].ManagedFields != nil {
+		t.Error("managedFields survived; the page was not trimmed, so the label check below proves nothing")
+	}
+	if mode := got[0].Labels["addonmanager.kubernetes.io/mode"]; mode != "Reconcile" {
+		t.Errorf("addonmanager.kubernetes.io/mode = %q after the trim, want Reconcile", mode)
 	}
 }
 

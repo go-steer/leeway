@@ -139,6 +139,22 @@ func TestSharedTransform_PreservesLoadBearingFields(t *testing.T) {
 	if len(n.Spec.Taints) == 0 {
 		t.Error("spec.taints was stripped; eligible-domain computation reads it")
 	}
+
+	const addonMode = "addonmanager.kubernetes.io/mode"
+	dep := fullDeployment(t)
+	dep.Labels = map[string]string{addonMode: "Reconcile"}
+	if out, err := trimDeployment(dep); err != nil {
+		t.Fatalf("trimDeployment: %v", err)
+	} else if out.(*appsv1.Deployment).Labels[addonMode] != "Reconcile" {
+		t.Error("Deployment metadata.labels was stripped; topologydrift's platformReconciled reads the addon manager label from it")
+	}
+	sts := fullStatefulSet(t)
+	sts.Labels = map[string]string{addonMode: "Reconcile"}
+	if out, err := trimStatefulSet(sts); err != nil {
+		t.Fatalf("trimStatefulSet: %v", err)
+	} else if out.(*appsv1.StatefulSet).Labels[addonMode] != "Reconcile" {
+		t.Error("StatefulSet metadata.labels was stripped; topologydrift's platformReconciled reads the addon manager label from it")
+	}
 }
 
 // TestSharedTransform_StripsSecretEnvValues states the security and memory
