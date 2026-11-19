@@ -99,15 +99,15 @@ leeway report --context=my-cluster --topology-tier-c-signals --all --pretty=fals
 - `clusters[]`: One entry per target, in the order resolved:
   - `cluster`, `source` (`direct`, `kubeconfig:<context>`, `gke:<project>/<location>/<cluster>`, `endpoint:<name>`, or the profile directory name), `status` (`ok` or `error`), and `error` when the cluster could not be evaluated.
   - `domains`: Map of topology key → domain → `{nodes, ready, usable, allocatable_cpu_milli, allocatable_mem_bytes}`. Check this first: `usable: 0` means nothing can be scheduled into that domain.
-  - `topology_findings[]`: [`leeway.Finding`](/reference/finding-kinds/#topology-findings) objects (`leeway.contract_violated`, `leeway.placement_drift`, `leeway.baseline_breach`, `leeway.domain_unavailable`). Each carries:
+  - `topology_findings[]`: [`leeway.Finding`](/reference/finding-kinds/#leewayfinding-json-schema) objects (`leeway.contract_violated`, `leeway.placement_drift`, `leeway.baseline_breach`, `leeway.domain_unavailable`). Each carries:
     - `tier` (`A`, `B`, `C`) and `severity` (`critical`, `warning`, `info`)
     - `score` (`drift`, `observedSkew`, `minAchievableSkew`, `excessSkew`, `relocationDistance`, `maxDomainShare`)
     - `intent` (`source`, `confidence`, `weighting`, `maxSkew`, `evidence[]`), omitted when the subject declared nothing
     - `domains[]` (`domain`, `actual`, `expected`, `delta`, `readyNodes`, `note`)
     - `suspectedCause` (`unknown`, `domain_outage`, `domain_capacity_shortfall`, `taint_exclusion`, `consolidation`, `volume_pinning`, `rollout_bias`, `constraint_ignored`, `selector_confined`), `contributingFactors[]`, and `untestedCauses[]` for causes `leeway report` had no evidence source for
-    - `remediation` (`kind` of `manifest_patch`, `rollout_restart`, `cluster_capacity`, `cluster_nodes`, `storage_topology`, `platform_managed`; `summary`; optional `command` and `yaml`). Read `summary` before applying `yaml`: a `manifest_patch` can be the second half of a two-step fix. `platform_managed` means the platform reconciles the workload and can revert a patch, so there is nothing to apply; [when it replaces `manifest_patch`](/reference/finding-kinds/#topology-findings).
+    - `remediation` (`kind` of `manifest_patch`, `rollout_restart`, `cluster_capacity`, `cluster_nodes`, `storage_topology`, `platform_managed`; `summary`; optional `command` and `yaml`). Read `summary` before applying `yaml`: a `manifest_patch` can be the second half of a two-step fix. `platform_managed` means the platform reconciles the workload and can revert a patch, so there is nothing to apply; [when it replaces `manifest_patch`](/reference/finding-kinds/#leewayfinding-json-schema).
   - `compute_classes[]`: One row per ComputeClass (`name`, `scorable`, `ordering`, `podsByRank`, `pendingPods`, `pendingProvisioning`, `pendingDeclined`).
-  - `rank_findings[]`: [`leeway.RankFinding`](/reference/finding-kinds/#computeclass-rank-findings) objects (`leeway.rank_wedged`, `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`).
+  - `rank_findings[]`: [`leeway.RankFinding`](/reference/finding-kinds/#leewayrankfinding-json-schema) objects (`leeway.rank_wedged`, `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`).
   - `subjects[]`: Only with `--all` or `--min-drift`. Every evaluated `(subject, topologyKey)` as a `leeway.Finding`, including non-breaching ones, which have empty `tier` and `severity` and no `remediation`.
 
 ## 2. Consuming daemon webhook incidents (`leeway watch`)

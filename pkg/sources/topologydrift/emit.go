@@ -123,9 +123,9 @@ func (s *Source) remediationFor(f leeway.Finding, sub leeway.SubjectRef, key lee
 
 // addonManagerModeLabel and addonManagerReconcile mark a workload the
 // cluster's addon manager reconciles on every pass, so an edit to it can be
-// reverted. GKE's kube-system/kube-dns Deployment carries it. EnsureExists, the label's other value, only
-// creates the object when it is missing and leaves edits alone, so it is not
-// matched.
+// reverted. GKE's kube-system/kube-dns Deployment carries it. EnsureExists,
+// the label's other value, only creates the object when it is missing and
+// leaves edits alone, so it is not matched.
 const (
 	addonManagerModeLabel = "addonmanager.kubernetes.io/mode"
 	addonManagerReconcile = "Reconcile"

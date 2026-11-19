@@ -55,9 +55,9 @@ const (
 
 	// RemediationPlatformManaged replaces a manifest_patch on a workload the
 	// cluster platform reconciles (its addon manager can revert a patch to
-	// it). It carries no yaml and no command: the
-	// change has to be made to what the platform places the workload on, or
-	// to the platform's own configuration for it.
+	// it). It carries no yaml and no command: the change has to be made to
+	// what the platform places the workload on, or to the platform's own
+	// configuration for it.
 	RemediationPlatformManaged RemediationKind = "platform_managed"
 )
 
@@ -262,8 +262,8 @@ func SuggestRemediation(f Finding, selectorLabels map[string]string) *FindingRem
 // cluster_capacity, cluster_nodes and storage_topology act on nodes, node
 // pools and volumes, which the workload's reconciler does not own.
 // rollout_restart needs no edit to survive: the restart reschedules the
-// replicas once, as it would for any other workload, whether or not the
-// platform later reverts the annotation it writes.
+// replicas as it would for any other workload, whether or not the platform
+// later reverts the annotation it writes.
 //
 // The caller decides whether the workload is reconciled; pkg/leeway never
 // sees the workload object.
