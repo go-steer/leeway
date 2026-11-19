@@ -501,11 +501,11 @@ func runMultiClusterWatch(ctx context.Context, o options, sink inject.Sink, stde
 		cfg.QPS = float32(o.kubeQPS)
 		cfg.Burst = o.kubeBurst
 
-		client, err := kubernetes.NewForConfig(cfg)
+		client, err := kube.BuildClientFromConfig(cfg)
 		if err != nil {
 			return fmt.Errorf("cluster %s client: %w", c.Name(), err)
 		}
-		dyn, err := dynamic.NewForConfig(cfg)
+		dyn, err := kube.BuildDynamicClientFromConfig(cfg)
 		if err != nil {
 			return fmt.Errorf("cluster %s dynamic client: %w", c.Name(), err)
 		}

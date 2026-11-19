@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"golang.org/x/oauth2"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -37,6 +38,21 @@ const (
 	// DefaultBurst is the default client-side token-bucket burst applied when
 	// Options.Burst is unset (0).
 	DefaultBurst int = 100
+	// DefaultAcceptContentTypes asks the API server for Kubernetes protobuf
+	// and accepts JSON from anything that cannot produce it
+	// (docs/leeway-design.md §6.1). client-go picks the decoder from the
+	// response's Content-Type, so a JSON-only endpoint still works.
+	//
+	// client-go's generated calls (List, Get, Watch, Create) already ask for
+	// protobuf when a config sets neither content type. Setting it on the
+	// config covers every request a typed client makes, raw RESTClient
+	// requests included, and stops it depending on that default.
+	DefaultAcceptContentTypes = runtime.ContentTypeProtobuf + "," + runtime.ContentTypeJSON
+	// DefaultContentType encodes typed request bodies (SelfSubjectAccessReview)
+	// as protobuf. dynamic.ConfigFor resets both fields to JSON (JSON and CBOR
+	// under client-go's CBOR feature gates), never protobuf, so the dynamic
+	// client, and with it every CRD read, never asks for protobuf.
+	DefaultContentType = runtime.ContentTypeProtobuf
 )
 
 // Options selects how the Kubernetes client config is resolved.
@@ -101,8 +117,11 @@ func BuildDynamicClient(opts Options) (dynamic.Interface, error) {
 // mints one config per cluster (GKE: ADC over the DNS endpoint), and
 // those configs run through the same client construction as the
 // kubeconfig/in-cluster path — pkg/kube stays cloud-free.
+//
+// A config that leaves AcceptContentTypes or ContentType empty gets the
+// protobuf defaults on a copy; the caller's config is not modified.
 func BuildClientFromConfig(cfg *rest.Config) (kubernetes.Interface, error) {
-	client, err := kubernetes.NewForConfig(cfg)
+	client, err := kubernetes.NewForConfig(withContentDefaults(cfg))
 	if err != nil {
 		return nil, fmt.Errorf("kubernetes client: %w", err)
 	}
@@ -131,6 +150,9 @@ func BuildDynamicClientFromConfig(cfg *rest.Config) (dynamic.Interface, error) {
 // credentials come from the pod's service account and there is no
 // context to choose, so honoring the flag silently would report a
 // cluster the invocation did not read.
+//
+// The returned config negotiates protobuf (DefaultAcceptContentTypes,
+// DefaultContentType).
 func BuildConfig(opts Options) (*rest.Config, error) {
 	var (
 		cfg *rest.Config
@@ -169,10 +191,33 @@ func BuildConfig(opts Options) (*rest.Config, error) {
 	}
 	cfg.QPS = qps
 	cfg.Burst = burst
+	setContentDefaults(cfg)
 	if opts.CallerToken != nil {
 		return callerConfig(cfg, opts.CallerToken)
 	}
 	return cfg, nil
+}
+
+// withContentDefaults returns cfg, or a copy of it carrying the protobuf
+// content-type defaults when either field is unset.
+func withContentDefaults(cfg *rest.Config) *rest.Config {
+	if cfg == nil || (cfg.AcceptContentTypes != "" && cfg.ContentType != "") {
+		return cfg
+	}
+	out := rest.CopyConfig(cfg)
+	setContentDefaults(out)
+	return out
+}
+
+// setContentDefaults fills an empty AcceptContentTypes or ContentType with
+// the protobuf defaults and leaves a value the config already carries alone.
+func setContentDefaults(cfg *rest.Config) {
+	if cfg.AcceptContentTypes == "" {
+		cfg.AcceptContentTypes = DefaultAcceptContentTypes
+	}
+	if cfg.ContentType == "" {
+		cfg.ContentType = DefaultContentType
+	}
 }
 
 // callerConfig returns cfg with every credential replaced by the caller's

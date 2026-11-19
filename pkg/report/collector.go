@@ -399,11 +399,11 @@ func buildClients(target clusters.Cluster, opts Options) (kubernetes.Interface, 
 	if target.Config == nil {
 		return nil, nil, fmt.Errorf("cluster %q has no rest.Config", target.Name())
 	}
-	client, err := kubernetes.NewForConfig(target.Config)
+	client, err := kube.BuildClientFromConfig(target.Config)
 	if err != nil {
 		return nil, nil, err
 	}
-	dyn, err := dynamic.NewForConfig(target.Config)
+	dyn, err := kube.BuildDynamicClientFromConfig(target.Config)
 	if err != nil {
 		return nil, nil, err
 	}
