@@ -181,22 +181,13 @@ func resolveFromProfilesDir(ctx context.Context, dir string, filterSpecs []strin
 		for _, c := range discovered {
 			byName[c.Identity.Cluster] = append(byName[c.Identity.Cluster], c)
 		}
-		directName := defaultClusterName(opts.ClusterName, opts.Context)
-		candidates := byName[directName]
+		single, err := resolveSingleCluster(opts, disc.Broker)
+		if err != nil {
+			return nil, err
+		}
+		direct := single[0]
+		candidates := byName[direct.Identity.Cluster]
 		if len(candidates) <= 1 {
-			cfg, err := buildDirectConfig(opts)
-			if err != nil {
-				return nil, err
-			}
-			direct := Cluster{
-				Identity: Identity{
-					Cluster:  directName,
-					Project:  opts.Project,
-					Location: opts.Location,
-				},
-				Profile: DirectProfile,
-				Config:  cfg,
-			}
 			if len(candidates) == 1 {
 				covered := candidates[0]
 				discovered = removeProfileCluster(discovered, covered.Profile)
@@ -229,7 +220,21 @@ func resolveFromSource(ctx context.Context, from string, filterSpecs []string, o
 		var out []Cluster
 		for _, c := range ctxs {
 			id := Identity{Cluster: c.Name, Project: opts.Project, Location: opts.Location}
+			if disc.Broker != nil && disc.Broker.ShellMode {
+				if gkeID, ok := parseGKEContext(c.Name); ok {
+					id = gkeID
+				}
+			}
 			if len(filterSpecs) > 0 && !matchesFilter(id, c.Name, filterSpecs) {
+				continue
+			}
+			if disc.Broker != nil && disc.Broker.ShellMode {
+				out = append(out, Cluster{
+					Identity:   id,
+					Profile:    "kubeconfig:" + c.Name,
+					Kubeconfig: kcPath,
+					Context:    c.Name,
+				})
 				continue
 			}
 			cfg, err := kube.ConfigForContext(kcPath, c.Name)
