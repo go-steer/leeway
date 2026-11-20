@@ -271,12 +271,19 @@ func PlatformManagedRemediation(f Finding, r *FindingRemediation) *FindingRemedi
 	if r == nil || r.Kind != RemediationManifestPatch {
 		return r
 	}
-	return &FindingRemediation{
-		Kind: RemediationPlatformManaged,
-		Summary: fmt.Sprintf(
-			"%s is reconciled by the cluster platform (addonmanager.kubernetes.io/mode: Reconcile), which can revert edits to it, so no workload patch is offered. To change how its replicas spread across %s, change what the platform places them on (the node pools and the domains they span), or the addon's own configuration where the platform exposes one.",
+	summary := fmt.Sprintf(
+		"%s is reconciled by the cluster platform (addonmanager.kubernetes.io/mode: Reconcile), which can revert edits to it, so no workload patch is offered. To change how its replicas spread across %s, change what the platform places them on (the node pools and the domains they span), or the addon's own configuration where the platform exposes one.",
+		f.Subject, f.TopologyKey,
+	)
+	if f.Intent != nil && evidenceHasConflictingNodeAffinity(f.Intent.Evidence) {
+		summary = fmt.Sprintf(
+			"%s is reconciled by the cluster platform (addonmanager.kubernetes.io/mode: Reconcile), which can revert edits to it, so no workload patch is offered. Its own nodeAffinity/nodeSelector on %s conflicts with its topologySpreadConstraint, so node-pool changes alone will not spread its replicas; change the addon's placement configuration where the platform exposes one.",
 			f.Subject, f.TopologyKey,
-		),
+		)
+	}
+	return &FindingRemediation{
+		Kind:    RemediationPlatformManaged,
+		Summary: summary,
 	}
 }
 

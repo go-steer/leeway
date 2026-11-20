@@ -101,17 +101,41 @@ func TestResolve_ShellModeTargetsCarryNoRestConfig(t *testing.T) {
 	t.Setenv(BrokerURLEnv, "")
 	t.Setenv(BrokerTokenFileEnv, "")
 	kc := writeTestKubeconfig(t, t.TempDir())
+	pdir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(pdir, "cluster-mgmt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(pdir, "cluster-mgmt", "config.yaml"),
+		[]byte("cluster_identity:\n  project: my-proj\n  location: us-central1\n  cluster: mgmt\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	cases := []struct {
-		name        string
-		opts        Options
-		wantContext string
+		name         string
+		opts         Options
+		wantContexts []string
 	}{
-		{"GKE triple", Options{Clusters: "my-proj/us-central1/prod-a"}, "gke_my-proj_us-central1_prod-a"},
-		{"gke_ context name", Options{Kubeconfig: kc, Clusters: "gke_my-proj_us-central1_prod-a"}, "gke_my-proj_us-central1_prod-a"},
-		{"kubeconfig context name", Options{Kubeconfig: kc, Clusters: "ctx-west"}, "ctx-west"},
-		{"single cluster with --context", Options{Kubeconfig: kc, Context: "gke_my-proj_us-central1_prod-a"}, "gke_my-proj_us-central1_prod-a"},
-		{"single cluster, no cluster argument", Options{}, ""},
+		{"GKE triple", Options{Clusters: "my-proj/us-central1/prod-a"}, []string{"gke_my-proj_us-central1_prod-a"}},
+		{"gke_ context name", Options{Kubeconfig: kc, Clusters: "gke_my-proj_us-central1_prod-a"}, []string{"gke_my-proj_us-central1_prod-a"}},
+		{"kubeconfig context name", Options{Kubeconfig: kc, Clusters: "ctx-west"}, []string{"ctx-west"}},
+		{"kubeconfig fleet discovery", Options{ClustersFrom: "kubeconfig:" + kc}, []string{"ctx-east", "ctx-west"}},
+		{
+			"profiles-dir with --context deduplication",
+			Options{
+				ProfilesDir: pdir,
+				Kubeconfig:  kc,
+				Context:     "gke_my-proj_us-central1_mgmt",
+				Describe: func(_ context.Context, id Identity) (*container.Cluster, error) {
+					return &container.Cluster{Name: id.Cluster, Location: id.Location, Autopilot: &container.Autopilot{Enabled: true}}, nil
+				},
+			},
+			[]string{"gke_my-proj_us-central1_mgmt"},
+		},
+		{"single cluster with --context", Options{Kubeconfig: kc, Context: "gke_my-proj_us-central1_prod-a"}, []string{"gke_my-proj_us-central1_prod-a"}},
+		{"single cluster, no cluster argument", Options{}, []string{""}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -119,14 +143,16 @@ func TestResolve_ShellModeTargetsCarryNoRestConfig(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Resolve: %v", err)
 			}
-			if len(got) != 1 {
-				t.Fatalf("got %d clusters, want 1: %+v", len(got), got)
+			if len(got) != len(tc.wantContexts) {
+				t.Fatalf("got %d clusters, want %d: %+v", len(got), len(tc.wantContexts), got)
 			}
-			if got[0].Config != nil {
-				t.Errorf("Config = %+v, want nil", got[0].Config)
-			}
-			if got[0].Context != tc.wantContext {
-				t.Errorf("Context = %q, want %q", got[0].Context, tc.wantContext)
+			for i, wantCtx := range tc.wantContexts {
+				if got[i].Config != nil {
+					t.Errorf("cluster[%d] Config = %+v, want nil", i, got[i].Config)
+				}
+				if got[i].Context != wantCtx {
+					t.Errorf("cluster[%d] Context = %q, want %q", i, got[i].Context, wantCtx)
+				}
 			}
 		})
 	}

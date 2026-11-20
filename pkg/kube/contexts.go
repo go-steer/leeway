@@ -87,6 +87,9 @@ func ConfigForContext(path, context string) (*rest.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("kubeconfig %s: context %q: %w", kubeconfigDesc(path), context, err)
 	}
+	cfg.QPS = DefaultQPS
+	cfg.Burst = DefaultBurst
+	setContentDefaults(cfg)
 	return cfg, nil
 }
 

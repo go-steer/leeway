@@ -362,6 +362,48 @@ func TestPlatformManagedRemediation_ReplacesAManifestPatch(t *testing.T) {
 	}
 }
 
+func TestPlatformManagedRemediation_PreservesConflictingAffinityDiagnosis(t *testing.T) {
+	t.Parallel()
+
+	maxSkew := int32(1)
+	sub := SubjectRef{Kind: SubjectDeployment, Namespace: "kube-system", Name: "metrics-agent"}
+	f := Finding{
+		Kind:           KindContractViolated,
+		Subject:        sub,
+		TopologyKey:    "topology.kubernetes.io/zone",
+		SuspectedCause: CauseConstraintIgnored,
+		Intent: &FindingIntent{
+			Source:     SourceTopologySpreadConstraint.String(),
+			Confidence: ConfidenceDeclared.String(),
+			MaxSkew:    &maxSkew,
+			Evidence: []string{
+				"topologySpreadConstraints[0]: topologyKey=topology.kubernetes.io/zone maxSkew=1 whenUnsatisfiable=ScheduleAnyway labelSelector=k8s-app=metrics-agent",
+				"conflicting nodeAffinity/nodeSelector restricts topology.kubernetes.io/zone to 1 of 3 cluster usable domain(s)",
+			},
+		},
+		Domains: []FindingDomain{
+			{Domain: "us-central1-a", Actual: 3, Expected: 1, Delta: 2, ReadyNodes: 2},
+			{Domain: "us-central1-b", Actual: 0, Expected: 1, Delta: -1, ReadyNodes: 2},
+			{Domain: "us-central1-c", Actual: 0, Expected: 1, Delta: -1, ReadyNodes: 2},
+		},
+	}
+	patch := SuggestRemediation(f, map[string]string{"k8s-app": "metrics-agent"})
+	if patch == nil || patch.Kind != RemediationManifestPatch {
+		t.Fatalf("precondition: SuggestRemediation = %+v, want manifest_patch", patch)
+	}
+
+	got := PlatformManagedRemediation(f, patch)
+	if got == nil || got.Kind != RemediationPlatformManaged {
+		t.Fatalf("PlatformManagedRemediation = %+v, want %q", got, RemediationPlatformManaged)
+	}
+	if got.YAML != "" || got.Command != "" {
+		t.Errorf("PlatformManagedRemediation carries yaml %q / command %q, want neither", got.YAML, got.Command)
+	}
+	if !strings.Contains(got.Summary, "nodeAffinity/nodeSelector") || !strings.Contains(got.Summary, "node-pool changes alone") {
+		t.Errorf("Summary = %q, want conflicting nodeAffinity/nodeSelector diagnosis preserved", got.Summary)
+	}
+}
+
 func TestPlatformManagedRemediation_LeavesEveryOtherKindAlone(t *testing.T) {
 	t.Parallel()
 
