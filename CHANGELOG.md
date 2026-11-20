@@ -4,6 +4,8 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-20
+
 ### Added
 
 - **`platform_managed` Remediation for Addon-Manager-Reconciled Workloads (`pkg/leeway`, `pkg/sources/topologydrift`, `pkg/kube`)**: A Deployment or StatefulSet whose own `metadata.labels` carry `addonmanager.kubernetes.io/mode: Reconcile` now gets a `platform_managed` remediation, with no `yaml` and no `command`, where it used to get a `manifest_patch`. The platform reconciles such a workload and can revert a patch, and on real GKE fleets most findings nobody planted were on `kube-system/kube-dns`, each offering one. The skew is real, so the finding stays, and its `summary` points at the node pools and the domains they span, or the addon's own configuration. Other remediation kinds, and the label's `EnsureExists` value, are unchanged. `topologydrift` reads the label from the Deployment and StatefulSet objects it already holds, and the field registry in `pkg/kube/transform_registry.go` records their `metadata.labels` as preserved. When `leeway report` cannot list those objects the `manifest_patch` is kept, and DaemonSets are not covered.
