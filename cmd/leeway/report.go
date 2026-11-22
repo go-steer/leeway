@@ -58,10 +58,9 @@ type reportOptions struct {
 	pretty      bool
 }
 
-func runReportCmd(args []string, stdout, stderr *os.File) int {
+func newReportFlagSet(o *reportOptions, stderr *os.File) *flag.FlagSet {
 	fs := flag.NewFlagSet("leeway report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var o reportOptions
 
 	fs.StringVar(&o.clusters, "clusters", "", "Comma-separated list of target clusters: GKE triples (`project/location/cluster`), `name=https://endpoint`, or kubeconfig context names.")
 	fs.StringVar(&o.clustersFrom, "clusters-from", "", "Fleet discovery source: `kubeconfig[:/path]`, `profiles:/path/to/profiles`, or `<project>[/<location>]`.")
@@ -96,6 +95,12 @@ func runReportCmd(args []string, stdout, stderr *os.File) int {
 			"structured JSON report to stdout (or --output).\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
+	return fs
+}
+
+func runReportCmd(args []string, stdout, stderr *os.File) int {
+	var o reportOptions
+	fs := newReportFlagSet(&o, stderr)
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

@@ -4,6 +4,10 @@ All notable changes to `leeway` are documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Report Schema, Finding Identity, `pkg/leeway` Go API, and CLI Stability Policy (`docs/stability-policy.md`, `pkg/leeway/identity.go`, `pkg/report/identity.go`, `pkg/report/schema_stability_test.go`, `cmd/leeway/report_flags_stability_test.go`)**: Defined compatibility rules across the four external surfaces consumed by `kube-agents`, `shipmind`, and `k8s-lookout` (`#30`). `leeway report` retains `schema_version: "leeway.report/v1alpha1"` so existing consumers stay unbroken, freezes every `snake_case` envelope and `camelCase` finding/remediation field against removal or type changes, and requires an opt-in `--schema-version` dual-version window of at least two minor releases and 60 calendar days before any future `v1` cut. Added deterministic six-part cross-sweep finding deduplication helpers (`report.CanonicalCluster`, `leeway.TopologyFindingKey`, and `leeway.RankFindingKey`, matching `kube-agents`'s axis-wide ledger keys and appending `/<focus>` when `focus >= 0` on per-tier `leeway.rank_tier_unused` findings so multiple unused tiers on one `ComputeClass` stay distinct) so `shipmind` and `kube-agents` derive identical ledger keys. Listed the guaranteed pure `pkg/leeway` symbols (`DecodeComputeClass` and static `ComputeClass` types, `LatestScaleUp` / `IsScaleUpReason` / `ScaleUpVerdict` / `AutoscalerEvent`, and pure scoring/remediation helpers) with a two-minor and 60-day deprecation window, and pinned the wire field set, vocabularies, `pkg/leeway` signatures, and `leeway report` flags and `0` / `1` / `2` exit codes in unit tests.
+
 ## [0.1.7] - 2026-11-20
 
 ### Added

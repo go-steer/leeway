@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-All `leeway` finding kinds are frozen under the `leeway.` prefix. The JSON examples on this page are taken from `leeway report` output against fake clusters; only arrays have been shortened.
+All `leeway` finding kinds are frozen under the `leeway.` prefix; wire-schema evolution and cross-sweep finding deduplication keys are governed by the [Stability policy](/reference/stability-policy/). The JSON examples on this page are taken from `leeway report` output against fake clusters; only arrays have been shortened.
 
 ## Topology findings (`topology-drift`)
 
