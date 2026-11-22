@@ -110,6 +110,8 @@ leeway report --context=my-cluster --topology-tier-c-signals --all --pretty=fals
   - `rank_findings[]`: [`leeway.RankFinding`](/reference/finding-kinds/#leewayrankfinding-json-schema) objects (`leeway.rank_wedged`, `leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`).
   - `subjects[]`: Only with `--all` or `--min-drift`. Every evaluated `(subject, topologyKey)` as a `leeway.Finding`, including non-breaching ones, which have empty `tier` and `severity` and no `remediation`.
 
+See the [Stability policy](/reference/stability-policy/) for the deterministic cross-sweep finding deduplication keys (`leeway.TopologyFindingKey` and `leeway.RankFindingKey`), `leeway.report/v1alpha1` schema guarantees, and exit codes (`0` / `1` / `2`).
+
 ## 2. Consuming daemon webhook incidents (`leeway watch`)
 
 When `leeway watch` runs continuously with `--webhook-url=<base-url>`, it posts JSON payloads to two endpoints on your receiver:

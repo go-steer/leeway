@@ -49,6 +49,8 @@ sidebar:
 | `--output`, `-o` | `""` (stdout) | Write the JSON report to this file path instead of `stdout`. |
 | `--pretty` | `true` | Pretty-print JSON with indentation; `--pretty=false` emits single-line JSON. |
 
+`leeway report` exits `0` when the JSON report is written (even when findings exist or individual target clusters fail with `"status": "error"`), `1` on discovery or output-write failures, and `2` on invalid flags or arguments; see the [Stability policy](/reference/stability-policy/#4-leeway-report-cli-flags-and-exit-codes).
+
 ## `leeway watch` flags
 
 | Flag | Default | Description |

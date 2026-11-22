@@ -187,7 +187,7 @@ The envelope is snake_case; the finding objects inside it are camelCase. This is
 }
 ```
 
-A cluster that could not be evaluated has `"status": "error"` and an `error` string instead of `domains` and findings. The finding schemas are in [Finding kinds](docs/site/src/content/docs/reference/finding-kinds.md).
+A cluster that could not be evaluated has `"status": "error"` and an `error` string instead of `domains` and findings. The finding schemas are in [Finding kinds](docs/site/src/content/docs/reference/finding-kinds.md), and compatibility guarantees for the `leeway.report/v1alpha1` schema, deterministic cross-sweep finding identity (`leeway.TopologyFindingKey` / `leeway.RankFindingKey`), exported `pkg/leeway` Go API, and `leeway report` flags and exit codes (`0` / `1` / `2`) are governed by [`docs/stability-policy.md`](docs/stability-policy.md).
 
 ---
 
