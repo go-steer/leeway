@@ -164,6 +164,8 @@ def main() -> None:
     shell_walk = [
         *[p for d in (REPO_ROOT / "dev/tools", REPO_ROOT / "dev/ci/presubmits")
           if d.exists() for p in d.iterdir()],
+        *[p for p in (REPO_ROOT / "dev/soak").rglob("*")
+          if (REPO_ROOT / "dev/soak").exists()],
         *[p for p in (REPO_ROOT / "examples").rglob("*")
           if (REPO_ROOT / "examples").exists()],
     ]
@@ -180,7 +182,7 @@ def main() -> None:
                 print(f"sh:   {path.relative_to(REPO_ROOT)}")
 
     # YAML: workflows, repo config, golangci-lint config, deploy +
-    # examples manifests. Deliberately NOT .github/ISSUE_TEMPLATE/* or
+    # examples + soak manifests. Deliberately NOT .github/ISSUE_TEMPLATE/* or
     # pull_request_template.md — those are prose GitHub renders to
     # contributors, and a fourteen-line license header above "What
     # happened" helps nobody.
@@ -197,6 +199,7 @@ def main() -> None:
         REPO_ROOT / "dev/tools/.golangci.yml",
         REPO_ROOT / "deploy/chart/Chart.yaml",
         REPO_ROOT / "deploy/chart/values.yaml",
+        *sorted((REPO_ROOT / "dev/soak").rglob("*.yaml")),
         *sorted((REPO_ROOT / "examples").rglob("*.yaml")),
     ]
     for path in yaml_files:
@@ -206,8 +209,12 @@ def main() -> None:
             counts["yaml"] += 1
             print(f"yaml: {path.relative_to(REPO_ROOT)}")
 
-    # Python: scripts under dev/tools/ that have a shebang.
-    py_files = [REPO_ROOT / "dev/tools/add-license-headers"]
+    # Python: scripts under dev/tools/, dev/drills/, and dev/soak/.
+    py_files = [
+        REPO_ROOT / "dev/tools/add-license-headers",
+        *sorted((REPO_ROOT / "dev/drills").rglob("*.py")),
+        *sorted((REPO_ROOT / "dev/soak").rglob("*.py")),
+    ]
     for path in py_files:
         if not path.exists():
             continue

@@ -20,7 +20,7 @@
 #   examples/kwok/leeway-report-scale
 #   examples/kwok/leeway-report-scale --report
 #
-# leeway-scale measures `leeway` the long-running process: informers,
+# leeway-scale measures `leeway watch` the long-running process: informers,
 # steady-state RSS, evaluation p99. This measures `leeway report`, the
 # one-shot snapshot, which reads the cluster by a different path and
 # whose cost is a peak, not a level. It reads a cluster one of two ways:
@@ -58,19 +58,6 @@
 #   LEEWAY_REPORT_SETTLE_TRIES       fingerprint checks, 5 s apart, to wait
 #                                    for the fleet to stop moving before
 #                                    reading it (default 36, three minutes)
-#
-# ON SETTLING. The two modes read the cluster seconds apart, so a fleet
-# still moving after scale-up (the pinned archetype's pods take a while
-# to land) gives them different snapshots and different findings. That
-# is not a read-path defect, and failing on it would make the rung flaky.
-# So it waits until what the evaluator counts per pod stops changing, and
-# if the modes still disagree while the fleet changed under them, it
-# settles and reads both once more. A disagreement on a fleet that did not
-# move, or a second one, fails.
-#
-# Like leeway-scale, the ceilings are off by default because a human
-# taking a reading wants the number; CI sets them. Each run appends one
-# row per mode to $STATE_DIR/leeway-report-scale.tsv.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -115,8 +102,8 @@ done
 
 bin="$(leeway_bin)"
 ctx="$(kubectl config current-context)"
-nodes="$(kubectl get nodes -o name | grep -c . || true)"
-pods="$(kubectl get pods -A -o name | grep -c . || true)"
+nodes="$(kubectl get nodes --chunk-size=0 --no-headers 2>/dev/null | grep -c . || true)"
+pods="$(cluster_pod_count)"
 
 echo "▸ cluster: $nodes nodes, $pods pods ($(fake_node_count) faked by kwok)"
 echo "▸ binary:  $bin"
@@ -153,7 +140,7 @@ run_mode() {
   local started peak=0 rss rc=0 pid
   started="$(date +%s.%N)"
   # Only topology-drift, as in leeway-scale: compute-class needs a GKE
-  # CRD kind does not serve.
+  # CRD kind/kwok does not serve.
   "${envs[@]}" "$bin" report \
     --context="$ctx" \
     --cluster-name=kwok-scale \
@@ -182,10 +169,49 @@ findings_of() {
 
 # fleet_fingerprint — a checksum of what the evaluator counts per pod:
 # identity, phase, node, whether it is terminating, and why it is unscheduled.
+# Paginated per namespace (`--chunk-size=500`) so 100k–200k+ padded-pod runs
+# never unmarshal the whole cluster into a single `kubectl` process. Any failed
+# namespace query emits a unique sentinel token so two timed-out polls never
+# compare equal as "settled".
 fleet_fingerprint() {
-  kubectl get pods -A \
-    -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.phase} {.spec.nodeName} {.metadata.deletionTimestamp} {.status.conditions[?(@.type=="PodScheduled")].reason}{"\n"}{end}' |
-    sort | cksum
+  local tmpdir ns active=0 failed=0 pid
+  local -a nss=() pids=()
+  if ! mapfile -t nss < <(kubectl get namespaces --chunk-size=0 --no-headers --request-timeout=60s 2>/dev/null | awk '{print $1}') \
+    || ((${#nss[@]} == 0)); then
+    printf 'unsettled-%s-%s\n' "$(date +%s.%N)" "$RANDOM"
+    return 0
+  fi
+  tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/kwok-fp.XXXXXX")"
+  echo 0 >"$tmpdir/_zero"
+  for ns in "${nss[@]}"; do
+    [[ -n "$ns" ]] || continue
+    (
+      set -euo pipefail
+      kubectl get pods -n "$ns" --chunk-size=500 \
+        -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,DEL:.metadata.deletionTimestamp,SCHED:.status.conditions[?(@.type=="PodScheduled")].reason' \
+        --no-headers --request-timeout=120s 2>/dev/null \
+        | LC_ALL=C sort | cksum >"$tmpdir/$ns"
+    ) &
+    pids+=("$!")
+    active=$((active + 1))
+    if ((active >= 4)); then
+      for pid in "${pids[@]}"; do
+        wait "$pid" || failed=1
+      done
+      pids=()
+      active=0
+    fi
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || failed=1
+  done
+  if ((failed)); then
+    rm -rf "$tmpdir"
+    printf 'unsettled-%s-%s\n' "$(date +%s.%N)" "$RANDOM"
+    return 0
+  fi
+  LC_ALL=C sort "$tmpdir"/* | cksum
+  rm -rf "$tmpdir"
 }
 
 # settle — wait until two fingerprints in a row match.
@@ -269,8 +295,8 @@ done
 
 if ((failed == 0)); then
   # Recounted: the fleet may have grown while it settled.
-  nodes="$(kubectl get nodes -o name | grep -c . || true)"
-  pods="$(kubectl get pods -A -o name | grep -c . || true)"
+  nodes="$(kubectl get nodes --chunk-size=0 --no-headers 2>/dev/null | grep -c . || true)"
+  pods="$(cluster_pod_count)"
   mkdir -p "$(dirname "$LADDER")"
   for mode in client-go kubectl; do
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$nodes" "$pods" "$mode" \

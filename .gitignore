@@ -10,11 +10,13 @@ dist/
 *.out
 coverage.*
 
-# Editor / OS noise
+# Editor / OS / Python bytecode noise
 .idea/
 .vscode/
 *.swp
 .DS_Store
+__pycache__/
+*.py[cod]
 
 # Local git worktrees used for isolated feature and parallel-branch development.
 /.worktrees/
