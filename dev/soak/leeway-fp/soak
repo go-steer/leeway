@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The leeway false-positive soak: run `leeway watch` (and periodic one-shot
+# `leeway report` snapshots) at production leeway settings against a kind
+# cluster shaped like a three-zone regional cluster, churn it the way a
+# healthy cluster churns, and count every leeway finding that reaches the
+# webhook wire or watcher log. Under benign churn the right dwell-gated
+# number is zero, so every `leeway watch` finding is either a false positive
+# or real drift the churn produced; summarize.py lays out the evidence
+# needed to tell which. See README.md.
+#
+# Usage:
+#   soak up                 kind cluster (7 nodes, 3 zones) + leeway watch + workloads
+#   soak run <duration>     collectors + churn for <duration> (e.g. 45m, 72h), then summary
+#   soak report [flags...]  run ad-hoc `leeway report` against the soak cluster
+#   soak summary            re-run the summary over what has been collected
+#   soak down               delete the kind cluster (keeps $SOAK_DIR)
+#
+# Env:
+#   SOAK_DIR          where everything is written (default ./out); must be absolute
+#                     or relative to the current directory
+#   SOAK_CLUSTER      kind cluster name (default leeway-fp)
+#   LEEWAY_IMAGE      watcher image (default leeway:fp-soak; built from ./Dockerfile
+#                     if absent from the local docker image store and LEEWAY_IMAGE_TAR
+#                     is unset)
+#   LEEWAY_IMAGE_TAR  docker-save tarball to load first (optional)
+#   LEEWAY_BIN        host `leeway` binary for `leeway report` snapshots (optional;
+#                     defaults to $SOAK_DIR/bin/leeway built from ./cmd/leeway or
+#                     extracted from $LEEWAY_IMAGE on go-less VMs)
+#   SOAK_SEED         churn RNG seed (default 416)
+#   SOAK_CHURN_SCALE  multiplies every churn interval (default 1; 0.25 for a
+#                     fast smoke run)
+#   SOAK_NODE_CPUS / SOAK_NODE_MEMORY  per-worker docker caps (default 1 / 3g);
+#                     the control plane gets three times both
+#   SOAK_ZONE_AFFINITY  1 (default) gives every soak pod a required node
+#                     affinity on the zone label; 0 drops it to exercise
+#                     pkg/leeway's DropEmptyUnknown directly on the unlabelled
+#                     control-plane node
+
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/../../.." && pwd)"
+
+CLUSTER="${SOAK_CLUSTER:-leeway-fp}"
+SOAK_DIR="$(mkdir -p "${SOAK_DIR:-out}" && cd "${SOAK_DIR:-out}" && pwd)"
+IMAGE="${LEEWAY_IMAGE:-leeway:fp-soak}"
+NODE_CPUS="${SOAK_NODE_CPUS:-1}"
+NODE_MEMORY="${SOAK_NODE_MEMORY:-3g}"
+# Never the caller's kubeconfig: this script cordons, drains and pauses
+# nodes, and must not be able to reach any cluster but its own.
+export KUBECONFIG="$SOAK_DIR/kubeconfig"
+NS=agent-triage
+WORKLOAD_IMAGES=(registry.k8s.io/pause:3.9 registry.k8s.io/pause:3.10 python:3.12-alpine)
+
+log() { echo "▸ $(date -u +%FT%TZ) $*"; }
+
+kind_config() {
+  # Three zones of two workers each, and two node pools that each span
+  # all three zones — the shape of a regional GKE cluster, so node-group
+  # subjects are exercised too. The control plane carries no zone label
+  # and keeps its NoSchedule taint: it hosts only `leeway watch` and the
+  # webhook capture stub, which churn never touches.
+  #
+  # The real topology.kubernetes.io/zone label, unlike examples/: this
+  # soak is about production behaviour, including the assumed cluster
+  # default spread that applies on that key.
+  local zones=(zone-a zone-a zone-b zone-b zone-c zone-c)
+  local pools=(pool-1 pool-2 pool-1 pool-2 pool-1 pool-2)
+  cat <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraMounts:
+      - hostPath: $SOAK_DIR/wire
+        containerPath: /fp-wire
+      - hostPath: $SOAK_DIR/store
+        containerPath: /fp-store
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        containerLogMaxSize: 500Mi
+        containerLogMaxFiles: 3
+EOF
+  local i
+  for i in "${!zones[@]}"; do
+    cat <<EOF
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: ${zones[$i]}
+      topology.kubernetes.io/region: soak-region
+      cloud.google.com/gke-nodepool: ${pools[$i]}
+EOF
+  done
+}
+
+ensure_image() {
+  if [[ -n "${LEEWAY_IMAGE_TAR:-}" ]]; then
+    log "loading image tarball $LEEWAY_IMAGE_TAR"
+    docker load -i "$LEEWAY_IMAGE_TAR"
+  fi
+  if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ ! -f "$root/Dockerfile" ]]; then
+    echo "ERROR: image '$IMAGE' is not in local docker store and $root/Dockerfile not found" >&2
+    exit 1
+  fi
+  local ver commit built
+  ver="$(sed -n 's/^[[:space:]]*Version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$root/internal/version/version.go" | head -1)"
+  [[ -n "$ver" ]] || ver="v0.0.0-dev"
+  commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo none)"
+  built="$(date -u +%FT%TZ)"
+  log "building $IMAGE from $root (version=$ver commit=${commit:0:8})"
+  docker build -t "$IMAGE" \
+    --build-arg "VERSION=$ver" \
+    --build-arg "COMMIT=$commit" \
+    --build-arg "BUILD_DATE=$built" \
+    "$root"
+}
+
+ensure_leeway_bin() {
+  if [[ -n "${LEEWAY_BIN:-}" ]]; then
+    echo "$LEEWAY_BIN"
+    return 0
+  fi
+  local bin="$SOAK_DIR/bin/leeway"
+  if [[ -x "$bin" ]]; then
+    echo "$bin"
+    return 0
+  fi
+  mkdir -p "$SOAK_DIR/bin"
+  if command -v go >/dev/null 2>&1 && [[ -f "$root/go.mod" ]]; then
+    log "building leeway CLI -> $bin" >&2
+    (cd "$root" && CGO_ENABLED=0 go build -o "$bin" ./cmd/leeway)
+    echo "$bin"
+    return 0
+  fi
+  if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    log "extracting /leeway from $IMAGE -> $bin" >&2
+    local cid
+    cid="$(docker create "$IMAGE")"
+    docker cp "$cid:/leeway" "$bin"
+    docker rm "$cid" >/dev/null
+    chmod +x "$bin"
+    echo "$bin"
+    return 0
+  fi
+  return 1
+}
+
+cmd_up() {
+  for tool in kind kubectl docker python3; do
+    command -v "$tool" >/dev/null || {
+      echo "ERROR: $tool not on PATH" >&2
+      exit 1
+    }
+  done
+  mkdir -p "$SOAK_DIR/wire" "$SOAK_DIR/store"
+  # The stub (uid 65534) and leeway watch (uid 65532) write here
+  # through hostPath mounts.
+  chmod 0777 "$SOAK_DIR/wire" "$SOAK_DIR/store"
+
+  ensure_image
+  ensure_leeway_bin >/dev/null || true
+
+  if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
+    log "kind cluster $CLUSTER exists — reusing"
+    kind export kubeconfig --name "$CLUSTER" --kubeconfig "$KUBECONFIG" >/dev/null
+  else
+    kind_config >"$SOAK_DIR/kind.yaml"
+    log "creating kind cluster $CLUSTER"
+    kind create cluster --name "$CLUSTER" --config "$SOAK_DIR/kind.yaml" --wait 5m
+  fi
+  # Capped so a churn burst cannot starve the whole VM, with the
+  # control plane given room: an apiserver starved of CPU misses node
+  # heartbeats, and spurious NotReady nodes would be a confound the soak
+  # created rather than one it found.
+  local n cpus mem
+  for n in $(kind get nodes --name "$CLUSTER"); do
+    cpus="$NODE_CPUS" mem="$NODE_MEMORY"
+    if [[ "$n" == *-control-plane ]]; then
+      cpus="$(python3 -c "print($NODE_CPUS*3)")"
+      mem="$((${NODE_MEMORY%g} * 3))g"
+    fi
+    docker update --cpus "$cpus" --memory "$mem" --memory-swap "$mem" "$n" >/dev/null
+  done
+  kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+  local platform
+  case "$(uname -m)" in
+    x86_64 | amd64) platform="linux/amd64" ;;
+    aarch64 | arm64) platform="linux/arm64" ;;
+    *) platform="linux/$(uname -m)" ;;
+  esac
+  soak_load_image() {
+    local target="$1"
+    if docker save --help 2>&1 | grep -q -- '--platform'; then
+      local archive rc=0
+      archive="$(mktemp "$SOAK_DIR/kind-img.XXXXXX.tar")"
+      if ! docker save --platform "$platform" -o "$archive" "$target" \
+        || ! kind load image-archive --name "$CLUSTER" "$archive"; then
+        rc=1
+      fi
+      rm -f "$archive"
+      return "$rc"
+    fi
+    kind load docker-image --name "$CLUSTER" "$target"
+  }
+
+  log "side-loading images"
+  soak_load_image "$IMAGE"
+  local img
+  for img in "${WORKLOAD_IMAGES[@]}"; do
+    docker image inspect "$img" >/dev/null 2>&1 || docker pull --platform "$platform" -q "$img"
+    soak_load_image "$img"
+  done
+
+  deploy_watcher
+  log "workloads"
+  python3 "$here/workloads.py" | kubectl apply -f -
+  kubectl get deploy,statefulset -n fp-soak --no-headers | wc -l | xargs echo "  workloads:"
+}
+
+deploy_watcher() {
+  log "leeway watch + webhook capture stub"
+  kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+  if [[ -f "$root/deploy/crds/leewaypolicies.yaml" ]]; then
+    kubectl apply -f "$root/deploy/crds/leewaypolicies.yaml"
+  fi
+  kubectl -n "$NS" create secret generic leeway-webhook-token \
+    --from-literal=token=fp-soak-stub-token --dry-run=client -o yaml | kubectl apply -f -
+  kubectl -n "$NS" create configmap stub-webhook \
+    --from-file=stub-webhook.py="$root/dev/drills/stub-webhook.py" \
+    --from-file=stamp.py="$here/stamp.py" \
+    --from-file=serve.py="$here/serve.py" \
+    --dry-run=client -o yaml | kubectl apply -f -
+  kubectl apply -f "$here/stub.yaml"
+  # Recreate `deploy/leeway` cleanly on re-runs (`Recreate` strategy backed by
+  # `/fp-store` hostPath): otherwise `kubectl apply -k` 3-way merges the base
+  # `emptyDir: {}` onto the live `hostPath` without clearing `hostPath`, which
+  # the apiserver rejects with 422 ("may not specify more than 1 volume type").
+  kubectl -n "$NS" delete deployment leeway --ignore-not-found >/dev/null
+  # The shipped manifests, unmodified, then the soak's patches.
+  kubectl apply -k "$root/deploy/"
+
+  # Production leeway settings: every --topology-* and --compute-class-*
+  # threshold and dwell stays at its default, except the two flags that
+  # route Tier C (`info`) findings to the signals counter and webhook so
+  # Tier C false positives are counted on the wire too. --sources rides
+  # the binary's default (`topology-drift,compute-class`, auto-skipping
+  # `compute-class` when the GKE CRD is absent).
+  #
+  # The webhook URL's host is fully qualified (trailing dot before :7777).
+  # Without the dot it has fewer than ndots:5 dots, so each lookup tries
+  # the host's search domains first; on a VM whose kind network has no
+  # working upstream DNS each search lookup times out and drops POSTs.
+  #
+  # Note: Dockerfile sets ENTRYPOINT ["/leeway", "watch"], so container
+  # args splice in directly after `watch`.
+  local args=(
+    "--in-cluster"
+    "--cluster-name=$CLUSTER"
+    "--webhook-url=http://stub-webhook.agent-triage.svc.cluster.local.:7777"
+    "--sink-token-env=LEEWAY_WEBHOOK_TOKEN"
+    "--dedup-window=5m"
+    "--metrics-addr=:9090"
+    "--store=/var/lib/leeway/leeway.db"
+    "--topology-tier-c-signals"
+    "--compute-class-tier-c-signals"
+  )
+  local args_json
+  args_json="$(printf '"%s",' "${args[@]}")"
+  args_json="[${args_json%,}]"
+  kubectl -n "$NS" patch deployment leeway --type=json -p "[
+    {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/image\",\"value\":\"$IMAGE\"},
+    {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/args\",\"value\":$args_json}]"
+  kubectl -n "$NS" patch deployment leeway --type=strategic -p '{"spec":{"template":{"spec":{
+    "nodeSelector":{"node-role.kubernetes.io/control-plane":""},
+    "tolerations":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}],
+    "containers":[{"name":"leeway","env":[{"name":"LEEWAY_WEBHOOK_TOKEN","valueFrom":{"secretKeyRef":{"name":"leeway-webhook-token","key":"token"}}}]}],
+    "volumes":[{"name":"leeway-data","emptyDir":null,"hostPath":{"path":"/fp-store","type":"Directory"}}]}}}}'
+  kubectl -n "$NS" rollout status deploy/stub-webhook --timeout=300s
+  kubectl -n "$NS" rollout status deploy/leeway --timeout=300s
+  sleep 5
+  kubectl -n "$NS" logs deploy/leeway --tail=60 >"$SOAK_DIR/watcher-startup.log"
+  grep -iE "source|topology|leeway|enabled|skip|serving" "$SOAK_DIR/watcher-startup.log" | head -40 || true
+}
+
+# follow_watcher — append leeway watch's log to watcher.log for as long
+# as the run lasts, re-attaching across pod restarts.
+follow_watcher() {
+  local pod last=""
+  while :; do
+    pod="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=leeway -o name 2>/dev/null | head -1)"
+    if [[ -n "$pod" ]]; then
+      if [[ "$pod" == "$last" ]]; then
+        kubectl -n "$NS" logs "$pod" -f --since=60s >>"$SOAK_DIR/watcher.log" 2>&1 || true
+      else
+        echo "### attach $pod $(date -u +%FT%TZ)" >>"$SOAK_DIR/watcher.log"
+        kubectl -n "$NS" logs "$pod" -f >>"$SOAK_DIR/watcher.log" 2>&1 || true
+      fi
+      last="$pod"
+    fi
+    sleep 10
+  done
+}
+
+# sample — every 10m:
+#   1. leeway watch's Prometheus /metrics (scraped from stub-webhook over
+#      Service leeway-metrics:9090);
+#   2. a placement snapshot (nodes + pods per workload/zone), so summarize.py
+#      can check each finding against where the pods actually were;
+#   3. a one-shot `leeway report` JSON snapshot (dwell bypassed) appended to
+#      reports.jsonl, exercising `./cmd/leeway`'s report path alongside watch.
+sample() {
+  local ts bin rep
+  bin="$(ensure_leeway_bin 2>/dev/null || true)"
+  while :; do
+    ts="$(date -u +%FT%TZ)"
+    {
+      echo "### $ts"
+      kubectl -n "$NS" exec deploy/stub-webhook -- python -c \
+        'import urllib.request,sys;sys.stdout.write(urllib.request.urlopen("http://leeway-metrics:9090/metrics",timeout=20).read().decode())' 2>&1 |
+        grep -E '^(lookout_leeway_|process_resident_memory_bytes|go_memstats_heap_alloc_bytes|go_memstats_heap_inuse_bytes)' || true
+    } >>"$SOAK_DIR/metrics.log"
+    {
+      echo "### $ts"
+      kubectl get nodes -o 'custom-columns=N:.metadata.name,Z:.metadata.labels.topology\.kubernetes\.io/zone,U:.spec.unschedulable,R:.status.conditions[?(@.type=="Ready")].status' --no-headers
+      echo "## pods"
+      kubectl get pods -A -o 'custom-columns=NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase,OWNER:.metadata.ownerReferences[0].name' --no-headers
+    } >>"$SOAK_DIR/placement.log" 2>&1
+    if [[ -n "$bin" && -x "$bin" ]]; then
+      if rep="$("$bin" report \
+        --kubeconfig="$KUBECONFIG" \
+        --cluster-name="$CLUSTER" \
+        --topology-tier-c-signals \
+        --compute-class-tier-c-signals \
+        --pretty=false 2>>"$SOAK_DIR/report-errors.log")"; then
+        printf '%s %s\n' "$ts" "$rep" >>"$SOAK_DIR/reports.jsonl"
+      fi
+    fi
+    sleep 600
+  done
+}
+
+build_identity() {
+  local bin id=""
+  bin="$(ensure_leeway_bin 2>/dev/null || true)"
+  if [[ -n "$bin" && -x "$bin" ]]; then
+    id="$("$bin" version 2>/dev/null | head -1 || true)"
+  fi
+  if [[ -z "$id" ]] && docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    id="$(docker run --rm --entrypoint /leeway "$IMAGE" version 2>/dev/null | head -1 || true)"
+  fi
+  printf '%s' "${id:-?}"
+}
+
+cmd_run() {
+  local dur="${1:?usage: soak run <duration, e.g. 72h>}"
+  local secs
+  secs="$(python3 -c 'import re,sys;m={"s":1,"m":60,"h":3600,"d":86400};print(sum(int(n)*m[u] for n,u in re.findall(r"(\d+)([smhd])",sys.argv[1])))' "$dur")"
+  ((secs > 0)) || {
+    echo "ERROR: bad duration '$dur'" >&2
+    exit 2
+  }
+  local start end build bin
+  start="$(date -u +%FT%TZ)"
+  end="$(date -u -d "+$secs seconds" +%FT%TZ)"
+  build="$(build_identity)"
+  {
+    echo "start=$start"
+    echo "planned_end=$end"
+    echo "duration=$dur"
+    echo "image=$IMAGE"
+    echo "build=$build"
+    echo "seed=${SOAK_SEED:-416}"
+    echo "churn_scale=${SOAK_CHURN_SCALE:-1}"
+  } >"$SOAK_DIR/run.env"
+  log "run $dur: $start → $end (dir $SOAK_DIR)"
+
+  local p_follow="" p_sample=""
+  _stop_collectors() {
+    [[ -n "$p_follow" ]] && {
+      kill "$p_follow" 2>/dev/null || true
+      pkill -P "$p_follow" 2>/dev/null || true
+    }
+    [[ -n "$p_sample" ]] && {
+      kill "$p_sample" 2>/dev/null || true
+      pkill -P "$p_sample" 2>/dev/null || true
+    }
+  }
+  trap '_stop_collectors' EXIT INT TERM
+  follow_watcher &
+  p_follow=$!
+  sample &
+  p_sample=$!
+  python3 "$here/churn.py" --cluster "$CLUSTER" --seed "${SOAK_SEED:-416}" \
+    --scale "${SOAK_CHURN_SCALE:-1}" --duration "$secs" --log "$SOAK_DIR/churn.log" || true
+  _stop_collectors
+  trap - EXIT INT TERM
+  echo "actual_end=$(date -u +%FT%TZ)" >>"$SOAK_DIR/run.env"
+  # The full container logs as well, in case a follower lost its stream.
+  kubectl -n "$NS" logs deploy/leeway >"$SOAK_DIR/watcher-final.log" 2>&1 || true
+  bin="$(ensure_leeway_bin 2>/dev/null || true)"
+  if [[ -n "$bin" && -x "$bin" ]]; then
+    "$bin" report \
+      --kubeconfig="$KUBECONFIG" \
+      --cluster-name="$CLUSTER" \
+      --topology-tier-c-signals \
+      --compute-class-tier-c-signals \
+      --output="$SOAK_DIR/report-final.json" 2>>"$SOAK_DIR/report-errors.log" || true
+  fi
+  cmd_summary
+}
+
+cmd_report() {
+  local bin
+  bin="$(ensure_leeway_bin)"
+  exec "$bin" report \
+    --kubeconfig="$KUBECONFIG" \
+    --cluster-name="$CLUSTER" \
+    --topology-tier-c-signals \
+    --compute-class-tier-c-signals \
+    "$@"
+}
+
+cmd_summary() {
+  python3 "$here/summarize.py" "$SOAK_DIR" | tee "$SOAK_DIR/summary.txt"
+}
+
+cmd_down() {
+  kind delete cluster --name "$CLUSTER"
+}
+
+case "${1:-}" in
+  up) cmd_up ;;
+  run) cmd_run "${2:-}" ;;
+  report)
+    shift
+    cmd_report "$@"
+    ;;
+  summary) cmd_summary ;;
+  down) cmd_down ;;
+  *)
+    sed -n '/^# Usage:/,/^$/p' "$0" >&2
+    exit 2
+    ;;
+esac
