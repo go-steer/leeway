@@ -14,7 +14,7 @@
 
 package telemetry
 
-// The black-hole soak behind §14's Phase 8 exit criterion: the process
+// The black-hole soak behind docs/archive/leeway-implementation-journal.md §14's Phase 8 exit criterion: the process
 // survives a black-holed OTLP endpoint for 24 h with flat RSS.
 //
 // This is a Go test and not a shell harness for the same reason

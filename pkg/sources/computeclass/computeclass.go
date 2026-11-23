@@ -90,6 +90,11 @@
 // binary carries no GKE types. A cluster without the CRD never auto-enables
 // the source; an explicit `--sources=…,compute-class` on such a cluster fails
 // loudly at startup (§11) rather than watching an empty stream.
+//
+// A citation written "journal §N" is to
+// docs/archive/leeway-implementation-journal.md, which holds the prerequisite
+// spikes (§13), the delivery plan (§14) and the open questions (§15) that
+// were moved out of the design document.
 package computeclass
 
 import (
@@ -120,7 +125,7 @@ import (
 const Name = "compute-class"
 
 // The GKE ComputeClass CR. Cluster-scoped, short name `cc`, all verified on a
-// live cluster (§13, spike S3).
+// live cluster (journal §13, spike S3).
 var (
 	computeClassGV  = schema.GroupVersion{Group: "cloud.google.com", Version: "v1"}
 	computeClassGVR = computeClassGV.WithResource("computeclasses")

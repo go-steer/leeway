@@ -408,7 +408,7 @@ const DefaultPerDomainMaxKeys = 4
 // The series count of a per-domain breakdown is subjects × keys × domains
 // × states, which at §6.6's 20k-subject baseline is ~480k series against ~3.5k
 // for the aggregates — and under Google Managed Prometheus that is not a scrape
-// that fails but a bill that grows (§13 S5). So the breakdown is exported for
+// that fails but a bill that grows (journal §13 S5). So the breakdown is exported for
 // the subjects somebody is actually going to look at, and the gate is what
 // decides which those are.
 //

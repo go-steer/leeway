@@ -56,7 +56,8 @@ var SystemDefaultConstraints = []corev1.TopologySpreadConstraint{
 
 // ClusterDefaultIntents derives FR-9 intents from the cluster's
 // `PodTopologySpread` default constraints (`nil` = unset/assumed,
-// `&[]` = declared empty, non-empty = declared; see docs/leeway-design.md §13 S4, §16).
+// `&[]` = declared empty, non-empty = declared; see docs/leeway-design.md §13.4
+// and docs/archive/leeway-implementation-journal.md §13 S4).
 func ClusterDefaultIntents(pod *corev1.Pod, declared *[]corev1.TopologySpreadConstraint) []leeway.Intent {
 	// DaemonSet pods run one pod per matching node via nodeName affinity rather
 	// than PodTopologySpread replica balancing; applying cluster-default equal

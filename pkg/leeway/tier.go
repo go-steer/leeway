@@ -258,7 +258,7 @@ type Delivery struct {
 // declared intent behind it, and every one of those stays a metric.
 //
 // A suppressed verdict (§7.6) is metrics-only regardless of tier, including
-// Tier A. That is the zone-outage case in §14's exit criteria: four hundred
+// Tier A. That is the zone-outage case in journal §14's exit criteria: four hundred
 // workloads all "violating" their spread contract because a zone went away is
 // one fact about the cluster, not four hundred findings about the workloads.
 //

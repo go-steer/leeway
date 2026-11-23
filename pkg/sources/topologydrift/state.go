@@ -118,7 +118,7 @@ type State struct {
 	// representatives is subject → one of its pods, by UID and name.
 	//
 	// Intent is inferred from an *admitted pod* and never from a controller's
-	// PodTemplateSpec (§13 S3: GKE injects tolerations at admission that the
+	// PodTemplateSpec (journal §13 S3: GKE injects tolerations at admission that the
 	// template does not carry, and inferring from the weaker document computes
 	// too small an eligible set, concludes the workload is pinned and
 	// suppresses real drift). Evaluation is per subject, so something has to

@@ -384,7 +384,7 @@ func TestJudgeTransient_ARelaxationDoesNotReachTheContractRules(t *testing.T) {
 
 // Suppression, unlike relaxation, covers Tier A. A zone dies and every
 // DoNotSchedule constraint in the cluster is violated in the same second;
-// §14's exit criterion is one finding, not four hundred.
+// journal §14's exit criterion is one finding, not four hundred.
 func TestJudgeTransient_AnOutageSuppressesEvenAContractBreach(t *testing.T) {
 	in := spreadIntent()
 	in.Source = SourceTopologySpreadConstraint

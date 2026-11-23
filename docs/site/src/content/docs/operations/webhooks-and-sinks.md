@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-In `leeway watch` mode, findings that clear their dwell window are logged to `stderr`, counted in `lookout_leeway_standalone_signals_total`, and—when a webhook is configured—delivered over HTTP with deduplication and automatic recovery tracking.
+In `leeway watch` mode, findings that clear their dwell window are logged to `stderr`, counted in `lookout_leeway_standalone_signals_total`, and—when a webhook is configured—delivered over HTTP with deduplication and automatic recovery tracking. See [Deploy the daemon](/getting-started/deploy/#how-leeway-watch-executes) for the end-to-end `leeway watch` state, store, and recovery pipeline diagram.
 
 ## Configuring the webhook sink
 

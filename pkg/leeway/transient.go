@@ -297,7 +297,7 @@ func scaleCount(n int64, mult float64) int64 {
 //
 // Suppression is the opposite: it covers Tier A too. That is the point of the
 // domain-outage row — a zone dies, every DoNotSchedule constraint in the
-// cluster is violated in the same second, and §14's exit criterion is one
+// cluster is violated in the same second, and journal §14's exit criterion is one
 // finding rather than four hundred.
 func (s *Scores) JudgeTransient(intent *Intent, t Thresholds, sup Suppression) Verdict {
 	if sup.Suppress {

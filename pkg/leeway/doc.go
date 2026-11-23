@@ -66,4 +66,9 @@
 // fastidiousness. These numbers reach finding bodies and fingerprints, so an
 // apportionment that resolved a tie by map-iteration order would make findings
 // flap between evaluations with nothing in the cluster having changed.
+//
+// A citation written "journal §N" is to
+// docs/archive/leeway-implementation-journal.md, which holds the prerequisite
+// spikes (§13), the delivery plan (§14) and the open questions (§15) that
+// were moved out of the design document.
 package leeway

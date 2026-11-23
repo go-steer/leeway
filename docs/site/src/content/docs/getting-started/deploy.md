@@ -7,6 +7,54 @@ sidebar:
 
 `leeway watch` runs continuously as a daemon. Unlike `leeway report`, which evaluates a single point-in-time snapshot, `leeway watch` maintains live Kubernetes informers, tracks dwell and resolution hysteresis (`--topology-dwell`, `--compute-class-dwell`), learns per-subject baselines (persisted across restarts with `--store`), serves Prometheus `/metrics`, and delivers incident and resolution events to an HTTP webhook callback.
 
+## How `leeway watch` executes
+
+```mermaid
+flowchart TB
+  Factory["Shared Transforming Informers (kube.NewTransformingFactory)<br/>Nodes, Pods, Workloads, PVs/PVCs, Events + Dynamic CRDs<br/>Trimmed at cache boundary by kube.Transform"]
+
+  subgraph Sources["Live Source Adapters (pkg/sources/*)"]
+    direction LR
+    Topo["topology-drift<br/>Burst-widening coalescer, domain latch,<br/>5m shard verifier"]
+    CC["compute-class<br/>RankTracker pod-seconds,<br/>rolling --compute-class-window"]
+  end
+
+  subgraph Machine["Stateful Hysteresis and Learning (pkg/leeway)"]
+    direction LR
+    Alert["AlertState / Alerts Table<br/>ok → pending (dwell) → firing → resolving<br/>+ startup leeway.Reconcile"]
+    Base["BaselineSet / Baselines Table<br/>12h EWMA share + bias-corrected EWMAD<br/>(frozen while firing)"]
+  end
+
+  Store[("SQLite pkg/store (modernc.org/sqlite)<br/>leeway_alert_state (sync writes)<br/>leeway_baseline (30s batched writes)")]
+
+  Metrics["Telemetry (internal/telemetry)<br/>Prometheus /metrics + /healthz + /readyz<br/>+ optional OTLP cumulative export"]
+
+  subgraph Delivery["Incident and Recovery Delivery (pkg/engine + pkg/inject)"]
+    direction TB
+    Dedup["engine.DedupCache (--dedup-window=15m)<br/>Open / doubling-schedule repeat suppression<br/>Incident id bindings held in memory"]
+    Sink["inject.WebhookSink (--webhook-url)<br/>POST /incidents → bind {id}<br/>POST /incidents/{id}/events"]
+    Recov["engine.RecoveryTracker (--recovery-stable-for=2m)<br/>Polls source ClearanceObserver → kind: resolved / resolved.reverted"]
+  end
+
+  Factory --> Topo
+  Factory --> CC
+  Topo --> Alert
+  Topo --> Base
+  CC --> Alert
+  CC --> Base
+  Base -.->|"Tier C learned intent"| Topo
+  Alert <-->|"sync write + restore"| Store
+  Base <-->|"30s batch + restore"| Store
+  Topo --> Metrics
+  CC --> Metrics
+  Alert -->|"TransitionFiring"| Dedup
+  Dedup --> Sink
+  Dedup --> Recov
+  Topo -.->|"ClearanceObserver"| Recov
+  CC -.->|"ClearanceObserver"| Recov
+  Recov -->|"ResolvedPayload"| Sink
+```
+
 ## Deploying in-cluster with Kustomize
 
 Apply the base manifests in `deploy/` (creates the `leeway` ServiceAccount, read-only ClusterRole, ClusterRoleBinding, metrics Service, and Deployment in namespace `agent-triage`):

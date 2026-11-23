@@ -112,7 +112,7 @@ func runEmitting(t *testing.T, cfg Config, st AlertStore, objs ...runtime.Object
 	return s, signals
 }
 
-// TestSource_ALearnedBaselineBreachReachesTheWire is §14's Phase 5 exit
+// TestSource_ALearnedBaselineBreachReachesTheWire is journal §14's Phase 5 exit
 // criterion in miniature, and the first time any code path can produce
 // leeway.baseline_breach: a Deployment that declared nothing has always sat
 // evenly across three zones, all six replicas end up in one, and the finding

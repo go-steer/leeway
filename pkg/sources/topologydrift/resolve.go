@@ -88,7 +88,7 @@ type ResolveConfig struct {
 // computes the eligible domains that intent is scored against.
 //
 // **The pod, never the controller's template.** Every inference entry point in
-// this package takes a *corev1.Pod for the reason §13 S3 measured: GKE injects
+// this package takes a *corev1.Pod for the reason journal §13 S3 measured: GKE injects
 // tolerations at admission that the owning Deployment's PodTemplateSpec does
 // not carry. A template is a strictly weaker document than the object the
 // scheduler actually placed, and inferring from it computes an eligible set

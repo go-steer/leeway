@@ -433,7 +433,7 @@ func TestSource_ARecentDrainRelaxesRatherThanSuppresses(t *testing.T) {
 	}
 }
 
-// §14's exit criterion, at the mechanism level: one dead zone is one cluster
+// journal §14's exit criterion, at the mechanism level: one dead zone is one cluster
 // event, not one finding per workload that had pods in it.
 func TestSource_AZoneOutageIsOneClusterEventNotAFindingPerWorkload(t *testing.T) {
 	// Zone a has three nodes so that losing two is strictly more than half.
@@ -478,7 +478,7 @@ func TestSource_AZoneOutageIsOneClusterEventNotAFindingPerWorkload(t *testing.T)
 	// that "no episodes" means the machine declined rather than had not run.
 	time.Sleep(50 * time.Millisecond)
 	if n := s.alerts.Len(); n != 0 {
-		t.Errorf("%d episode(s) opened for one dead zone, want none: §14 asks for one finding, not four hundred", n)
+		t.Errorf("%d episode(s) opened for one dead zone, want none: journal §14 asks for one finding, not four hundred", n)
 	}
 }
 

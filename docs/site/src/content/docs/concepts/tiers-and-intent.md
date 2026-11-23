@@ -2,7 +2,7 @@
 title: Confidence tiers and intent hierarchy
 description: How leeway resolves placement intent from policies, pod specs, and learned baselines and assigns Tier A, B, or C.
 sidebar:
-  order: 2
+  order: 3
 ---
 
 Every `leeway` finding carries a **Tier** (`A`, `B`, or `C`). The tier is not a synonym for severity — it records **where the placement expectation came from**.
