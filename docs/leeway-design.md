@@ -1497,30 +1497,28 @@ Three things in that table are worth more than the numbers:
 
 Extrapolating the measured slope, and saying plainly that this is arithmetic:
 
-| Tier | Pods | Resident, extrapolated |
+| Tier | Pods | Resident, extrapolated (JSON, 3 replicas/Deployment) |
 |---|---|---|
 | 200,000 | 200,000 | **~12.1 GiB** |
 | 1,000,000 | 1,000,000 | **~60.4 GiB** |
 
-> **What was not measured, and will not be pretended otherwise.** Two of the three
-> figures §12.1 asks for are still open.
->
-> - **The 200k-pod tier is extrapolation, not measurement.** §12.1 calls it
->   "directly measurable" on a large machine with tuned etcd; this run reached 8,814
->   pods on kind, an order of magnitude short, and the binding constraint was the
->   apiserver rather than the process under test. The 1M tier was always going to be
->   arithmetic and is labelled as such above; the 200k one is *supposed* to be
->   measurable and has not been.
-> - **500 pods/sec was not approached.** The churn rung sustained **4.6 pod
->   lifecycles/s**, two orders of magnitude below the design target, because
->   `kubectl rollout restart` against a kind apiserver is what was available. The
->   process cost 0.071 core at that rate. Extrapolating a hundredfold on one point
->   would be indefensible, so §6.6.1's totals stay modelled.
->
-> What the run *does* establish: the memory model is linear over three decades of
-> pod count with no cliff, its constant agrees with S8's independently, evaluation
-> p99 stays at 5 ms under churn against an NFR that has room for three orders of
-> magnitude more, and nothing in the subsystem's own SLIs moved while it happened.
+**Measured 100k–200.5k-pod & 1,578 pods/s ladder (2026-11-18, Protobuf + `kwokctl`, [go-steer/k8s-lookout#495](https://github.com/go-steer/k8s-lookout/issues/495) / [#829](https://github.com/go-steer/k8s-lookout/pull/829) / [#831](https://github.com/go-steer/k8s-lookout/pull/831); ported to `go-steer/leeway` in [#29](https://github.com/go-steer/leeway/issues/29) / [#33](https://github.com/go-steer/leeway/pull/33)).** With typed Kubernetes clients on Protobuf (`pkg/kube`, [#24](https://github.com/go-steer/leeway/pull/24) / [go-steer/k8s-lookout#824](https://github.com/go-steer/k8s-lookout/pull/824)) and `examples/kwok/kwokctl-run` (`examples/kwok/kwokctl-up` / `kwokctl-down`) driving a standalone `kwokctl --runtime=binary` control plane (`32 GiB` etcd quota at `>120k` pods, QPS limits off, `50` controller workers, `64` kwok pod-stage workers, up to `4,000` fake nodes and `5,000` workloads × `50` replicas across 10 archetypes = `200,500` S8-padded pods at `16,384 B` mean Pod and `21,061 B` mean Node) against the `leeway` binary (`examples/kwok/leeway-scale` running `leeway watch --sources=topology-drift`) on a 64-core / 117 GiB workstation:
+
+| Nodes | Pods | Subject-axes | Ready | Peak RSS | Go heap | CPU | p99 | Churn | Evals/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 0 | 0 | 0.0 s | 57.9 MiB | 6.6 MiB | 0.000 core | — | — | — |
+| 2,000 | 100,500 | 4,500 | 21.1 s | **3,093.0 MiB** | **2,241.6 MiB** | 0.001 core | 10.0 ms | — | — |
+| 2,000 | 111,422 | 4,500 | 19.0 s | **3,647.7 MiB** | **3,284.0 MiB** | **1.174 core** | 25.0 ms | **596.3 lifecycles/s** | 131.53 /s |
+| 4,000 | **200,500** | 4,500 | **40.7 s** | **5,697.1 MiB** | **4,481.8 MiB** | 0.001 core | 25.0 ms | — | — |
+| 4,000 | **200,500** | 4,500 | **38.6 s** | **7,082.2 MiB** | **4,883.5 MiB** | **1.384 core** | 100.0 ms | **1,578.5 lifecycles/s** | 23.76 /s |
+
+Key outcomes from the 100k–200.5k runs (`counter_mismatch_total = 0` across every rung):
+
+1. **At the `200,500`-pod design target, quiet resident memory of `leeway watch` (`--sources=topology-drift`) is `5,697.1 MiB` (`5.56 GiB`) — `28.80 KiB/pod` marginal resident and `22.86 KiB/pod` Go heap** (over a `57.9 MiB` intercept), cutting the early `~12.1 GiB` JSON/3-replica extrapolation in half and projecting **`27.52 GiB`** linearly at 1M pods. Protobuf wire decoding eliminates JSON reflection bloat (~43% RSS reduction measured at constant 3-replica density in CI), and production-realistic replica density (`25–50` replicas/Deployment vs `3`) amortises owner/node state — leaving Go heap only `4.3 KiB/pod` above S8's `18.6 KiB` raw per-pod baseline despite including `4,500` Deployments/ReplicaSets, `4,000` Nodes, and `leeway`'s live indexes.
+2. **Sustained `1,578.5 pod lifecycles/s` at `200,500` pods / `4,000` nodes exceeds §6.6.1 / §12.1's `500 pods/s` design target by `3.16×` inside `1.3840` whole-process cores.** Twenty-four rollout drivers (`KWOKCTL_RUN_CHURN=24 examples/kwok/kwokctl-run 4000 5000 50`) generated `1,893.4 watch events/s` ([#491](https://github.com/go-steer/k8s-lookout/issues/491)), which the subject-keyed coalescer folded `79.7:1` into `23.76 evaluations/s` (`0.5871` core inside the evaluator at `24,709.3 µs` mean across `4,000` nodes, `0.7969` core across Protobuf decode, reflector, informer indexing, and GC) with evaluation p99 bounded at **`100.0 ms`**.
+3. **Whole-daemon & one-shot snapshot context.** In `go-steer/leeway`, `examples/kwok/kwokctl-run` runs the full standalone `leeway watch --dry-run` (default sources) alongside `examples/kwok/leeway-scale` and benchmarks one-shot `leeway report` across both `client-go` and `CREDENTIAL_PROXY_URL` `kubectl` (`ShellMode`) read paths via `examples/kwok/leeway-report-scale` against the isolated `examples/kwok/kwokctl-up` / `kwokctl-down` cluster. For historical comparison against the pre-retirement `k8s-lookout` sentinel ([go-steer/k8s-lookout#831](https://github.com/go-steer/k8s-lookout/pull/831)), `lookout watch --dry-run --sources=auto` held all 10 portable sources plus the live `--storm` topology graph (`pkg/graph`) across the same `4,000` nodes / `200,500` pods in `6,772.5 MiB` (`6.61 GiB`) peak `VmHWM` (`5,587.3 MiB` Go heap), draining `/readyz` in **`43.8 s`**, and all 26/26 `k8s-lookout` read-path commands passed `BENCH_REQUIRE_DEFAULT_TIMEOUT=1` inside their shipped `--timeout` (`10s` / `30s` / `120s`) and `--kube-qps=50 --kube-burst=100` defaults (`health` `16.4 s`, `scan` `15.6 s` across `645,663` objects, every `10s`-default check in `0.0–9.1 s`).
+
+> **Remaining extrapolation boundary.** Both the full **`200,500`-pod** design target (`5.56 GiB` quiet resident, `6.92 GiB` peak under `3×` target churn) and **`1,578.5 pods/s`** sustained rollout churn are now directly measured via `KWOKCTL_RUN_CHURN=24 examples/kwok/kwokctl-run 4000 5000 50`. Only the `1M`-pod tier (`27.52 GiB`) remains linear headroom arithmetic.
 
 **Measured steady-state soak (2026-09-22, #478).** `examples/kwok/soak` is the other
 half of the gate, and it runs the opposite experiment: the *whole sentinel*, eleven
@@ -1577,12 +1575,12 @@ standalone binary running one.
 #### 6.6.1 Event-rate cost model
 
 This, not memory, is what the design target stresses. At 500 pods/sec sustained
-scheduling, steady state implies ~500 pods/sec terminating too, and each pod
-lifecycle produces roughly eight watch events — a **modelled** figure, not a measured
-one, since S7 was deferred (§13). Everything below scales linearly off it, so read the
-totals as an estimate. **Phase 8's scale gate has now been judged and could not
-re-derive them; they are still modelled, and the reason is worth reading (below the
-tables).**
+scheduling, steady state implies ~500 pods/sec terminating too, and on a real kubelet
+fleet each pod lifecycle produces roughly eight watch events — a real-cluster parameter
+that S7 deferred (§13) and that `kwok` intentionally compresses (measured below via
+[#491](https://github.com/go-steer/k8s-lookout/issues/491)). Read the first two tables
+as the real-kubelet design budget and the `#491` measurement below them as the
+instrumented `200,500`-pod / `1,578.5 lifecycles/s` result.
 
 | | |
 |---|---|
@@ -1621,40 +1619,37 @@ server-side.
 > points), which also makes the "~8 events per lifecycle" constant and the "~80%
 > inert" split measurable rather than asserted.
 >
-> **The instrument shipped (2026-09-29, #491); the measurement has not been re-run.**
+> **Instrumenting and measuring the watch stream (2026-09-29 [#491](https://github.com/go-steer/k8s-lookout/issues/491) / [#499](https://github.com/go-steer/k8s-lookout/issues/499); measured at 200.5k pods 2026-11-18 [go-steer/k8s-lookout#495](https://github.com/go-steer/k8s-lookout/issues/495) / [#29](https://github.com/go-steer/leeway/issues/29)).**
 > `lookout_leeway_watch_events_total{resource,outcome}` is labelled `resource` rather
 > than `kind` so it joins `last_event_timestamp`, and `outcome` is `inert` or `applied`.
 > It is kept in plain atomics and read at scrape time, because the handlers are
 > registered before the instruments exist and a synchronous counter would drop the
 > initial sync. On an EPYC 7B12 the add is 2.5 ns against a 117 ns inert pod event
-> (`BenchmarkSource_InertPodEvent`), so it does not move the ladder. The same benchmark
-> showed the pre-existing `last_event_timestamp` Record cost ~490 ns and 4 allocations
-> per event, which was 80% of the metered inert path. #499 moved that gauge onto the
-> same atomics-at-scrape pattern; the metered inert path is now 115 ns and 0 allocations,
-> the same as the bare one
-> ([#499](https://github.com/go-steer/k8s-lookout/issues/499)). The rows above stay modelled until
-> the churn rung is re-run against this counter.
+> (`BenchmarkSource_InertPodEvent`), and [#499](https://github.com/go-steer/k8s-lookout/issues/499)
+> moved `last_event_timestamp` onto the same atomics-at-scrape pattern (115 ns, 0 allocations).
 >
-> What the churn rung *did* measure, off
-> `lookout_leeway_evaluation_duration_seconds`, is the cost per **evaluation**:
+> `examples/kwok/leeway-scale` (`leeway watch --sources=topology-drift`) now differences
+> `lookout_leeway_watch_events_total` alongside `lookout_leeway_evaluation_duration_seconds`.
+> At `4,000` nodes / `200,500` S8-padded pods under `24` parallel rollout drivers
+> (`KWOKCTL_RUN_CHURN=24 examples/kwok/kwokctl-run 4000 5000 50`):
 >
-> | | |
-> |---|---|
-> | Driven churn | 4.6 pod lifecycles/s, counted from the apiserver |
-> | Evaluations | 4.15/s |
-> | Mean evaluation | 3,023 µs — the evaluator only, from the histogram's `_sum`/`_count` |
-> | Evaluator share | 0.0125 core |
-> | Whole process | 0.0706 core — decode, reflector, transform, indexer and GC included |
+> | Metric | Measured (`4,000` nodes, `200,500` pods) | What it establishes |
+> |---|---|---|
+> | Driven churn | **1,578.5 pod lifecycles/s** | `3.16×` §6.6.1's `500 pods/s` design target, counted from apiserver `creationTimestamp` |
+> | Watch events ([#491](https://github.com/go-steer/k8s-lookout/issues/491)) | **1,893.4 /s** (`81.2%` applied, `18.8%` inert) | `1,536.6 /s` topologically relevant delta updates, `356.8 /s` early-returned inert events |
+> | Pod events / lifecycle | **1.02** (`1,612.1` pod events/s) | `kwok`'s 2-stage fast-forward emits ~1 pod watch event per lifecycle (no image pull, probe transitions, or kubelet status chatter), flipping the real-kubelet ~20:80 applied:inert ratio to 81:19 |
+> | Coalescer folding | **79.7 watch events / evaluation** | `1,893.4` events/s collapse into **23.76 evaluations/s**, directly confirming §6.6.2's subject-keyed burst absorption |
+> | Mean evaluation | **24,709.3 µs** (`p99 <= 100.0 ms`) | Scales linearly with node count (`4,000` nodes vs `3,989 µs` at `2,000` nodes) |
+> | Whole process vs evaluator | **1.3840 core** total (**0.5871 core** eval / **0.7969 core** ingest+GC) | **731.0 µs / watch event** end-to-end (`420.9 µs` Protobuf decode, reflector, informer indexing & GC at 200.5k-object heap + `310.1 µs` amortised 4,000-node evaluation) |
 >
-> **The last two are a split, not a rate per event.** An evaluation is not an event:
-> one `rollout restart` is a Deployment write, a ReplicaSet create, a long tail of
-> status updates on both, and `replicas` pod lifecycles, and leeway re-evaluates the
-> subject on the Deployment write. Quoting 3,023 µs/evaluation as a per-event figure
-> would overstate the per-event cost by exactly the number of events the coalescing
-> window folded together — which is the ratio nothing currently measures. Note also
-> what the split says on its own terms: **the evaluator is 18% of the process and
-> ingest is the other 82%**, which is the shape the fold-in argument predicts and
-> the first direct evidence for it.
+> Two takeaways hold across the `4.6/s` (`400`-node), `596.3/s` (`2,000`-node), and
+> `1,578.5/s` (`4,000`-node) rungs: **ingest + GC (`55–82%` of process CPU) still out-weighs
+> the evaluator (`18–45%`) even when `81.2%` of `kwok` events force full delta application**,
+> keeping the shared-decode fold-in argument intact while confirming standalone `leeway watch`
+> fits comfortably inside `~1.4` cores at `3×` target churn; and because `kwok` compresses away
+> the ~7 inert kubelet status updates per lifecycle, a real cluster at `500 pods/s` exercises
+> *fewer* applied transitions (`~1,000/s` vs the `1,536.6/s` measured here) and spends the
+> remaining `~4,000/s` inert updates on the `45 µs` shared decode + `115 ns` early-return path.
 
 #### 6.6.2 Burst behaviour
 
@@ -4576,13 +4571,16 @@ document's orbit inherits:
   soak counts the fleet every sample and takes its verdict against that count rather
   than against RSS.
 
-The measured ladder, the marginal cost it yields and the line between the measured and
-the extrapolated are in §6.6, along with the soak: the memory model holds under two
-hours of sustained churn, with the marginal resident cost of a fleet object falling
-5.3% between the halves of the window. The per-event decomposition this paragraph
-promised as a regression gate is in §6.6.1 and is **still modelled**. The counter it
-needed now exists ([#491](https://github.com/go-steer/k8s-lookout/issues/491),
-`lookout_leeway_watch_events_total`), but the churn rung has not been re-run against it.
+The measured ladder (now extending directly to `4,000` nodes / `200,500` S8-padded pods at
+`28.80 KiB/pod` marginal resident via `examples/kwok/kwokctl-run`), the `1M`-pod extrapolation
+boundary, and the two-hour soak are in §6.6: the memory model holds under sustained churn, with
+the marginal resident cost of a fleet object falling 5.3% between the halves of the soak window.
+The per-watch-event decomposition ([#491](https://github.com/go-steer/k8s-lookout/issues/491),
+`lookout_leeway_watch_events_total{resource,outcome}`) is now wired into
+`examples/kwok/leeway-scale` (`leeway watch --sources=topology-drift`) and measured in §6.6.1 at
+`1,578.5 pod lifecycles/s` (`1,893.4` watch events/s, `79.7` events folded per evaluation,
+`1.384 core` whole process), isolating the `1.02` pod-events/lifecycle `kwok` compression from
+real-kubelet status chatter.
 
 ---
 
@@ -5130,7 +5128,7 @@ independent of 5.
 | **5 — Baselines** (2 wks) | EWMA/EWMAD, freeze-while-firing, maturity gates, invalidation, Tier C. **The estimator shipped as library code, 2026-09-20** — `leeway.BaselineSet` holds one EWMA share and one EWMAD deviation per domain, matures behind both §7.5 gates, freezes while an episode fires (the clock stops, not just the arithmetic, so a week-long incident does not teach the baseline that the incident is normal), and invalidates on the events §7.5 lists. The warm-up bias is real and corrected: at a 12 h half-life a baseline matures having accumulated ~29 % of its weight, so raw EWMAD understates dispersion ~3.5× — `DevWeight` accumulates `α(1−w)` and `DeviationOf` divides by it. **Persistence shipped, 2026-09-20** — store migration v8 and `leeway_baseline`, written in one batched transaction every 30 s (§9.2's second write policy; alert state stays synchronous), with §9.3 step 7's downtime rules on restore: ≤ 2 h resume, ≤ 24 h widen ×1.5 for one half-life, beyond that mark stale. `DevWeight` persists, because a baseline restored without it would re-acquire the bias it was corrected for. **Wired into the source, 2026-09-20** — a sample timer on its own clock, independent of the evaluation coalescer, so what is learned is a placement's duration and not its edit rate. **Tier C turn-on, 2026-09-20 — PHASE 5 COMPLETE.** A mature baseline renders as an `*Intent` with `Source: LearnedBaseline`, so it reuses apportionment, scoring, the per-domain gauges and routing unchanged; the presence of `Bands` (k·max(deviation, floor)) is what switches the breach rule from ρ to the per-domain band test, and no declared source sets them. An immature baseline is nil, which means "scored against an even apportionment" and not "unmonitored". The finding reaches the wire as `leeway.baseline_breach`, the 52nd kind in the frozen schema, still metrics-only unless `--topology-tier-c-signals` says otherwise. Three flags: `--topology-learn-baselines` (default on), `--topology-baseline-half-life`, `--topology-baseline-band`. **This phase amended §5.1** — see the delta there: `SourceClusterDefaultAssumed` moved to the bottom of the precedence list, without which the whole phase would have shipped inert | Tier C detects injected drift in soak without firing on the FP corpus. **Both halves now hold as standing tests, 2026-09-20**: a Deployment that declared nothing and has always sat evenly across three zones, with all six replicas in one, produces exactly one `leeway.baseline_breach` quoting the *learned* expectation; and all seven §12 fixtures run a second time with their declarations stripped — so the baseline is what scores them — and add no findings at the narrowest (floor-width) band |
 | **6 — Preference ranks** (2 wks) | `compute-class` source: dynamic ComputeClass informer, configurable extractors, rank resolution with cross-check, time-weighted pod-seconds, attribution SLIs. **COMPLETE 2026-09-20.** The node model and rule matcher (#457), rank resolution and the pod-second tracker (#458), the ComputeClass reader (#459) and the source itself (#460) shipped counters-first, the same staging Phase 2 used. **Findings shipped 2026-09-20 (#462)**: the four §7.7.4 kinds, judged over a *sampled* window rather than the cumulative counters — the tracker's totals run for the axis's life, so a share taken off them would still be reporting a bad week in March in June; the judge keeps a ring and diffs the ends over `--compute-class-window`. §8.2's machine and `leeway.Reconcile` are reused unchanged, and the persisted rows share the one `leeway_alert_state` table with `topology-drift`, told apart by subject kind at `Load` on both sides. The incident UID prefix is `leeway-rank:` with a hyphen rather than a colon, so the other source's parse fails outright instead of half-succeeding and reporting a rank incident `cleared/object_deleted` on its first sweep. **A class with fewer than two priorities is not judged at all, which takes the wedged rule with it** — deliberate, and confirmed live: the four GKE-managed Autopilot classes each declare exactly one priority, and a Pending pod on one of those is the ordinary out-of-capacity story `capacity` already reports. `wedged_pods` still counts them. One §7.7.4 row was deferred to #463: mean achieved rank against the axis's own EWMA baseline, which needs §7.5's `BaselineSet` plumbed into this source. **Shipped 2026-09-29 (#463)** as rule `rank-baseline` — see the note under §7.7.4's table | Rank shares match a hand-audited sample of a live GKE cluster; unmatched and disagreement rates 0. **Both met on `std-simian-test`, 2026-09-20**: `preference_nodes` read 2 at rank 0 for `n2-preferred` and 1 for `n4-preferred`, which is exactly what `kubectl get nodes -L cloud.google.com/compute-class` shows, and 100 % of pod-seconds on both axes sat at rank 0; `unmatched`, `disagreement`, `no_rule_matching`, `ambiguous`, `off_axis`, `out_of_range`, `axis_invalid` and `tracker_underflows_total` were **all zero** over the run |
 | **7 — Nodes** (1.5 wks) | Node-group subjects, capacity weighting, `leeway.domain_unavailable`. **Capacity weighting shipped 2026-09-21 (#468)**: `Weighting` gained an `Auto` zero value so that a declared `Equal` and an undeclared weighting stop being the same thing, every `NodeView` now carries both allocatable dimensions (the trigger has to read CPU to *choose* the weighting, so projecting one resource during eligibility was a chicken-and-egg), and §5.1 resolution writes the resolved weighting back onto the intent with an evidence line quoting the ratio. **This phase amended §7.2** — see the four carve-outs there; the pod-count one was found by breaking two §12 fixtures, and the `minDomains` one would have hidden every padded subject's missing domain. **Node-group subjects shipped 2026-09-21 (#469)**: the inventory groups nodes off FR-3's precedence list, a 30 s pass scores each group against the cluster's domains with no intent (Tier C, deliberately — see FR-3's three rules), and `--topology-max-node-groups` bounds the cardinality by dropping *all* groups rather than an arbitrary subset, with `lookout_leeway_node_groups_discovered` still reporting the true count. Node groups live in their own map inside `State`, absent from `Subjects()`: §6.5's verifier rebuilds each shard from the pod cache, and a subject with no pods would be found empty, called counter drift and erased every sweep. **This shipped a second §7.2 amendment, in the opposite direction to the first** — node-group subjects were to default to `AllocatableCPU` and are instead *pinned* to `Equal`, because a node group's objects are the capacity the weighting apportions over, and the circularity does not only excuse a lopsided pool, it makes an evenly spread pool alongside it read as drifting. **`leeway.domain_unavailable` shipped 2026-09-21 (#467) — PHASE 7 COMPLETE**: the last of §2.3's eight names now has a producer and the v1 ledger is 57 kinds. The subject is the domain, `SubjectDomain`, the one subject kind that holds no objects — which is why the §8.2 machine and the clearance observer took it unchanged but two things around them did not: `judgements` has to append the domain set or `Alerts.Pass` reads every domain episode as gone, and `Clearance` has to skip its pod-index check or it reports a zone that is still down as recovered-`object_deleted` on the first observation. The rule is `Known && usable == 0` against a latch of which domains the cluster has — see §2.3 on why not a window, why *usable* rather than Ready, and why the axis set is configuration | Node-pool imbalance detected and attributed. **The §12 corpus gained a heterogeneous-capacity fixture, 2026-09-21**: ten replicas sitting `[8 1 1]` across zones that are 64, 8 and 8 cores are quiet under the trigger and breach at ρ = 0.4 without it. **The node-group half now holds as a standing test, 2026-09-21**: three zones, a six-node pool wholly in one of them and a balanced pool alongside it — the concentrated pool produces one finding naming the pool (ρ = 2/3, R = 4), the balanced pool scores ρ = 0, and a Deployment pinned to the concentrated pool by `nodeSelector` is narrowed by FR-7 to that one zone and stays quiet rather than restating its pool's imbalance. **The domain half holds as a standing test, 2026-09-21**: three zones and twenty workloads spread over them, every node in one zone lost — **exactly one** `leeway.domain_unavailable` reaches the wire and not one of the twenty workloads emits, because §7.1 drops the lost zone and the survivors are judged among themselves (corrected 2026-10-01: that test removes the nodes, which §7.6 never sees; the NotReady zone is held by §7.6 since the outage row learned to walk §7.1's `Unready` domains); cordoning every node in a zone instead produces the same kind with `taint_exclusion` where deleting them produces `consolidation`; and the zone coming back resolves through the existing clearance observer rather than as a second signal |
-| **8 — Hardening** (2 wks) | Cause attribution consuming sibling sources, cardinality controls, OTLP hardening, `cmd/leeway`, docs, dashboards. **§8.4's remaining three cardinality controls shipped 2026-09-22 (#475)** — collapsed states, an axis cap taking a prefix of `--topology-keys` rather than of the drift ranking, and the namespace lists, each independently reversible, with `lookout_leeway_domain_series_withheld{reason}` counting what they drop in subjects rather than folding it into an `other` bucket that would count the same pod on every axis; the 20k-subject budget is now an executable assertion rather than a paragraph. **`cmd/leeway` shipped 2026-09-22 (#477)** — the standalone runs both sources metrics-only and store-less, `/leeway` rides in the same image, and it is built and executed by a Go smoke test so `go test ./...` covers it everywhere. §2.4's two import-graph disciplines stopped being conventions in the same change: `TestLayering_TheImportGraphMatchesTheDesign` enforces the boundary (`pkg/...` never reaches `internal/...`) rather than the one forbidden package, and fails when a rule's pattern matches nothing. Discipline 2's narrow informer interface is deliberately **not** in it — see §2.4. **OTLP hardening shipped 2026-09-22 (#476)** — with the requirement restated: the SDK has no export queue to bound, so the deliverable was proving the structural bound, making the drops legible (five `lookout_otlp_*` SLIs on the *pull* registry, because a drop counter readable only over the broken pipe is useless), and stopping a configuration from reintroducing the hazard (the per-export deadline is now derived from the interval and always strictly below it, with the retry budget bound to the same number). The recording path's inability to block is proved by releasing a wedged exporter only after the recording and the scrape have already finished. **Operator docs and dashboards shipped 2026-09-22 (#478)** — *Operations → Placement* and a Grafana board over the §8.4 SLIs. **The scale + soak harnesses shipped with them (#478)**: `examples/kwok/leeway-scale`, `examples/kwok/soak` and a weekly `Scale (kwok)` workflow, and the ladder they produced is recorded in §6.6 | Scale + soak met on the padded kwok harness — **PARTLY met 2026-09-22.** The memory model is measured and linear over three decades of pod count (§6.6: 63.3 KiB/pod resident over a 52.9 MiB intercept, at 8,814 pods; heap:wire 1.87× against S8's independent 1.73×), evaluation p99 is 5 ms under churn, and every SLI stayed at zero. **The two-hour soak holds it** (§6.6): under four rollout drivers RSS rose 847 MiB/h while the fleet grew 121%, and the marginal resident cost of a fleet object *fell* from 53.4 to 50.5 KiB between the halves of the window — which is also the run that showed the soak had been taking its verdict on raw RSS, the opposite of the test its own prose describes. Two of the three targets are **not** met and are labelled as extrapolation rather than measurement: the **200k-pod tier** (reached 8,814 on kind — the apiserver was the constraint, not the process) and **500 pods/sec** (sustained 4.6 lifecycles/s). §6.6.1's per-event decomposition is still modelled, because nothing in the tree counts watch events — [#491](https://github.com/go-steer/k8s-lookout/issues/491) adds the instrument that would close it; **`cmd/leeway` built and smoke-tested in CI — met 2026-09-22**; process survives a black-holed OTLP endpoint for 24 h with flat RSS — **met 2026-09-30**: harness, SLIs and tests shipped 2026-09-22, and the 24 h run held heap flat at 7.2 MiB and RSS in a 33–39 MiB band while dropping 34.6 M points (§8.4; #476 closed) |
+| **8 — Hardening** (2 wks) | Cause attribution consuming sibling sources, cardinality controls, OTLP hardening, `cmd/leeway`, docs, dashboards. **§8.4's remaining three cardinality controls shipped 2026-09-22 (#475)** — collapsed states, an axis cap taking a prefix of `--topology-keys` rather than of the drift ranking, and the namespace lists, each independently reversible, with `lookout_leeway_domain_series_withheld{reason}` counting what they drop in subjects rather than folding it into an `other` bucket that would count the same pod on every axis; the 20k-subject budget is now an executable assertion rather than a paragraph. **`cmd/leeway` shipped 2026-09-22 (#477)** — the standalone runs both sources metrics-only and store-less, `/leeway` rides in the same image, and it is built and executed by a Go smoke test so `go test ./...` covers it everywhere. §2.4's two import-graph disciplines stopped being conventions in the same change: `TestLayering_TheImportGraphMatchesTheDesign` enforces the boundary (`pkg/...` never reaches `internal/...`) rather than the one forbidden package, and fails when a rule's pattern matches nothing. Discipline 2's narrow informer interface is deliberately **not** in it — see §2.4. **OTLP hardening shipped 2026-09-22 (#476)** — with the requirement restated: the SDK has no export queue to bound, so the deliverable was proving the structural bound, making the drops legible (five `lookout_otlp_*` SLIs on the *pull* registry, because a drop counter readable only over the broken pipe is useless), and stopping a configuration from reintroducing the hazard (the per-export deadline is now derived from the interval and always strictly below it, with the retry budget bound to the same number). The recording path's inability to block is proved by releasing a wedged exporter only after the recording and the scrape have already finished. **Operator docs and dashboards shipped 2026-09-22 (#478)** — *Operations → Placement* and a Grafana board over the §8.4 SLIs. **The scale + soak harnesses shipped with them (#478)**: `examples/kwok/leeway-scale`, `examples/kwok/soak` and a weekly `Scale (kwok)` workflow, and the ladder they produced is recorded in §6.6 | Scale + soak met on the padded kwok harness — **PARTLY met 2026-09-22.** The memory model is measured and linear over three decades of pod count (§6.6: 63.3 KiB/pod resident over a 52.9 MiB intercept, at 8,814 pods; heap:wire 1.87× against S8's independent 1.73×), evaluation p99 is 5 ms under churn, and every SLI stayed at zero. **The two-hour soak holds it** (§6.6): under four rollout drivers RSS rose 847 MiB/h while the fleet grew 121%, and the marginal resident cost of a fleet object *fell* from 53.4 to 50.5 KiB between the halves of the window — which is also the run that showed the soak had been taking its verdict on raw RSS, the opposite of the test its own prose describes. Two of the three targets were initially **not** met on `kind` and were labelled as extrapolation rather than measurement: the **200k-pod tier** (reached 8,814 on kind — the apiserver was the constraint, not the process) and **500 pods/sec** (sustained 4.6 lifecycles/s), while §6.6.1's per-event decomposition stayed modelled until [#491](https://github.com/go-steer/k8s-lookout/issues/491) added the watch-event counter — **closed 2026-11-18 ([go-steer/k8s-lookout#829](https://github.com/go-steer/k8s-lookout/pull/829), [#831](https://github.com/go-steer/k8s-lookout/pull/831); ported in [#29](https://github.com/go-steer/leeway/issues/29) / [#33](https://github.com/go-steer/leeway/pull/33))**: `examples/kwok/kwokctl-run` (`kwokctl --runtime=binary` + Protobuf clients) directly measured `4,000` nodes / `200,500` S8-padded pods (`5,697.1 MiB` quiet resident = `28.80 KiB/pod`) and `1,578.5 pod lifecycles/s` (`1,893.4` watch events/s, `79.7` events folded per evaluation, `1.384 core` whole process; §6.6, §6.6.1); **`cmd/leeway` built and smoke-tested in CI — met 2026-09-22**; process survives a black-holed OTLP endpoint for 24 h with flat RSS — **met 2026-09-30**: harness, SLIs and tests shipped 2026-09-22, and the 24 h run held heap flat at 7.2 MiB and RSS in a 33–39 MiB band while dropping 34.6 M points (§8.4; #476 closed) |
 
 Roughly 14 weeks, against ~19 for the standalone version — the difference is almost
 entirely the plumbing lookout already owns.
