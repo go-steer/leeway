@@ -5,7 +5,40 @@ sidebar:
   order: 3
 ---
 
-`leeway report` is a stateless, one-shot CLI mode designed for external processes, CI/CD checks, and AI troubleshooting agents. It connects to one or more Kubernetes clusters in parallel, lists the placement-relevant objects, evaluates every subject with dwell timers bypassed, and prints a single JSON report.
+`leeway report` is a stateless, one-shot CLI mode designed for external processes, CI/CD checks, and AI troubleshooting agents. It connects to one or more Kubernetes clusters in parallel, lists the placement-relevant objects one page at a time, evaluates every subject with dwell timers bypassed, and prints a single JSON report.
+
+## How `leeway report` executes
+
+```mermaid
+flowchart TB
+  Targets["1. Target Discovery (pkg/clusters.Resolve)<br/>--profiles-dir | --clusters-from | --clusters | --kubeconfig / --in-cluster"]
+
+  subgraph Collect["2. Parallel Per-Cluster Snapshot (pkg/report.Collect, --parallelism=8)"]
+    direction LR
+    ClientGo["client-go + dynamic Path<br/>Protobuf REST clients<br/>kube.CollectPages (limit + continue)<br/>+ per-page kube.Transform"]
+    ShellMode["CREDENTIAL_PROXY_URL ShellMode<br/>kubectlListPaged (kubectl get --raw)<br/>limit=250, truncation backoff/recovery,<br/>410 Gone restart + kube.Transform"]
+  end
+
+  subgraph Eval["3. Snapshot Evaluation (Dwell Bypassed)"]
+    direction LR
+    TopoSnap["topologydrift.EvaluateSnapshot<br/>Domain census, intent, Hamilton apportionment,<br/>drift score, attribution + Tier A/B(/C)"]
+    CCSnap["computeclass.EvaluateSnapshot<br/>DecodeComputeClass, node rank resolution,<br/>windowed pod-shares + scale-up verdicts"]
+  end
+
+  Remed["4. Deterministic Remediation (pkg/leeway)<br/>manifest_patch | platform_managed | rollout_restart |<br/>cluster_capacity | cluster_nodes | storage_topology"]
+
+  Out["5. leeway.report/v1alpha1 JSON Envelope (stdout or --output)<br/>summary (snake_case) + clusters[] (domains, topology_findings,<br/>compute_classes, rank_findings, optional subjects)"]
+
+  Targets --> ClientGo
+  Targets --> ShellMode
+  ClientGo --> TopoSnap
+  ClientGo --> CCSnap
+  ShellMode --> TopoSnap
+  ShellMode --> CCSnap
+  TopoSnap --> Remed
+  Remed --> Out
+  CCSnap --> Out
+```
 
 ## Specifying target clusters
 
@@ -57,7 +90,7 @@ When none of the multi-cluster flags are set, `leeway report` falls back to a si
 leeway report --kubeconfig=~/.kube/config --context=prod-us-central1
 ```
 
-When `WATCHER_BROKER_URL` and `WATCHER_BROKER_TOKEN_FILE` are both set in the environment, cluster API connections and GKE API calls are routed through the credential-proxy broker. When only `CREDENTIAL_PROXY_URL` is set (inside the agent-sandbox container), objects are read through the sandbox's `kubectl` instead of a direct client (filtering `events` to `involvedObject.kind=Pod` and automatically falling back from `-A` to per-namespace `kubectl get -n <ns>` queries if a response hits the proxy's stdout cap).
+When `WATCHER_BROKER_URL` and `WATCHER_BROKER_TOKEN_FILE` are both set in the environment, cluster API connections and GKE API calls are routed through the credential-proxy broker. When only `CREDENTIAL_PROXY_URL` is set (`ShellMode`, inside an external agent sandbox), built-in Kubernetes collections are paged through `kubectl get --raw` (`limit=250` with `continue` tokens, automatic page-size halving/recovery on proxy output truncation, `410 Gone` clean restart, `involvedObject.kind=Pod` event filtering, and per-page `kube.Transform` object trimming), while `LeewayPolicy` and `ComputeClass` CRDs are read via `kubectl get -o json` (with per-namespace fallback if `-A` hits the proxy cap).
 
 ## Scoping the evaluation
 

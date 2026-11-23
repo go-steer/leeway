@@ -25,7 +25,7 @@ import (
 
 // DefaultDomainUnavailableKeys are the failure-domain axes `leeway.domain_unavailable`
 // is judged on; per-node axes such as `kubernetes.io/hostname` are excluded
-// intentionally (see docs/leeway-design.md §2.3, §16).
+// intentionally (see docs/leeway-design.md §2.3, §13.3).
 var DefaultDomainUnavailableKeys = []leeway.TopologyKey{
 	corev1.LabelTopologyZone,
 	corev1.LabelTopologyRegion,
@@ -44,7 +44,7 @@ func (s *Source) domainAxes() []leeway.TopologyKey {
 
 // sampleDomains latches which domains this process has observed with nodes and
 // forgets domains whose nodes are gone and whose ready history has aged out
-// (see docs/leeway-design.md §2.3, §16).
+// (see docs/leeway-design.md §2.3, §13.3).
 func (s *Source) sampleDomains(now time.Time) {
 	axes := s.domainAxes()
 	if len(axes) == 0 {

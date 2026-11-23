@@ -85,7 +85,7 @@ type pendingEntry struct {
 	hits int
 }
 
-// timerHeap orders subjects by readyAt using stale-tolerant heap entries (see docs/leeway-design.md §16).
+// timerHeap orders subjects by readyAt using stale-tolerant heap entries (see docs/leeway-design.md §13.2).
 type timerHeap []heapItem
 
 type heapItem struct {
@@ -105,7 +105,7 @@ func (h timerHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 func (h *timerHeap) Push(x any)   { *h = append(*h, x.(heapItem)) }
 func (h *timerHeap) Pop() (x any) { old := *h; x, *h = old[len(old)-1], old[:len(old)-1]; return x }
 
-// reschedule folds an enqueue at now into e, widening repeated bursts up to maxDelay (docs/leeway-design.md §6.4, §16).
+// reschedule folds an enqueue at now into e, widening repeated bursts up to maxDelay (docs/leeway-design.md §6.4, §13.2).
 func (w coalesceWindows) reschedule(e *pendingEntry, now time.Time) {
 	if e.hits == 0 {
 		e.first = now
@@ -144,7 +144,7 @@ type CoalesceOptions struct {
 	Now func() time.Time
 }
 
-// coalescer collapses a burst of subject enqueues into one evaluation (docs/leeway-design.md §6.4, §16).
+// coalescer collapses a burst of subject enqueues into one evaluation (docs/leeway-design.md §6.4, §13.2).
 type coalescer struct {
 	windows  coalesceWindows
 	evaluate func(context.Context, leeway.SubjectRef)

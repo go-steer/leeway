@@ -487,7 +487,7 @@ func TestRoute_TheTierSetsTheSeverityAndTierCDecidesWhetherToSpeak(t *testing.T)
 	}
 }
 
-// TestRoute_SuppressionSilencesEveryTier is §14's exit criterion in miniature.
+// TestRoute_SuppressionSilencesEveryTier is journal §14's exit criterion in miniature.
 // A zone going away puts four hundred workloads in breach of a contract they
 // all genuinely declared, and Tier A is precisely the tier that would
 // otherwise open four hundred agent sessions about one fact.

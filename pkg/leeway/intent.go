@@ -26,7 +26,7 @@ type IntentMode uint8
 
 // The intent modes. Ignore is not the absence of intent — it is a positive
 // statement that drift on this key is uninteresting, which is how a Karpenter
-// pool that consolidates on purpose (§15 item 8) stops generating findings
+// pool that consolidates on purpose (journal §15 item 8) stops generating findings
 // without being excluded from the subsystem entirely.
 const (
 	ModeSpread IntentMode = iota
@@ -79,7 +79,7 @@ const (
 	// default is X" is therefore sometimes an operator's assertion and
 	// sometimes our assumption, and collapsing those into one value would
 	// lose exactly the distinction that keeps a guess from raising a
-	// critical finding. See §13 S4.
+	// critical finding. See journal §13 S4.
 	SourceClusterDefaultDeclared
 	SourcePodAntiAffinityPreferred
 	SourcePodAffinityPreferred

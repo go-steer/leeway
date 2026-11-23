@@ -2,8 +2,31 @@
 title: Scoring and root-cause attribution
 description: How leeway computes expected domain counts, excess skew, relocation distance, and attributes the most specific root cause.
 sidebar:
-  order: 3
+  order: 4
 ---
+
+## End-to-end scoring pipeline
+
+For each workload or node-group subject and each configured topology axis (`topology.kubernetes.io/zone`, `topology.kubernetes.io/region`, or `--topology-keys`), `pkg/leeway` runs a pure seven-stage evaluation pipeline:
+
+```mermaid
+flowchart TB
+  Intent["1. Intent Resolution (ResolveIntents)<br/>Precedence: LeewayPolicy / ClusterLeewayPolicy → topologySpreadConstraints →<br/>required pod (anti-)affinity → declared cluster defaults →<br/>preferred pod (anti-)affinity → learned baseline → assumed cluster defaults"]
+
+  Elig["2. Eligible Domains (EligibleDomains)<br/>Filter cluster domains to nodes matching pod nodeSelector,<br/>required nodeAffinity, taints/tolerations (Honor), and Ready status"]
+
+  Apport["3. Weighting and Apportionment (ApportionAligned)<br/>Equal vs AllocatableCPU (auto-triggered at ≥ 1.25x capacity ratio)<br/>Tie-aligned Hamilton largest-remainder expectation sum(E_d) = N"]
+
+  Score["4. Core Scores (Score)<br/>drift (relocationDistance / N), observedSkew, minAchievableSkew,<br/>excessSkew (+ Pending Unschedulable), relocationDistance, maxDomainShare"]
+
+  Judge["5. Confidence Tier and Severity (Scores.Judge)<br/>Tier A: leeway.contract_violated (critical) — broken DoNotSchedule (pod spec or declared cluster default) / required anti-affinity<br/>Tier B: leeway.placement_drift (warning) — soft / inferred / policy / assumed cluster-default breach<br/>Tier C: leeway.baseline_breach or placement_drift (info; warning if maxDomainShare > 0.5)<br/>+ optional LeewayPolicy thresholds.severity override"]
+
+  Cause["6. Causal Attribution Ladder (Scores.Attribute)<br/>1. domain_outage → 2. consolidation → 3. taint_exclusion →<br/>4. domain_capacity_shortfall → 5. volume_pinning → 6. rollout_bias →<br/>7. constraint_ignored → 8. unknown (+ Tier C selector_confined)"]
+
+  Remed["7. Deterministic Remediation (SuggestRemediation)<br/>manifest_patch | platform_managed | rollout_restart |<br/>cluster_capacity | cluster_nodes | storage_topology"]
+
+  Intent --> Elig --> Apport --> Score --> Judge --> Cause --> Remed
+```
 
 ## Capacity-aware expectation (Hamilton apportionment)
 

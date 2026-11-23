@@ -46,23 +46,23 @@ import (
 const Name = "topology-drift"
 
 // DefaultEligibilitySweepInterval bounds how often a broad node eligibility
-// change triggers subject re-evaluation (§6.3; see docs/leeway-design.md §16).
+// change triggers subject re-evaluation (§6.3; see docs/leeway-design.md §13.1).
 const DefaultEligibilitySweepInterval = 5 * time.Minute
 
 // DefaultAlertInterval is how often §8.2's dwell machine advances over scored
-// subjects (see docs/leeway-design.md §16).
+// subjects (see docs/leeway-design.md §13.1).
 const DefaultAlertInterval = 30 * time.Second
 
 // DefaultReconcileGrace bounds how long a persisted alert record waits for its
-// subject to be scored again after a restart (§9.3 step 6; see docs/leeway-design.md §16).
+// subject to be scored again after a restart (§9.3 step 6; see docs/leeway-design.md §13.1).
 const DefaultReconcileGrace = 5 * time.Minute
 
 // DefaultReadySampleInterval is how often §7.6's ready-node series is sampled
-// (see docs/leeway-design.md §16).
+// (see docs/leeway-design.md §13.1).
 const DefaultReadySampleInterval = 30 * time.Second
 
 // DefaultBaselineSampleInterval is how often §7.5's baseline estimators are fed
-// (see docs/leeway-design.md §16).
+// (see docs/leeway-design.md §13.1).
 const DefaultBaselineSampleInterval = time.Minute
 
 // DefaultBaselineFlushInterval is §9.2's batched baseline persistence cadence.
@@ -1586,7 +1586,7 @@ func (s *Source) Run(ctx context.Context, emit func(sources.Signal)) error {
 		return fmt.Errorf("topologydrift: register statefulset handler: %w", err)
 	}
 	if s.rollouts == nil {
-		// §13 S4's "say it out loud" rule, applied to a row that is simply
+		// journal §13 S4's "say it out loud" rule, applied to a row that is simply
 		// absent: an operator looking at lookout_leeway_transient_subjects and
 		// seeing no rollout bucket should be able to find out here whether that
 		// means no rollouts or no answer.
@@ -1604,7 +1604,7 @@ func (s *Source) Run(ctx context.Context, emit func(sources.Signal)) error {
 		s.logger()("topologydrift: no capacity source wired — §8.5 findings will report pending-pod evidence as unavailable")
 	}
 
-	// §13 S4's fourth mitigation, and the cheapest one: say once, out loud,
+	// journal §13 S4's fourth mitigation, and the cheapest one: say once, out loud,
 	// whose numbers the fleet is about to be scored against. An operator who
 	// never configured anything should not have to read the source to find out
 	// that a maxSkew is ours rather than theirs.

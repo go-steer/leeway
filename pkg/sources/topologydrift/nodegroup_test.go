@@ -247,7 +247,7 @@ func TestStateGroups_AreTrackedButNotSweptOrVerified(t *testing.T) {
 	}
 }
 
-// TestNodeGroupSubjects_ImbalanceIsAttributedToThePool is §14's phase 7 exit
+// TestNodeGroupSubjects_ImbalanceIsAttributedToThePool is journal §14's phase 7 exit
 // criterion, stated in issue #469: "a pool with nodes in one of the three zones
 // it is configured for produces one finding naming the pool, and the workloads
 // riding it do not each produce their own".

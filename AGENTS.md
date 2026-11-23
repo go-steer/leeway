@@ -64,7 +64,8 @@ examples/            Hermetic kind e2e (`examples/e2e`, `examples/kind/`) and kw
 test/e2e/            Live kind cluster e2e suite (invoked via `examples/e2e`, not unit CI).
 dev/                 Local CI runner (`dev/tools/ci`), individual presubmits (`dev/ci/presubmits/`),
                      license header tool, pinned `golangci-lint` config (`dev/tools/.golangci.yml`).
-docs/                `leeway-design.md` specification + Astro Starlight site (`docs/site/`).
+docs/                `leeway-design.md` specification, `stability-policy.md`,
+                     `archive/` historical journal, + Astro Starlight site (`docs/site/`).
 ```
 
 ## Build & test

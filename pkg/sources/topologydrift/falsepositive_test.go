@@ -844,7 +844,7 @@ func undeclared(rep *corev1.Pod) *corev1.Pod {
 }
 
 // TestFalsePositiveCorpus_LearnedBaselinesAddNoFalsePositives is the other half
-// of §14's Phase 5 exit criterion. The first half — that Tier C detects
+// of journal §14's Phase 5 exit criterion. The first half — that Tier C detects
 // injected drift — is TestSource_ALearnedBaselineBreachReachesTheWire; this is
 // the "without firing on the FP corpus" half, run against every cluster §12
 // says is fine with learning turned on.
@@ -859,7 +859,7 @@ func undeclared(rep *corev1.Pod) *corev1.Pod {
 // half: a workload that said something must not have its expectation quietly
 // replaced by what it happens to be doing, which §5.1 prevents but only as long
 // as the candidate really is appended below the declaration. "undeclared" is
-// the band half, and the one §14 is about: the same cluster with nobody having
+// the band half, and the one journal §14 is about: the same cluster with nobody having
 // declared anything, scored by §7.5's per-domain rule instead of ρ — a
 // different rule, on shapes chosen because they look like drift and are not.
 func TestFalsePositiveCorpus_LearnedBaselinesAddNoFalsePositives(t *testing.T) {

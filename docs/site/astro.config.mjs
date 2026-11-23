@@ -36,6 +36,16 @@ export default defineConfig({
           attrs: { 'is:inline': true },
           content: "document.documentElement.dataset.theme = 'light';",
         },
+        // Client-side Mermaid renderer. Upgrades ```mermaid code blocks
+        // to SVG diagrams and tucks the source in a <details> block.
+        // See public/mermaid-render.js.
+        {
+          tag: 'script',
+          attrs: {
+            type: 'module',
+            src: `${BASE}/mermaid-render.js`,
+          },
+        },
       ],
       plugins: [
         starlightLlmsTxt({

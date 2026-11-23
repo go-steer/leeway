@@ -26,7 +26,7 @@ import (
 )
 
 // This file is the **scenario corpus**: the first half of Phase 3's exit
-// criterion in §14, "correct intent on the scenario corpus". Its sibling
+// criterion in journal §14, "correct intent on the scenario corpus". Its sibling
 // falsepositive_test.go is the second half.
 //
 // Every other test file in this package asks one question of one function.

@@ -276,7 +276,7 @@ func TestScores_Breach(t *testing.T) {
 	t.Run("assumed cluster default cannot use the contract path", func(t *testing.T) {
 		s := scoreEqual([]int64{34, 33, 32}, &skew1)
 		if ok, _ := s.Breach(assumed, DefaultThresholds()); ok {
-			t.Error("an assumed cluster default must not raise a contract breach (§8.1, §13 S4)")
+			t.Error("an assumed cluster default must not raise a contract breach (§8.1, journal §13 S4)")
 		}
 	})
 }
