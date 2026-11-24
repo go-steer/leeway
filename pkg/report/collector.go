@@ -211,6 +211,11 @@ func collectCluster(ctx context.Context, target clusters.Cluster, opts Options, 
 		Source:  target.Profile,
 		Status:  StatusOK,
 	}
+	if target.ResolveError != nil {
+		cr.Status = StatusError
+		cr.Error = target.ResolveError.Error()
+		return cr
+	}
 
 	runTopo := sourceEnabled(opts.Sources, topologydrift.Name)
 	runCC := sourceEnabled(opts.Sources, computeclass.Name)

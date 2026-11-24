@@ -25,19 +25,22 @@ make test-race
 
 ## Execution Modes
 
-Leeway supports two primary execution modes from a single binary (`leeway`):
+Leeway supports three execution modes from a single binary (`leeway`):
 
-### 1. One-Shot Multi-Cluster Report (`leeway report`)
+### 1. One-Shot Multi-Cluster Report (`leeway report`) & MCP Server (`leeway mcp`)
 
-Designed to be invoked by an external process, CLI workflow, or AI agent. Connects to one or more target Kubernetes clusters in parallel, takes a point-in-time snapshot of nodes, pods, workloads, PV/PVCs, events, `LeewayPolicy` CRDs, and `ComputeClass` CRDs, runs the full Leeway evaluation pipeline with dwell bypassed, and prints a structured JSON report to `stdout` (or `--output=<file>`).
+Designed to be invoked by an external process, CLI workflow, or AI agent (either directly via `leeway report` or as a stdio Model Context Protocol server via `leeway mcp`, which exposes a read-only `report` tool returning the same `leeway.report/v1alpha1` JSON document without network calls during startup or `tools/list`). Connects to one or more target Kubernetes clusters in parallel, takes a point-in-time snapshot of nodes, pods, workloads, PV/PVCs, events, `LeewayPolicy` CRDs, and `ComputeClass` CRDs, runs the full Leeway evaluation pipeline with dwell bypassed, and prints a structured JSON report to `stdout` (or `--output=<file>`).
 
 ```bash
-# Evaluate explicit targets: GKE triples, name=endpoint pairs, or kubeconfig contexts
-leeway report --clusters=my-project/us-east1/gke-prod-us-east1,gke-prod-us-west1=https://10.0.0.2:6443
+# Evaluate explicit targets: GKE resource paths, triples, gke_ contexts, name=endpoint pairs, or kubeconfig contexts
+leeway report --clusters=projects/my-project/locations/us-east1/clusters/gke-prod-us-east1,gke-prod-us-west1=https://10.0.0.2:6443
 
-# Evaluate every context in a kubeconfig, or every GKE cluster in a project
+# Evaluate every context in a kubeconfig, or every GKE cluster across one or more scopes
 leeway report --clusters-from=kubeconfig:/etc/leeway/kubeconfig
-leeway report --clusters-from=my-project
+leeway report --clusters-from=my-project,other-project/us-central1
+
+# Serve `report` over stdio as a read-only MCP server (e.g. for core-agent / shipmind)
+leeway mcp
 
 # Evaluate every Cluster Agent profile in a Hermes profiles directory
 leeway report --profiles-dir=/opt/data/profiles
@@ -50,13 +53,14 @@ leeway report --kubeconfig=~/.kube/config --context=gke_my-project_us-central1_p
 
 | Flag | Default | Description |
 |---|---|---|
-| `--clusters` | `""` | Comma-separated cluster targets (`project/location/cluster`, `name=https://host:port`, or kubeconfig context names); a filter when `--profiles-dir` or `--clusters-from` is set |
-| `--clusters-from` | `""` | Fleet discovery source: `kubeconfig[:/path]`, `profiles:/path/to/profiles`, or `<project>[/<location>]` |
+| `--clusters` | `""` | Comma-separated cluster targets (`projects/<p>/locations/<l>/clusters/<c>`, `<p>/<l>/<c>`, `gke_<p>_<l>_<c>`, `name=https://host:port`, or kubeconfig context names); resolved against `--kubeconfig` / `KUBECONFIG` when set, or a filter when `--profiles-dir` or `--clusters-from` is set |
+| `--clusters-from` | `""` | Comma-separated fleet discovery scopes: `kubeconfig[:/path]`, `profiles:/path/to/profiles`, `<project>[/<location>]`, or `projects/<project>/locations/<loc\|->` (partial scope failures emit `"status": "error"` entries when other scopes succeed) |
 | `--profiles-dir` | `""` | Hermes profiles directory; each Cluster Agent profile's `config.yaml` carries a `cluster_identity` block |
 | `--kubeconfig` | `""` | Path to kubeconfig file (falls back to `KUBECONFIG`, then `~/.kube/config`) |
 | `--context` | `""` | Kubeconfig context to use |
 | `--in-cluster` | `false` | Use in-cluster service account credentials |
 | `--cluster-name` | `""` | Logical cluster name for single-cluster reports (default: the context name, else `default`) |
+| `--google-auth` | `""` | Google auth mode (`adc` or `injected`; empty consults `LEEWAY_GOOGLE_AUTH`, `CORE_AGENT_GOOGLE_AUTH=injected`, and `MAST_GOOGLE_AUTH=injected`) |
 | `--namespace` | `""` | Comma-separated namespaces to evaluate (empty queries all namespaces) |
 | `--sources` | `topology-drift,compute-class` | Comma-separated sources to evaluate |
 | `--topology-tier-c-signals`, `--compute-class-tier-c-signals` | `false` | Include Tier C findings in `topology_findings` / `rank_findings` |

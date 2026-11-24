@@ -24,6 +24,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	container "google.golang.org/api/container/v1"
+	"google.golang.org/api/option"
 	"k8s.io/client-go/rest"
 )
 
@@ -46,8 +47,8 @@ const (
 
 // describeClusterViaAPI reads one cluster's control-plane addressing from the
 // GKE API.
-func describeClusterViaAPI(ctx context.Context, id Identity) (*container.Cluster, error) {
-	svc, err := container.NewService(ctx)
+func describeClusterViaAPI(ctx context.Context, id Identity, opts ...option.ClientOption) (*container.Cluster, error) {
+	svc, err := container.NewService(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("GKE API client: %w", err)
 	}

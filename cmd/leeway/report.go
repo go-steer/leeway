@@ -41,6 +41,7 @@ type reportOptions struct {
 	clusterName  string
 	project      string
 	location     string
+	googleAuth   string
 
 	namespaces         string
 	sources            string
@@ -62,8 +63,8 @@ func newReportFlagSet(o *reportOptions, stderr *os.File) *flag.FlagSet {
 	fs := flag.NewFlagSet("leeway report", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	fs.StringVar(&o.clusters, "clusters", "", "Comma-separated list of target clusters: GKE triples (`project/location/cluster`), `name=https://endpoint`, or kubeconfig context names.")
-	fs.StringVar(&o.clustersFrom, "clusters-from", "", "Fleet discovery source: `kubeconfig[:/path]`, `profiles:/path/to/profiles`, or `<project>[/<location>]`.")
+	fs.StringVar(&o.clusters, "clusters", "", "Comma-separated list of target clusters: GKE resource paths (`projects/<p>/locations/<l>/clusters/<c>`), triples (`<p>/<l>/<c>`), `gke_<p>_<l>_<c>`, `name=https://endpoint`, or kubeconfig context names.")
+	fs.StringVar(&o.clustersFrom, "clusters-from", "", "Comma-separated fleet discovery scopes: `kubeconfig[:/path]`, `profiles:/path/to/profiles`, or `<project>[/<location>]`.")
 	fs.StringVar(&o.profilesDir, "profiles-dir", "", "Path to a Hermes profiles directory where each Cluster Agent profile has a config.yaml with a cluster_identity block.")
 	fs.StringVar(&o.kubeconfig, "kubeconfig", "", "Path to a kubeconfig file (falls back to KUBECONFIG or ~/.kube/config).")
 	fs.StringVar(&o.kubeContext, "context", "", "Kubeconfig context name for single-cluster report.")
@@ -71,6 +72,7 @@ func newReportFlagSet(o *reportOptions, stderr *os.File) *flag.FlagSet {
 	fs.StringVar(&o.clusterName, "cluster-name", "", "Logical cluster name for single-cluster report.")
 	fs.StringVar(&o.project, "project", "", "Default GCP project for cluster identity.")
 	fs.StringVar(&o.location, "location", "", "Default GCP location (region or zone) for cluster identity.")
+	fs.StringVar(&o.googleAuth, "google-auth", "", "Google authentication mode (`adc` or `injected`; empty consults LEEWAY_GOOGLE_AUTH, CORE_AGENT_GOOGLE_AUTH, and MAST_GOOGLE_AUTH).")
 
 	fs.StringVar(&o.namespaces, "namespace", "", "Comma-separated namespaces to scope workload and pod evaluation (empty queries all namespaces).")
 	fs.StringVar(&o.sources, "sources", strings.Join(defaultSources, ","), "Comma-separated sources to evaluate (`topology-drift`, `compute-class`).")
@@ -120,6 +122,10 @@ func runReportCmd(args []string, stdout, stderr *os.File) int {
 		fmt.Fprintf(stderr, "leeway report: --timeout must be > 0 (got %s)\n", o.timeout)
 		return 2
 	}
+	if _, err := clusters.ResolveGoogleAuthMode(o.googleAuth); err != nil {
+		fmt.Fprintf(stderr, "leeway report: --google-auth: %v\n", err)
+		return 2
+	}
 
 	parsedDefaults, err := topologydrift.ParseClusterDefaults(o.topologyDefaults)
 	if err != nil {
@@ -143,15 +149,17 @@ func runReportCmd(args []string, stdout, stderr *os.File) int {
 	defer stop()
 
 	targets, err := clusters.Resolve(ctx, clusters.Options{
-		Clusters:     o.clusters,
-		ClustersFrom: o.clustersFrom,
-		ProfilesDir:  o.profilesDir,
-		Kubeconfig:   o.kubeconfig,
-		Context:      o.kubeContext,
-		InCluster:    o.inCluster,
-		ClusterName:  o.clusterName,
-		Project:      o.project,
-		Location:     o.location,
+		Clusters:         o.clusters,
+		ClustersFrom:     o.clustersFrom,
+		ProfilesDir:      o.profilesDir,
+		Kubeconfig:       o.kubeconfig,
+		Context:          o.kubeContext,
+		InCluster:        o.inCluster,
+		ClusterName:      o.clusterName,
+		Project:          o.project,
+		Location:         o.location,
+		GoogleAuth:       o.googleAuth,
+		KeepFailedScopes: true,
 		OnSkip: func(source string, err error) {
 			fmt.Fprintf(stderr, "leeway report: skipping cluster %s: %v\n", source, err)
 		},

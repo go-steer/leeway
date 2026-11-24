@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -37,12 +39,25 @@ const (
 	BrokerURLEnv       = "WATCHER_BROKER_URL"
 	BrokerTokenFileEnv = "WATCHER_BROKER_TOKEN_FILE"
 
-	// CredentialProxyURLEnv and CredentialProxyTokenFileEnv are the variables
-	// set inside the agent-sandbox container (CALLER_ROLE_SHELL). When present,
-	// Google REST API reads route through /v1/gcp/<host>/ and Kubernetes object
-	// reads route through the sandbox's `kubectl` credential-proxy wrapper.
+	// CredentialProxyURLEnv and CredentialProxyTokenFileEnv configure the
+	// credential proxy used by distroless agent tasks (Substrate / shipmind)
+	// and sandbox containers. Google REST API reads route through /v1/gcp/<host>/
+	// and Kubernetes API reads route through /v1/k8s/<project>/<location>/<cluster>
+	// via client-go (or through the sandbox `kubectl` wrapper when ShellMode is
+	// active).
 	CredentialProxyURLEnv       = "CREDENTIAL_PROXY_URL"        // #nosec G101 -- environment variable name, not a credential
 	CredentialProxyTokenFileEnv = "CREDENTIAL_PROXY_TOKEN_FILE" // #nosec G101 -- environment variable name, not a credential
+
+	// CredentialProxyModeEnv optionally overrides whether CREDENTIAL_PROXY_URL
+	// uses native "client-go" (default) or the sandbox "kubectl" shim.
+	CredentialProxyModeEnv = "LEEWAY_CREDENTIAL_PROXY_MODE" // #nosec G101 -- environment variable name, not a credential
+
+	// kubeProxyURLEnv and credentialProxyExecURLEnv are set alongside
+	// CREDENTIAL_PROXY_URL inside kube-agents's agent-sandbox container, where
+	// Kubernetes API access goes through the sandbox's `kubectl` wrapper rather
+	// than the watcher /v1/k8s/ route.
+	kubeProxyURLEnv           = "KUBE_PROXY_URL"            // #nosec G101 -- environment variable name, not a credential
+	credentialProxyExecURLEnv = "CREDENTIAL_PROXY_EXEC_URL" // #nosec G101 -- environment variable name, not a credential
 
 	// brokerGCPPathFormat is the proxy's route for a Google REST API, taking
 	// the proxy's base URL and the API's host. The trailing slash is
@@ -90,39 +105,61 @@ type Broker struct {
 	// TokenFile is the projected ServiceAccount token. The kubelet rotates it
 	// in place, so it is read per request rather than once.
 	TokenFile string
-	// ShellMode is true when the broker was configured from CREDENTIAL_PROXY_URL
-	// (the agent-sandbox shell role) rather than WATCHER_BROKER_URL. In ShellMode,
-	// Google REST APIs route through /v1/gcp/<host>/ and Kubernetes cluster reads
-	// route through the `kubectl` credential-proxy shim on PATH.
+	// CredentialProxy is true when the broker was configured from
+	// CREDENTIAL_PROXY_URL rather than WATCHER_BROKER_URL. Google REST APIs
+	// route through /v1/gcp/<host>/ (instead of /v1/watcher/gcp/<host>/),
+	// TokenFile is optional when unset, and Kubernetes cluster reads route
+	// through /v1/k8s/<project>/<location>/<cluster> via client-go unless
+	// ShellMode is also enabled.
+	CredentialProxy bool
+	// ShellMode is true when Kubernetes cluster reads must shell out to the
+	// sandbox `kubectl` wrapper rather than using client-go (for example inside
+	// kube-agents's agent-sandbox where KUBE_PROXY_URL is set, or when
+	// LEEWAY_CREDENTIAL_PROXY_MODE=kubectl).
 	ShellMode bool
 }
 
 // BrokerFromEnv returns the proxy BrokerURLEnv and BrokerTokenFileEnv name, or
 // nil when neither is set -- the Workload Identity path, unchanged. When
-// WATCHER_BROKER_URL is unset but CREDENTIAL_PROXY_URL is set (inside the
-// agent-sandbox container), it returns a ShellMode Broker.
+// WATCHER_BROKER_URL is unset but CREDENTIAL_PROXY_URL is set, it returns a
+// CredentialProxy Broker using native client-go (or ShellMode when running
+// inside a kubectl-wrapped sandbox).
 //
 // Exactly one of WATCHER_BROKER_URL / WATCHER_BROKER_TOKEN_FILE set is an error
 // rather than a fall back to Workload Identity: the operator sets them as a
 // pair, so half a pair is a broken install, and quietly reaching Google with
 // the pod's own identity is the behaviour the variables exist to turn off.
 func BrokerFromEnv() (*Broker, error) {
-	base := strings.TrimRight(os.Getenv(BrokerURLEnv), "/")
-	tokenFile := os.Getenv(BrokerTokenFileEnv)
+	return BrokerFromEnvWith(os.Getenv)
+}
+
+// BrokerFromEnvWith resolves Broker configuration using getenv (falling back to
+// os.Getenv when nil).
+func BrokerFromEnvWith(getenv func(string) string) (*Broker, error) {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	base := strings.TrimRight(strings.TrimSpace(getenv(BrokerURLEnv)), "/")
+	tokenFile := strings.TrimSpace(getenv(BrokerTokenFileEnv))
 	switch {
 	case base == "" && tokenFile == "":
-		shellBase := strings.TrimRight(os.Getenv(CredentialProxyURLEnv), "/")
-		if shellBase == "" {
+		proxyBase := strings.TrimRight(strings.TrimSpace(getenv(CredentialProxyURLEnv)), "/")
+		if proxyBase == "" {
 			return nil, nil
 		}
-		u, err := url.Parse(shellBase)
+		u, err := url.Parse(proxyBase)
 		if err != nil || !brokerSchemes[u.Scheme] || u.Host == "" {
-			return nil, fmt.Errorf("%s=%q is not an http(s) URL", CredentialProxyURLEnv, shellBase)
+			return nil, fmt.Errorf("%s=%q is not an http(s) URL", CredentialProxyURLEnv, proxyBase)
+		}
+		shellMode, err := resolveCredentialProxyShellMode(getenv)
+		if err != nil {
+			return nil, err
 		}
 		return &Broker{
-			URL:       shellBase,
-			TokenFile: strings.TrimSpace(os.Getenv(CredentialProxyTokenFileEnv)),
-			ShellMode: true,
+			URL:             proxyBase,
+			TokenFile:       strings.TrimSpace(getenv(CredentialProxyTokenFileEnv)),
+			CredentialProxy: true,
+			ShellMode:       shellMode,
 		}, nil
 	case base == "" || tokenFile == "":
 		return nil, fmt.Errorf("%s and %s are set together or not at all; got %s=%q %s=%q",
@@ -135,12 +172,65 @@ func BrokerFromEnv() (*Broker, error) {
 	return &Broker{URL: base, TokenFile: tokenFile}, nil
 }
 
+func resolveCredentialProxyShellMode(getenv func(string) string) (bool, error) {
+	switch mode := strings.ToLower(strings.TrimSpace(getenv(CredentialProxyModeEnv))); mode {
+	case "":
+		if hasSandboxKubectlShim(getenv) {
+			return kubectlInPath(getenv("PATH")), nil
+		}
+		return false, nil
+	case "client-go":
+		return false, nil
+	case "kubectl":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s=%q: unknown credential proxy mode (want %q or %q)",
+			CredentialProxyModeEnv, mode, "client-go", "kubectl")
+	}
+}
+
+func hasSandboxKubectlShim(getenv func(string) string) bool {
+	if strings.TrimSpace(getenv(kubeProxyURLEnv)) != "" ||
+		strings.TrimSpace(getenv(credentialProxyExecURLEnv)) != "" {
+		return true
+	}
+	for _, dir := range filepath.SplitList(getenv("PATH")) {
+		if strings.Contains(dir, "credential-proxy") {
+			return true
+		}
+	}
+	for _, marker := range []string{
+		"/opt/credential-proxy/bin/kubectl",
+		"/opt/credential-proxy/libexec/credential-proxy-exec",
+		"/usr/local/libexec/kubectl-admit",
+	} {
+		if info, err := os.Stat(marker); err == nil && !info.IsDir() {
+			return true
+		}
+	}
+	return false
+}
+
+func kubectlInPath(pathEnv string) bool {
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			continue
+		}
+		cand := filepath.Join(dir, "kubectl")
+		if info, err := os.Stat(cand); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return true
+		}
+	}
+	_, err := exec.LookPath("kubectl")
+	return err == nil
+}
+
 // HTTPClient returns a client that sends the current projected token on every
 // request.
 func (b *Broker) HTTPClient() *http.Client {
 	return &http.Client{Transport: &bearerFileTransport{
 		path:     b.TokenFile,
-		optional: b.ShellMode && b.TokenFile == "",
+		optional: (b.CredentialProxy || b.ShellMode) && b.TokenFile == "",
 		base:     http.DefaultTransport,
 	}}
 }
@@ -151,7 +241,7 @@ func (b *Broker) HTTPClient() *http.Client {
 // WithoutAuthentication states it, so a later option cannot bring ADC back.
 func (b *Broker) GoogleAPIOptions(apiHost string) []option.ClientOption {
 	format := brokerGCPPathFormat
-	if b.ShellMode {
+	if b.CredentialProxy || b.ShellMode {
 		format = shellBrokerGCPPathFormat
 	}
 	return []option.ClientOption{

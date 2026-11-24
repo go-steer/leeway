@@ -5,17 +5,29 @@ description: Copy-runnable recipes for AI troubleshooting and fleet-inspection a
 
 `leeway` is built to be invoked directly by an AI agent or external orchestrator, or to push structured placement incidents to an agent receiver.
 
-## 1. One-shot multi-cluster inspection (`leeway report`)
+## 1. One-shot multi-cluster inspection (`leeway report` and `leeway mcp`)
 
-When an agent needs the current topology skew, zone availability census, and ComputeClass priority rank status across one or more clusters, invoke `leeway report`:
+When an agent needs the current topology skew, zone availability census, and ComputeClass priority rank status across one or more clusters, either register `leeway mcp` in `mcp.json` (exposing the read-only `report` tool over stdio, qualified by `core-agent` as `leeway_report`) or invoke `leeway report` directly:
+
+```json
+{
+  "servers": {
+    "leeway": {
+      "transport": "stdio",
+      "command": "/usr/local/bin/leeway",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
 ```sh
-# Evaluate explicit targets: GKE triples, name=endpoint pairs, or kubeconfig contexts
-leeway report --clusters=my-project/us-east1/prod-us-east1,prod-us-west1=https://10.0.0.2:6443
+# Evaluate explicit targets: GKE resource paths, triples, gke_ contexts, name=endpoint pairs, or kubeconfig contexts
+leeway report --clusters=projects/my-project/locations/us-east1/clusters/prod-us-east1,prod-us-west1=https://10.0.0.2:6443
 
-# Evaluate every context in a kubeconfig, or every GKE cluster in a project
+# Evaluate every context in a kubeconfig, or every GKE cluster across one or more scopes
 leeway report --clusters-from=kubeconfig:/etc/leeway/kubeconfig
-leeway report --clusters-from=my-project
+leeway report --clusters-from=my-project,other-project/us-central1
 
 # Evaluate every Cluster Agent profile in a Hermes profiles directory
 leeway report --profiles-dir=/opt/data/profiles
@@ -27,7 +39,7 @@ leeway report --kubeconfig=~/.kube/config --context=my-cluster
 leeway report --context=my-cluster --topology-tier-c-signals --all --pretty=false
 ```
 
-`--clusters-from` names a discovery source (`kubeconfig[:/path]`, `profiles:/path`, or `<project>[/<location>]`), never a file of targets. See [One-shot multi-cluster reports](/getting-started/report/) for every flag.
+`--clusters-from` names one or more comma-separated discovery scopes (`kubeconfig[:/path]`, `profiles:/path`, `<project>[/<location>]`, or `projects/<project>/locations/<loc|->`), never a file of targets. In distroless tasks without ADC or a metadata server, `--google-auth=injected` (or `LEEWAY_GOOGLE_AUTH=injected` / `CORE_AGENT_GOOGLE_AUTH=injected` / `MAST_GOOGLE_AUTH=injected`) sends a static placeholder bearer for gateway token injection, and `CREDENTIAL_PROXY_URL` (+ `CREDENTIAL_PROXY_TOKEN_FILE`) uses native `client-go` without shelling out to `kubectl`. See [One-shot multi-cluster reports](/getting-started/report/) for every flag.
 
 ### Reading the JSON output
 

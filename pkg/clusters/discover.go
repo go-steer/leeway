@@ -109,6 +109,10 @@ type Cluster struct {
 	// direct --in-cluster cluster) never builds one of these and reads false,
 	// which is the fail-open side of that question.
 	Autopilot bool
+	// ResolveError, when non-nil, records a per-scope discovery failure retained
+	// when Options.KeepFailedScopes is true so multi-scope `leeway report` runs
+	// surface failed scopes as `status: "error"` entries rather than aborting.
+	ResolveError error
 }
 
 // Discoverer scans a profiles directory. The zero value reaches the real GKE
@@ -123,10 +127,17 @@ type Discoverer struct {
 	Describe func(ctx context.Context, id Identity) (*container.Cluster, error)
 
 	// TokenSource mints the credential every discovered cluster is reached
-	// with. nil uses this process's Application Default Credentials at
-	// GKEAuthScope. A field for the same reason as Describe. Unused when
-	// Broker is set.
+	// with. nil uses GoogleAuth (or Application Default Credentials at
+	// GKEAuthScope). Unused when Broker is set.
 	TokenSource func(ctx context.Context) (oauth2.TokenSource, error)
+
+	// GoogleAuth selects the Google credential mode ("adc" or "injected") when
+	// Broker and TokenSource are nil. Empty consults LEEWAY_GOOGLE_AUTH,
+	// CORE_AGENT_GOOGLE_AUTH, and MAST_GOOGLE_AUTH.
+	GoogleAuth string
+
+	// GKEEndpoint optionally overrides the GKE API base URL (used in tests).
+	GKEEndpoint string
 
 	// Broker, when set, routes discovery through the credential proxy instead
 	// of this process's Google credentials: the describe goes to the proxy's
@@ -172,12 +183,30 @@ func (d Discoverer) describe(ctx context.Context, id Identity) (*container.Clust
 	if d.Broker != nil {
 		return d.Broker.describeCluster(ctx, id)
 	}
+	mode, err := ResolveGoogleAuthMode(d.GoogleAuth)
+	if err != nil {
+		return nil, err
+	}
+	if mode == GoogleAuthInjected || d.TokenSource != nil || strings.TrimSpace(d.GKEEndpoint) != "" {
+		ts, err := d.tokenSource(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return describeClusterViaAPI(ctx, id, googleAPIOptionsForTokenSource(ts, d.GKEEndpoint)...)
+	}
 	return describeClusterViaAPI(ctx, id)
 }
 
 func (d Discoverer) tokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 	if d.TokenSource != nil {
 		return d.TokenSource(ctx)
+	}
+	mode, err := ResolveGoogleAuthMode(d.GoogleAuth)
+	if err != nil {
+		return nil, err
+	}
+	if mode == GoogleAuthInjected {
+		return InjectedTokenSource(), nil
 	}
 	return defaultTokenSource(ctx)
 }
@@ -193,13 +222,17 @@ func (d Discoverer) describedBy() string {
 // clientConfig is the config one discovered cluster is reached with. Through
 // the proxy the describe still runs -- it is what proves the cluster exists and
 // carries the Autopilot bit -- but its addressing is not used: the proxy
-// resolves the control plane itself. The addressing is still checked: the proxy
-// applies the same rule to every request, so a cluster the describe gives no
-// usable endpoint is skipped here, and counted as a discovery error, rather
-// than becoming an informer that is refused for the life of the process.
+// resolves the control plane itself. The addressing is still checked on the
+// watcher broker: the proxy applies the same rule to every request, so a
+// cluster the describe gives no usable endpoint is skipped here, and counted as
+// a discovery error, rather than becoming an informer that is refused for the
+// life of the process.
 func (d Discoverer) clientConfig(id Identity, described *container.Cluster, ts oauth2.TokenSource) (*rest.Config, error) {
 	if d.Broker != nil && d.Broker.ShellMode {
 		return nil, nil
+	}
+	if d.Broker != nil && d.Broker.CredentialProxy {
+		return d.Broker.ClientConfig(id)
 	}
 	cfg, err := ClientConfigForIdentity(described)
 	if d.Broker != nil {

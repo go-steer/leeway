@@ -70,6 +70,7 @@ type options struct {
 	cluster      string
 	project      string
 	location     string
+	googleAuth   string
 
 	metricsAddr  string
 	otelExporter string
@@ -113,6 +114,8 @@ func realMain(args []string, stdout, stderr *os.File) int {
 		switch args[0] {
 		case "report":
 			return runReportCmd(args[1:], stdout, stderr)
+		case "mcp":
+			return runMCPCmd(args[1:], os.Stdin, stdout, stderr)
 		case "watch":
 			return runWatchCmd(args[1:], stdout, stderr)
 		case "version":
@@ -128,8 +131,8 @@ func runWatchCmd(args []string, stdout, stderr *os.File) int {
 	fs.SetOutput(stderr)
 	var o options
 
-	fs.StringVar(&o.clusters, "clusters", "", "Comma-separated list of target clusters (`project/location/cluster`, `name=https://endpoint`, or kubeconfig contexts).")
-	fs.StringVar(&o.clustersFrom, "clusters-from", "", "Fleet discovery source (`kubeconfig[:/path]`, `profiles:/path/to/profiles`, or `<project>[/<location>]`).")
+	fs.StringVar(&o.clusters, "clusters", "", "Comma-separated list of target clusters (`projects/<p>/locations/<l>/clusters/<c>`, `<p>/<l>/<c>`, `gke_<p>_<l>_<c>`, `name=https://endpoint`, or kubeconfig contexts).")
+	fs.StringVar(&o.clustersFrom, "clusters-from", "", "Comma-separated fleet discovery scopes (`kubeconfig[:/path]`, `profiles:/path/to/profiles`, or `<project>[/<location>]`).")
 	fs.StringVar(&o.profilesDir, "profiles-dir", "", "Path to a Hermes profiles directory where each Cluster Agent profile has a config.yaml with a cluster_identity block.")
 	fs.StringVar(&o.kubeconfig, "kubeconfig", "", "Path to a kubeconfig. Empty uses KUBECONFIG or ~/.kube/config, or in-cluster service account under --in-cluster.")
 	fs.StringVar(&o.kubeContext, "context", "", "Context in the kubeconfig to use instead of its current-context.")
@@ -139,6 +142,7 @@ func runWatchCmd(args []string, stdout, stderr *os.File) int {
 	fs.StringVar(&o.cluster, "cluster-name", "", "Cluster identity stamped as the `cluster` label on exported series and incident payloads.")
 	fs.StringVar(&o.project, "project", "", "GCP project stamped on incident payloads when not inferred from cluster discovery.")
 	fs.StringVar(&o.location, "location", "", "GCP location (region or zone) stamped on incident payloads when not inferred from cluster discovery.")
+	fs.StringVar(&o.googleAuth, "google-auth", "", "Google authentication mode (`adc` or `injected`; empty consults LEEWAY_GOOGLE_AUTH, CORE_AGENT_GOOGLE_AUTH, and MAST_GOOGLE_AUTH).")
 
 	fs.StringVar(&o.metricsAddr, "metrics-addr", DefaultMetricsAddr, "Prometheus /metrics + /healthz + /readyz listener address (host:port). Empty disables the listener.")
 	fs.StringVar(&o.otelExporter, "otel-exporter", "none", "Push metrics over OTLP as well as serving them: `otlp` or `none`.")
@@ -173,6 +177,7 @@ func runWatchCmd(args []string, stdout, stderr *os.File) int {
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage:\n"+
 			"  leeway report [flags]   Run a one-shot topology skew & compute-class report across clusters\n"+
+			"  leeway mcp    [flags]   Run the read-only stdio MCP server exposing leeway report\n"+
 			"  leeway watch  [flags]   Run the continuous leeway daemon (metrics + optional webhook sink)\n"+
 			"  leeway version          Print version and exit\n\n"+
 			"Flags for `leeway watch` (default when invoked without a subcommand):\n")
@@ -188,6 +193,10 @@ func runWatchCmd(args []string, stdout, stderr *os.File) int {
 	if o.showVersion {
 		fmt.Fprintln(stdout, version.String("leeway"))
 		return 0
+	}
+	if _, err := clusters.ResolveGoogleAuthMode(o.googleAuth); err != nil {
+		fmt.Fprintf(stderr, "leeway: --google-auth: %v\n", err)
+		return 2
 	}
 	if o.kubeQPS <= 0 {
 		fmt.Fprintf(stderr, "leeway: --kube-qps must be > 0 (got %v)\n", o.kubeQPS)
@@ -464,6 +473,7 @@ func runMultiClusterWatch(ctx context.Context, o options, sink inject.Sink, stde
 		ClusterName:  o.cluster,
 		Project:      o.project,
 		Location:     o.location,
+		GoogleAuth:   o.googleAuth,
 		OnSkip: func(source string, err error) {
 			fmt.Fprintf(stderr, "leeway: skipping cluster %s: %v\n", source, err)
 		},

@@ -56,24 +56,24 @@ leeway report --profiles-dir=/opt/data/profiles
 
 ### 2. Fleet discovery (`--clusters-from`)
 
-`--clusters-from` names a discovery source, not a file. It accepts:
+`--clusters-from` names one or more comma-separated discovery scopes, not a file. Each scope accepts:
 
 - `kubeconfig` or `kubeconfig:/path/to/config` — one target per context in the kubeconfig (`--kubeconfig` supplies the path when none is given).
 - `profiles:/path/to/profiles` — the same as `--profiles-dir`.
-- `<project>` or `<project>/<location>` — every GKE cluster listed under that project (and location) via the GKE API.
+- `<project>`, `<project>/<location>`, or `projects/<project>/locations/<location|->` — every GKE cluster listed under that project (and location) via the GKE API.
 
 ```sh
 leeway report --clusters-from=kubeconfig --output=report.json
-leeway report --clusters-from=my-project/us-central1
+leeway report --clusters-from=my-project/us-central1,other-project
 ```
 
-`--clusters` filters the discovered set in the same way.
+When multiple scopes are listed and one fails discovery while at least one other succeeds, `leeway report` (and `leeway mcp`) emits a `clusters[]` entry with `"status": "error"` for the failed scope rather than failing the whole run. `--clusters` filters the discovered set in the same way.
 
 ### 3. Explicit `--clusters` list
 
 With no discovery source, `--clusters` is a comma-separated list of targets, each one of:
 
-- `project/location/cluster` — a GKE cluster, described through the GKE API.
+- `projects/project/locations/location/clusters/cluster`, `project/location/cluster`, or `gke_project_location_cluster` — resolved against matching kubeconfig contexts (`gke_<p>_<l>_<c>`, `<p>/<l>/<c>`, or exact context name) when `--kubeconfig` or `KUBECONFIG` is set, or described through the GKE API otherwise.
 - `name=https://host:port` — an explicit API server endpoint (`https://` is assumed when the scheme is omitted).
 - a kubeconfig context name.
 
@@ -90,7 +90,7 @@ When none of the multi-cluster flags are set, `leeway report` falls back to a si
 leeway report --kubeconfig=~/.kube/config --context=prod-us-central1
 ```
 
-When `WATCHER_BROKER_URL` and `WATCHER_BROKER_TOKEN_FILE` are both set in the environment, cluster API connections and GKE API calls are routed through the credential-proxy broker. When only `CREDENTIAL_PROXY_URL` is set (`ShellMode`, inside an external agent sandbox), built-in Kubernetes collections are paged through `kubectl get --raw` (`limit=250` with `continue` tokens, automatic page-size halving/recovery on proxy output truncation, `410 Gone` clean restart, `involvedObject.kind=Pod` event filtering, and per-page `kube.Transform` object trimming), while `LeewayPolicy` and `ComputeClass` CRDs are read via `kubectl get -o json` (with per-namespace fallback if `-A` hits the proxy cap).
+When `--google-auth=injected` (or `LEEWAY_GOOGLE_AUTH=injected`, `CORE_AGENT_GOOGLE_AUTH=injected`, or `MAST_GOOGLE_AUTH=injected`) is set in a distroless task whose egress gateway injects Google credentials, `leeway` sends a static placeholder bearer token without probing ADC or GCE metadata. When `WATCHER_BROKER_URL` + `WATCHER_BROKER_TOKEN_FILE` or `CREDENTIAL_PROXY_URL` (+ optional `CREDENTIAL_PROXY_TOKEN_FILE`) are set, GKE discovery (`/v1/watcher/gcp/` or `/v1/gcp/`) and Kubernetes cluster reads (`/v1/k8s/<project>/<location>/<cluster>`) run natively over `client-go` (`kube.CollectPages` + per-page `kube.Transform`) without `kubectl`. Inside `kube-agents`'s `agent-sandbox` (`KUBE_PROXY_URL` or `LEEWAY_CREDENTIAL_PROXY_MODE=kubectl`), built-in Kubernetes collections are paged through `kubectl get --raw` (`limit=250` with `continue` tokens, automatic page-size halving/recovery on proxy output truncation, `410 Gone` clean restart, `involvedObject.kind=Pod` event filtering, and per-page `kube.Transform` object trimming), while `LeewayPolicy` and `ComputeClass` CRDs are read via `kubectl get -o json` (with per-namespace fallback if `-A` hits the proxy cap).
 
 ## Scoping the evaluation
 

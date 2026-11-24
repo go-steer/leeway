@@ -18,9 +18,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1032,5 +1035,157 @@ esac
 	}
 	if count := strings.Count(calls, "get namespaces -o json"); count != 1 {
 		t.Errorf("expected namespaces to be listed once, got %d:\n%s", count, calls)
+	}
+}
+
+func TestCollect_CredentialProxyClientGoPagedAndTrimmed(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		sawURLs []string
+		sawAuth []string
+	)
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sawURLs = append(sawURLs, r.URL.RequestURI())
+		sawAuth = append(sawAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		const k8sPrefix = "/v1/k8s/sub-proj/us-central1/c1"
+		switch {
+		case r.URL.Path == "/v1/gcp/container.googleapis.com/v1/projects/sub-proj/locations/-/clusters":
+			_, _ = w.Write([]byte(`{"clusters":[{"name":"c1","location":"us-central1"}]}`))
+
+		case r.URL.Path == k8sPrefix+"/api/v1/nodes":
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"NodeList","metadata":{},"items":[
+				{"metadata":{"name":"n-a","labels":{"topology.kubernetes.io/zone":"us-central1-a","topology.kubernetes.io/region":"us-central1"},"managedFields":[{"manager":"kubelet"}]},"status":{"conditions":[{"type":"Ready","status":"True"}],"allocatable":{"cpu":"4","memory":"16Gi"}}},
+				{"metadata":{"name":"n-b","labels":{"topology.kubernetes.io/zone":"us-central1-b","topology.kubernetes.io/region":"us-central1"},"managedFields":[{"manager":"kubelet"}]},"status":{"conditions":[{"type":"Ready","status":"True"}],"allocatable":{"cpu":"4","memory":"16Gi"}}}
+			]}`))
+
+		case r.URL.Path == k8sPrefix+"/api/v1/pods":
+			if r.URL.Query().Get("continue") == "" {
+				_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"PodList","metadata":{"continue":"page2"},"items":[
+					{"metadata":{"name":"api-0","namespace":"ns1","uid":"u0","labels":{"app":"api"},"managedFields":[{"manager":"m"}],"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs1","controller":true}]},"spec":{"nodeName":"n-a","containers":[{"name":"app","env":[{"name":"SECRET_KEY","value":"top-secret"}]}],"topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+					{"metadata":{"name":"api-1","namespace":"ns1","uid":"u1","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs1","controller":true}]},"spec":{"nodeName":"n-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}}
+				]}`))
+			} else {
+				_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[
+					{"metadata":{"name":"api-2","namespace":"ns1","uid":"u2","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs1","controller":true}]},"spec":{"nodeName":"n-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}},
+					{"metadata":{"name":"api-3","namespace":"ns1","uid":"u3","labels":{"app":"api"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"api-rs","uid":"rs1","controller":true}]},"spec":{"nodeName":"n-a","topologySpreadConstraints":[{"maxSkew":1,"topologyKey":"topology.kubernetes.io/zone","whenUnsatisfiable":"DoNotSchedule","labelSelector":{"matchLabels":{"app":"api"}}}]},"status":{"phase":"Running"}}
+				]}`))
+			}
+
+		case r.URL.Path == k8sPrefix+"/apis/apps/v1/replicasets":
+			_, _ = w.Write([]byte(`{"apiVersion":"apps/v1","kind":"ReplicaSetList","metadata":{},"items":[
+				{"metadata":{"name":"api-rs","namespace":"ns1","uid":"rs1","ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"api","uid":"d1","controller":true}]},"spec":{"selector":{"matchLabels":{"app":"api"}}}}
+			]}`))
+
+		case strings.HasPrefix(r.URL.Path, k8sPrefix+"/apis/leeway.lookout.go-steer.io/"),
+			strings.HasPrefix(r.URL.Path, k8sPrefix+"/apis/cloud.google.com/"):
+			http.NotFound(w, r)
+
+		default:
+			_, _ = w.Write([]byte(`{"apiVersion":"v1","kind":"List","metadata":{},"items":[]}`))
+		}
+	}))
+	defer proxySrv.Close()
+
+	tokFile := filepath.Join(t.TempDir(), "proxy.tok")
+	if err := os.WriteFile(tokFile, []byte("proxy-secret-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", "") // distroless: no kubectl or shell on PATH
+	t.Setenv("WATCHER_BROKER_URL", "")
+	t.Setenv("WATCHER_BROKER_TOKEN_FILE", "")
+	t.Setenv("CREDENTIAL_PROXY_URL", proxySrv.URL)
+	t.Setenv("CREDENTIAL_PROXY_TOKEN_FILE", tokFile)
+	t.Setenv("LEEWAY_CREDENTIAL_PROXY_MODE", "")
+	t.Setenv("KUBE_PROXY_URL", "")
+
+	targets, err := clusters.Resolve(context.Background(), clusters.Options{
+		ClustersFrom: "sub-proj",
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	rep, err := Collect(context.Background(), targets, Options{
+		Now:     time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC),
+		Timeout: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(rep.Clusters) != 1 || rep.Clusters[0].Status != StatusOK {
+		t.Fatalf("rep.Clusters = %+v, want 1 ok cluster", rep.Clusters)
+	}
+	if len(rep.Clusters[0].TopologyFindings) != 1 || rep.Clusters[0].TopologyFindings[0].Kind != leeway.KindContractViolated {
+		t.Fatalf("TopologyFindings = %+v, want 1 leeway.contract_violated finding across 2 pages", rep.Clusters[0].TopologyFindings)
+	}
+
+	// Verify listPods paged via client-go with limit=500 and continue=page2, and sent Bearer token.
+	mu.Lock()
+	defer mu.Unlock()
+	joined := strings.Join(sawURLs, "\n")
+	for _, want := range []string{
+		"/v1/gcp/container.googleapis.com/v1/projects/sub-proj/locations/-/clusters",
+		"/v1/k8s/sub-proj/us-central1/c1/api/v1/nodes?limit=500",
+		"/v1/k8s/sub-proj/us-central1/c1/api/v1/pods?limit=500",
+		"/v1/k8s/sub-proj/us-central1/c1/api/v1/pods?continue=page2&limit=500",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("proxy requests missing %q; saw:\n%s", want, joined)
+		}
+	}
+	for i, a := range sawAuth {
+		if a != "Bearer proxy-secret-token" {
+			t.Errorf("auth[%d] = %q, want \"Bearer proxy-secret-token\"", i, a)
+		}
+	}
+}
+
+func TestCollect_MultiScopePartialFailureEmitsErrorEntry(t *testing.T) {
+	t.Parallel()
+
+	healthyClient := kubefake.NewSimpleClientset(&corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "n1",
+			Labels: map[string]string{"topology.kubernetes.io/zone": "us-central1-a"},
+		},
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},
+			Allocatable: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("16Gi"),
+			},
+		},
+	})
+
+	targets := []clusters.Cluster{
+		{
+			Identity: clusters.Identity{Project: "proj-a", Location: "us-central1", Cluster: "c-ok"},
+			Profile:  "gke:proj-a/us-central1/c-ok",
+		},
+		{
+			Identity:     clusters.Identity{Cluster: "proj-forbidden", Project: "proj-forbidden"},
+			Profile:      "gke:proj-forbidden",
+			ResolveError: errors.New("list GKE clusters under projects/proj-forbidden/locations/-: HTTP 403"),
+		},
+	}
+
+	rep, err := Collect(context.Background(), targets, Options{
+		Now: time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC),
+		ClientBuilder: func(c clusters.Cluster) (kubernetes.Interface, dynamic.Interface, error) {
+			return healthyClient, nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if rep.Summary.ClustersTotal != 2 || rep.Summary.ClustersSucceeded != 1 || rep.Summary.ClustersFailed != 1 {
+		t.Fatalf("Summary = %+v, want total=2 succeeded=1 failed=1", rep.Summary)
+	}
+	if rep.Clusters[0].Status != StatusOK || rep.Clusters[1].Status != StatusError || !strings.Contains(rep.Clusters[1].Error, "HTTP 403") {
+		t.Errorf("Clusters = %+v", rep.Clusters)
 	}
 }

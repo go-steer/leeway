@@ -49,6 +49,7 @@ func TestReportFlagSurfaceFrozen(t *testing.T) {
 		"cluster-name":                     {defVal: "", isBool: false},
 		"project":                          {defVal: "", isBool: false},
 		"location":                         {defVal: "", isBool: false},
+		"google-auth":                      {defVal: "", isBool: false},
 		"namespace":                        {defVal: "", isBool: false},
 		"sources":                          {defVal: "topology-drift,compute-class", isBool: false},
 		"topology-keys":                    {defVal: "topology.kubernetes.io/zone,topology.kubernetes.io/region", isBool: false},

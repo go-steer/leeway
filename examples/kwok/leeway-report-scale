@@ -27,11 +27,11 @@
 #
 #   client-go   the target carries a rest config, so pkg/report lists
 #               through client-go (`listPods` and friends).
-#   kubectl     CREDENTIAL_PROXY_URL is set, as it is inside the
-#               kube-agents shell sandbox, so the target carries no rest
-#               config and `fetchViaKubectl` shells out to kubectl,
-#               paging through `kubectl get --raw`. The URL is never
-#               dialled on this path; it only selects it.
+#   kubectl     CREDENTIAL_PROXY_URL + LEEWAY_CREDENTIAL_PROXY_MODE=kubectl
+#               are set, as inside the kube-agents shell sandbox, so the
+#               target carries no rest config and `fetchViaKubectl` shells
+#               out to kubectl, paging through `kubectl get --raw`. The URL
+#               is never dialled on this path; it only selects it.
 #
 # Neither path had a scale guard, which is how a 23k-pod cluster OOMKilled
 # a 2 GiB sandbox before anyone measured it (#12).
@@ -132,9 +132,9 @@ tree_rss_kb() {
 # run_mode <mode> — run one report, print "<wall-s> <peak-mb> <rc>".
 run_mode() {
   local mode="$1" out="$work/$1.json" err="$work/$1.err"
-  local -a envs=(env -u WATCHER_BROKER_URL -u WATCHER_BROKER_TOKEN_FILE -u CREDENTIAL_PROXY_URL)
+  local -a envs=(env -u WATCHER_BROKER_URL -u WATCHER_BROKER_TOKEN_FILE -u CREDENTIAL_PROXY_URL -u LEEWAY_CREDENTIAL_PROXY_MODE)
   if [[ "$mode" == kubectl ]]; then
-    envs+=("CREDENTIAL_PROXY_URL=$SHELL_MODE_PROXY_URL")
+    envs+=("CREDENTIAL_PROXY_URL=$SHELL_MODE_PROXY_URL" "LEEWAY_CREDENTIAL_PROXY_MODE=kubectl")
   fi
 
   local started peak=0 rss rc=0 pid
