@@ -224,22 +224,13 @@ func resolveFromProfilesDirScope(ctx context.Context, dir string, filterSpecs []
 		for _, c := range discovered {
 			byName[c.Identity.Cluster] = append(byName[c.Identity.Cluster], c)
 		}
-		directName := defaultClusterName(opts.ClusterName, opts.Context)
-		candidates := byName[directName]
+		single, err := resolveSingleCluster(opts, disc.Broker)
+		if err != nil {
+			return nil, err
+		}
+		direct := single[0]
+		candidates := byName[direct.Identity.Cluster]
 		if len(candidates) <= 1 {
-			cfg, err := buildDirectConfig(opts)
-			if err != nil {
-				return nil, err
-			}
-			direct := Cluster{
-				Identity: Identity{
-					Cluster:  directName,
-					Project:  opts.Project,
-					Location: opts.Location,
-				},
-				Profile: DirectProfile,
-				Config:  cfg,
-			}
 			if len(candidates) == 1 {
 				covered := candidates[0]
 				discovered = removeProfileCluster(discovered, covered.Profile)
@@ -493,6 +484,15 @@ func resolveSingleScope(ctx context.Context, sc parsedScope, multiScope bool, fi
 				}
 			}
 			if len(filterSpecs) > 0 && !matchesKubeconfigFilter(c.Name, filterSpecs) {
+				continue
+			}
+			if disc.Broker != nil && disc.Broker.ShellMode {
+				out = append(out, Cluster{
+					Identity:   id,
+					Profile:    "kubeconfig:" + c.Name,
+					Kubeconfig: kcPath,
+					Context:    c.Name,
+				})
 				continue
 			}
 			cfg, err := kube.ConfigForContext(kcPath, c.Name)

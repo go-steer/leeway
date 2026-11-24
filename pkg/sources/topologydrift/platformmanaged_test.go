@@ -31,6 +31,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	appslisters "k8s.io/client-go/listers/apps/v1"
 
+	"github.com/go-steer/leeway/pkg/kube"
 	"github.com/go-steer/leeway/pkg/leeway"
 	"github.com/go-steer/leeway/pkg/sources"
 )
@@ -111,7 +112,9 @@ func watchRemediation(t *testing.T, kind leeway.SubjectKind, mode string) *leewa
 
 	cfg := quickAlerts()
 	cfg.TopologyKeys = DefaultTopologyKeys
-	s := New(fake.NewSimpleClientset(objs...), cfg)
+	client := fake.NewSimpleClientset(objs...)
+	s := New(client, cfg)
+	s.WithFactory(kube.NewTransformingFactory(client))
 	s.logf = func(string, ...any) {}
 
 	var mu sync.Mutex

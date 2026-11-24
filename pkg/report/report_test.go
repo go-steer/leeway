@@ -299,8 +299,13 @@ func TestCollect_PlatformManagedRemediation(t *testing.T) {
 			t.Errorf("%s Remediation = %+v, want %q", name, f.Remediation, want)
 		}
 	}
-	if rem := byWorkload["affinity-pinned-api"].Remediation; rem != nil && (rem.YAML != "" || rem.Command != "") {
-		t.Errorf("affinity-pinned-api platform_managed carries yaml %q / command %q, want neither", rem.YAML, rem.Command)
+	if rem := byWorkload["affinity-pinned-api"].Remediation; rem != nil {
+		if rem.YAML != "" || rem.Command != "" {
+			t.Errorf("affinity-pinned-api platform_managed carries yaml %q / command %q, want neither", rem.YAML, rem.Command)
+		}
+		if !strings.Contains(rem.Summary, "nodeAffinity/nodeSelector") {
+			t.Errorf("affinity-pinned-api platform_managed summary = %q, want conflicting nodeAffinity/nodeSelector diagnosis", rem.Summary)
+		}
 	}
 	if _, bad := byWorkload["pool-pinned-filler"]; bad {
 		t.Error("pool-pinned-filler is flagged; the label must not create a finding")
