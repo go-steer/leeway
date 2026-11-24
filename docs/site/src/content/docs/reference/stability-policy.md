@@ -72,7 +72,7 @@ Mutable episode fields (`suspectedCause`, `severity`, `score.*`, `domains[]`, `r
 
 ## 4. `leeway report` CLI flags and exit codes
 
-All 22 shipped `leeway report` options (23 flag names including `-o`, see [CLI reference](/reference/cli/)) and the exit codes below are **Frozen** (`cmd/leeway/report_flags_stability_test.go`). Breaking flag changes on future Stable flags require `>= 2` minor releases and `>= 60` calendar days with warnings written strictly to `stderr` (`stdout` is reserved for the JSON payload). Default changes require a `CHANGELOG.md` `### Changed` entry and keep the prior behavior reachable by flag.
+All 23 shipped `leeway report` options (24 flag names including `-o`, see [CLI reference](/reference/cli/)) and the exit codes below are **Frozen** (`cmd/leeway/report_flags_stability_test.go`). Breaking flag changes on future Stable flags require `>= 2` minor releases and `>= 60` calendar days with warnings written strictly to `stderr` (`stdout` is reserved for the JSON payload). Default changes require a `CHANGELOG.md` `### Changed` entry and keep the prior behavior reachable by flag.
 
 | Exit code | Meaning |
 | --- | --- |

@@ -214,7 +214,7 @@ Every `leeway report` CLI element sits in one of three tiers:
 
 | Tier | Contents | Rule |
 | --- | --- | --- |
-| **Frozen** | Exit codes (`0`, `1`, `2`), `stdout`-is-JSON-payload invariant, and the 22 `leeway report` options (23 flag names including `-o`) in §4.4 | Never removed or syntax-broken; guardian-tested in `cmd/leeway/report_flags_stability_test.go` |
+| **Frozen** | Exit codes (`0`, `1`, `2`), `stdout`-is-JSON-payload invariant, and the 23 `leeway report` options (24 flag names including `-o`) in §4.4 | Never removed or syntax-broken; guardian-tested in `cmd/leeway/report_flags_stability_test.go` |
 | **Stable** | Any future flag shipped in a tagged release without `(experimental)` in its help text | Deprecate-then-remove only (§4.2) |
 | **Experimental** | Flags explicitly marked `(experimental)` in `leeway report --help`, plus unreleased flags on `main` | May change without a deprecation window |
 
@@ -245,6 +245,7 @@ Every `leeway report` CLI element sits in one of three tiers:
 | `--cluster-name` | `string` | `""` |
 | `--project` | `string` | `""` |
 | `--location` | `string` | `""` |
+| `--google-auth` | `string` | `""` |
 | `--namespace` | `string` | `""` |
 | `--sources` | `string` | `"topology-drift,compute-class"` |
 | `--topology-keys` | `string` | `"topology.kubernetes.io/zone,topology.kubernetes.io/region"` |
@@ -270,4 +271,4 @@ Every `leeway report` CLI element sits in one of three tiers:
   - `TestClusterReport_FindingIdentityHelpers` and `pkg/leeway/identity_test.go` pin the six-part `topology-drift` and `compute-class` deduplication keys.
   - `TestPkgLeeway_ExternalGoAPISurfaceFrozen` compile-pins every guaranteed `pkg/leeway` symbol and signature in §3.2.
 - **`pkg/leeway/purity_test.go`** & **`pkg/sources/layering_test.go`**: enforce zero `client-go` / `internal/...` / `pkg/sources` / `pkg/store` dependencies in `pkg/leeway`.
-- **`cmd/leeway/report_flags_stability_test.go`**: pins all 22 `leeway report` flags, bool/value syntax, defaults, and `0` / `1` / `2` exit codes.
+- **`cmd/leeway/report_flags_stability_test.go`**: pins all 23 `leeway report` flags, bool/value syntax, defaults, and `0` / `1` / `2` exit codes.

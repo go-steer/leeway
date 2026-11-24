@@ -135,9 +135,11 @@ func writeToken(t *testing.T, path, token string) {
 
 func TestBrokerFromEnv(t *testing.T) {
 	cases := []struct {
-		name, url, file string
-		want            *Broker
-		wantErr         bool
+		name, url, file      string
+		credURL, credTokFile string
+		credMode, kubeProxy  string
+		want                 *Broker
+		wantErr              bool
 	}{
 		{name: "neither set is Workload Identity", want: nil},
 		{name: "both set", url: "http://proxy.ns.svc:8765", file: "/var/run/tok",
@@ -148,11 +150,57 @@ func TestBrokerFromEnv(t *testing.T) {
 		{name: "token file alone is an error", file: "/var/run/tok", wantErr: true},
 		{name: "not a URL", url: "proxy.ns.svc:8765", file: "/var/run/tok", wantErr: true},
 		{name: "wrong scheme", url: "ftp://proxy.ns.svc", file: "/var/run/tok", wantErr: true},
+		{
+			name:        "CREDENTIAL_PROXY_URL defaults to native client-go",
+			credURL:     "http://cred-proxy.ns.svc:8080/",
+			credTokFile: "/var/run/cred.tok",
+			want: &Broker{
+				URL:             "http://cred-proxy.ns.svc:8080",
+				TokenFile:       "/var/run/cred.tok",
+				CredentialProxy: true,
+				ShellMode:       false,
+			},
+		},
+		{
+			name:    "CREDENTIAL_PROXY_URL without token file is allowed",
+			credURL: "http://127.0.0.1:18080",
+			want: &Broker{
+				URL:             "http://127.0.0.1:18080",
+				CredentialProxy: true,
+				ShellMode:       false,
+			},
+		},
+		{
+			name:     "CREDENTIAL_PROXY_URL explicit kubectl mode",
+			credURL:  "http://127.0.0.1:18080",
+			credMode: "kubectl",
+			want: &Broker{
+				URL:             "http://127.0.0.1:18080",
+				CredentialProxy: true,
+				ShellMode:       true,
+			},
+		},
+		{
+			name:     "CREDENTIAL_PROXY_URL invalid mode is an error",
+			credURL:  "http://127.0.0.1:18080",
+			credMode: "bogus",
+			wantErr:  true,
+		},
+		{
+			name:    "CREDENTIAL_PROXY_URL wrong scheme is an error",
+			credURL: "ftp://cred-proxy.ns.svc",
+			wantErr: true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(BrokerURLEnv, tc.url)
 			t.Setenv(BrokerTokenFileEnv, tc.file)
+			t.Setenv(CredentialProxyURLEnv, tc.credURL)
+			t.Setenv(CredentialProxyTokenFileEnv, tc.credTokFile)
+			t.Setenv(CredentialProxyModeEnv, tc.credMode)
+			t.Setenv(kubeProxyURLEnv, tc.kubeProxy)
+			t.Setenv(credentialProxyExecURLEnv, "")
 			got, err := BrokerFromEnv()
 			if tc.wantErr {
 				if err == nil {
@@ -167,6 +215,104 @@ func TestBrokerFromEnv(t *testing.T) {
 				t.Errorf("BrokerFromEnv() = %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCredentialProxyClientGoRoutes(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", filepath.Join(t.TempDir(), "no-such-adc.json"))
+
+	var (
+		mu       sync.Mutex
+		requests []string
+		auths    []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		auths = append(auths, r.Header.Get("Authorization"))
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/gcp/container.googleapis.com/v1/projects/sub-proj/locations/-/clusters":
+			// Minimal proxy cluster list omitting Endpoint, matching Substrate proxy responses.
+			_, _ = w.Write([]byte(`{"clusters":[{"name":"c1","location":"us-central1","autopilot":{"enabled":true}}]}`))
+		case "/v1/k8s/sub-proj/us-central1/c1/api/v1/nodes":
+			_, _ = w.Write([]byte(`{"kind":"NodeList","apiVersion":"v1","metadata":{},"items":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	tokFile := filepath.Join(t.TempDir(), "cred-proxy.tok")
+	writeToken(t, tokFile, "substrate-jwt")
+
+	t.Setenv(BrokerURLEnv, "")
+	t.Setenv(BrokerTokenFileEnv, "")
+	t.Setenv(CredentialProxyURLEnv, srv.URL)
+	t.Setenv(CredentialProxyTokenFileEnv, tokFile)
+	t.Setenv(CredentialProxyModeEnv, "")
+	t.Setenv(kubeProxyURLEnv, "")
+	t.Setenv("PATH", "") // distroless: no kubectl on PATH
+
+	got, err := Resolve(context.Background(), Options{
+		ClustersFrom: "sub-proj",
+	})
+	if err != nil {
+		t.Fatalf("Resolve via CREDENTIAL_PROXY_URL: %v", err)
+	}
+	if len(got) != 1 || got[0].Identity.String() != "sub-proj/us-central1/c1" || !got[0].Autopilot {
+		t.Fatalf("got = %+v, want sub-proj/us-central1/c1 (autopilot=true)", got)
+	}
+	if got[0].Config == nil || got[0].Config.Host != srv.URL+"/v1/k8s/sub-proj/us-central1/c1" {
+		t.Fatalf("Config = %+v, want Host %s/v1/k8s/sub-proj/us-central1/c1", got[0].Config, srv.URL)
+	}
+
+	client, err := kubernetes.NewForConfig(got[0].Config)
+	if err != nil {
+		t.Fatalf("NewForConfig: %v", err)
+	}
+	if _, err := client.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{}); err != nil {
+		t.Fatalf("Nodes().List: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	wantReqs := []string{
+		"GET /v1/gcp/container.googleapis.com/v1/projects/sub-proj/locations/-/clusters",
+		"GET /v1/k8s/sub-proj/us-central1/c1/api/v1/nodes",
+	}
+	if strings.Join(requests, "\n") != strings.Join(wantReqs, "\n") {
+		t.Errorf("requests =\n%s\nwant:\n%s", strings.Join(requests, "\n"), strings.Join(wantReqs, "\n"))
+	}
+	for i, a := range auths {
+		if a != "Bearer substrate-jwt" {
+			t.Errorf("auth[%d] = %q, want \"Bearer substrate-jwt\"", i, a)
+		}
+	}
+
+	// Sandbox shim auto-detection: a PATH entry under credential-proxy/bin with
+	// an executable kubectl switches ShellMode on automatically (matching
+	// kube-agents's agent-sandbox smoke-test.sh without KUBE_PROXY_URL).
+	shimBin := filepath.Join(t.TempDir(), "credential-proxy", "bin")
+	if err := os.MkdirAll(shimBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(shimBin, "kubectl"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bShim, err := BrokerFromEnvWith(func(k string) string {
+		switch k {
+		case CredentialProxyURLEnv:
+			return "http://127.0.0.1:9999"
+		case "PATH":
+			return shimBin
+		}
+		return ""
+	})
+	if err != nil || bShim == nil || !bShim.CredentialProxy || !bShim.ShellMode {
+		t.Errorf("sandbox shim BrokerFromEnvWith = (%+v, %v), want CredentialProxy=true ShellMode=true", bShim, err)
 	}
 }
 

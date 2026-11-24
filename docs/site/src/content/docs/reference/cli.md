@@ -1,30 +1,32 @@
 ---
 title: CLI reference
-description: Subcommands and flags for leeway report, leeway watch, and leeway version.
+description: Subcommands and flags for leeway report, leeway mcp, leeway watch, and leeway version.
 sidebar:
   order: 2
 ---
 
-`leeway` provides three subcommands:
+`leeway` provides four subcommands:
 - `leeway report [flags]` — Run a one-shot placement and priority-rank evaluation across one or more clusters and emit JSON.
+- `leeway mcp [flags]` — Serve a read-only Model Context Protocol (MCP) server over stdio exposing `leeway report` as the `report` tool (`readOnlyHint: true`). Startup and `tools/list` perform no cluster discovery or network calls.
 - `leeway watch [flags]` — Run the continuous daemon with informers, `/metrics`, `/healthz`, `/readyz`, and optional webhook delivery. (Also the default when invoked with bare flags.)
 - `leeway version` — Print the build version.
 
-`leeway report --help` and `leeway watch --help` print the authoritative flag lists for the installed build.
+`leeway report --help`, `leeway mcp --help`, and `leeway watch --help` print the authoritative flag lists for the installed build.
 
-## Cluster discovery flags (shared by `report` and `watch`)
+## Cluster discovery flags (shared by `report`, `mcp`, and `watch`)
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--clusters` | `""` | Comma-separated cluster targets: `project/location/cluster` GKE triples, `name=https://endpoint` pairs, or kubeconfig context names. Acts as a filter when `--profiles-dir` or `--clusters-from` is set. |
-| `--clusters-from` | `""` | Fleet discovery source: `kubeconfig[:/path]`, `profiles:/path/to/profiles`, or `<project>[/<location>]`. |
+| `--clusters` | `""` | Comma-separated cluster targets: `projects/<p>/locations/<l>/clusters/<c>` GKE resource paths, `project/location/cluster` GKE triples, `gke_<p>_<l>_<c>` context names, `name=https://endpoint` pairs, or kubeconfig context names. Resolved against `--kubeconfig` / `KUBECONFIG` when set, or used as a filter when `--profiles-dir` or `--clusters-from` is set. |
+| `--clusters-from` | `""` | Comma-separated fleet discovery scopes: `kubeconfig[:/path]`, `profiles:/path/to/profiles`, `<project>[/<location>]`, or `projects/<project>/locations/<loc\|->`. On `report` and `mcp`, if one scope fails discovery while another succeeds, the failed scope is emitted as a `"status": "error"` entry inside `clusters[]`. |
 | `--profiles-dir` | `""` | Hermes profiles directory; each Cluster Agent profile is a subdirectory whose `config.yaml` has a `cluster_identity` block. |
 | `--kubeconfig` | `""` | Path to a kubeconfig; empty falls back to `KUBECONFIG`, then `~/.kube/config`. |
 | `--context` | `""` | Kubeconfig context to use instead of its current-context. |
 | `--in-cluster` | `false` | Use in-cluster service account credentials. |
 | `--cluster-name` | `""` | Logical cluster name for single-cluster mode (defaults to the context name, else `default`). |
-| `--project` | `""` | Default GCP project for cluster identity when not inferred from discovery. |
+| `--project` | `""` | Default GCP project for cluster identity (and `leeway mcp` scope fallback) when not inferred from discovery. |
 | `--location` | `""` | Default GCP location (region or zone) for cluster identity when not inferred from discovery. |
+| `--google-auth` | `""` | Google authentication mode (`adc` or `injected`). Empty consults `LEEWAY_GOOGLE_AUTH`, `CORE_AGENT_GOOGLE_AUTH=injected`, and `MAST_GOOGLE_AUTH=injected` so Substrate tasks with egress token injection require no metadata server or ADC. |
 | `--sources` | `topology-drift,compute-class` | Comma-separated sources to run (`topology-drift`, `compute-class`). |
 
 ## Scoring flags (shared by `report` and `watch`)
@@ -50,6 +52,10 @@ sidebar:
 | `--pretty` | `true` | Pretty-print JSON with indentation; `--pretty=false` emits single-line JSON. |
 
 `leeway report` exits `0` when the JSON report is written (even when findings exist or individual target clusters fail with `"status": "error"`), `1` on discovery or output-write failures, and `2` on invalid flags or arguments; see the [Stability policy](/reference/stability-policy/#4-leeway-report-cli-flags-and-exit-codes).
+
+## `leeway mcp` flags and tool schema
+
+`leeway mcp` accepts the shared cluster discovery flags above plus `--topology-keys`, `--topology-domain-unavailable-keys`, `--topology-cluster-defaults`, `--parallelism` (default `8`), and `--timeout` (default `60s`). It exposes a single read-only MCP tool named `report` (`readOnlyHint: true`, server name `leeway`) accepting `clusters`, `clusters_from`, `namespace`, `sources`, `topology_keys`, `topology_domain_unavailable_keys`, `topology_cluster_defaults`, `topology_tier_c_signals`, `compute_class_tier_c_signals`, `all`, and `min_drift`, and exits `0` cleanly on `SIGTERM` even while `stdin` remains open.
 
 ## `leeway watch` flags
 

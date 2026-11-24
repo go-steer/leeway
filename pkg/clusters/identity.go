@@ -35,6 +35,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"sigs.k8s.io/yaml"
 )
@@ -66,6 +67,55 @@ type Identity struct {
 // silently leave it unreached.
 func (i Identity) String() string {
 	return i.Project + "/" + i.Location + "/" + i.Cluster
+}
+
+// ContextName returns the gcloud kubeconfig context name
+// "gke_<project>_<location>_<cluster>".
+func (i Identity) ContextName() string {
+	return "gke_" + i.Project + "_" + i.Location + "_" + i.Cluster
+}
+
+// ParseClusterRef parses a GKE cluster resource path
+// ("projects/<p>/locations/<l>/clusters/<c>" or "projects/<p>/zones/<l>/clusters/<c>"),
+// a canonical triple ("<p>/<l>/<c>"), or a gcloud kubeconfig context name
+// ("gke_<p>_<l>_<c>").
+func ParseClusterRef(raw string) (Identity, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" || strings.Contains(s, "=") {
+		return Identity{}, false
+	}
+	for _, badPrefix := range []string{"kubeconfig:", "profiles:", "http:", "https:"} {
+		if strings.HasPrefix(s, badPrefix) {
+			return Identity{}, false
+		}
+	}
+	if strings.HasPrefix(s, "projects/") {
+		parts := strings.Split(s, "/")
+		if len(parts) == 6 && parts[0] == "projects" && (parts[2] == "locations" || parts[2] == "zones") && parts[4] == "clusters" {
+			id := Identity{Project: parts[1], Location: parts[3], Cluster: parts[5]}
+			if id.brokerSafe() == nil {
+				return id, true
+			}
+		}
+		return Identity{}, false
+	}
+	if strings.HasPrefix(s, "gke_") {
+		parts := strings.SplitN(s, "_", 4)
+		if len(parts) == 4 {
+			id := Identity{Project: parts[1], Location: parts[2], Cluster: parts[3]}
+			if id.brokerSafe() == nil {
+				return id, true
+			}
+		}
+		return Identity{}, false
+	}
+	if parts := strings.Split(s, "/"); len(parts) == 3 {
+		id := Identity{Project: parts[0], Location: parts[1], Cluster: parts[2]}
+		if id.brokerSafe() == nil {
+			return id, true
+		}
+	}
+	return Identity{}, false
 }
 
 // complete reports whether all three parts are present. To ReadIdentity an

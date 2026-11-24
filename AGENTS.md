@@ -17,9 +17,9 @@ One static Go binary, `leeway` (`cmd/leeway`), extracted from [`go-steer/k8s-loo
 - **`topology-drift`** (`pkg/sources/topologydrift`): scores pod placement skew across failure domains (`topology.kubernetes.io/zone`, `topology.kubernetes.io/region`, or `--topology-keys`), resolves declared or inferred intent (`LeewayPolicy` / `ClusterLeewayPolicy`, `topologySpreadConstraints`, pod anti-affinity, node selectors/affinity, cluster defaults), attributes root causes, and emits actionable remediation payloads.
 - **`compute-class`** (`pkg/sources/computeclass`): tracks GKE `ComputeClass` (`cloud.google.com/v1`) priority ladders, accumulating pod-seconds and pod shares per rank to detect rank degradation, wedged fallback tiers, stalled scaleback, and unused preferred tiers.
 
-Both sources run in two modes from the same binary:
+Both sources run in three modes from the same binary:
 
-1. **One-shot fleet snapshot (`leeway report`, `pkg/report`):** evaluates one or more target clusters in parallel (via `client-go`, watcher broker proxy, or `CREDENTIAL_PROXY_URL` `ShellMode`) with dwell bypassed, writing a `leeway.report/v1alpha1` JSON document to `stdout` (or `--output`).
+1. **One-shot fleet snapshot (`leeway report`, `pkg/report`) & stdio MCP server (`leeway mcp`, `internal/mcpserver`):** evaluates one or more target clusters in parallel (via `client-go`, watcher broker proxy, `CREDENTIAL_PROXY_URL` `client-go` or sandbox `ShellMode`, or `--google-auth=injected`) with dwell bypassed, returning a `leeway.report/v1alpha1` JSON document on `stdout` (`--output`) or as the read-only `report` MCP tool.
 2. **Continuous incident daemon (`leeway watch`, default container `ENTRYPOINT`):** watches clusters via shared informers, maintains dwell/hysteresis (`leeway.AlertTable`), EWMA baseline learning (`leeway.BaselineTable`), optional SQLite state (`pkg/store`), Prometheus `/metrics` + OTLP export (`internal/telemetry`), and dispatches open/resolved incident webhooks (`pkg/inject`).
 
 ## Hard rules (from the design; violations are bugs)
@@ -28,16 +28,16 @@ Both sources run in two modes from the same binary:
 - **`pkg/...` never imports `internal/...`.** Enforced across transitive closures by `TestLayering_TheImportGraphMatchesTheDesign` in [`pkg/sources/layering_test.go`](./pkg/sources/layering_test.go) so `pkg/leeway` and `pkg/sources/*` remain embeddable outside `cmd/leeway`.
 - **Page and trim Kubernetes objects on ingest.** Never buffer an unpaged, untrimmed cluster list in memory:
   - `leeway watch` builds informers through `kube.NewTransformingFactory` (verified at the lister boundary by [`pkg/kube/transform_wiring_test.go`](./pkg/kube/transform_wiring_test.go)).
-  - `leeway report` pages `client-go` and dynamic reads through `kube.CollectPages` (applying `kube.Transform` per page) and pages `CREDENTIAL_PROXY_URL` `ShellMode` reads through `kubectlListPaged` (`kubectl get --raw` with `limit`/`continue`, page-size backoff/recovery on proxy truncation, `410 Gone` restart, and per-page `kube.Transform`).
+  - `leeway report` and `leeway mcp` page `client-go` and dynamic reads (including `CREDENTIAL_PROXY_URL` `client-go` reads) through `kube.CollectPages` (applying `kube.Transform` per page) and page `CREDENTIAL_PROXY_URL` `ShellMode` reads through `kubectlListPaged` (`kubectl get --raw` with `limit`/`continue`, page-size backoff/recovery on proxy truncation, `410 Gone` restart, and per-page `kube.Transform`).
   - Every field stripped or preserved on `Pod` and `Node` is governed by [`pkg/kube/transform_registry.go`](./pkg/kube/transform_registry.go) (`TestSharedTransform_StripsExactlyTheRegistry`). Stripping a field requires proving no informer-reachable or report reader touches it and adding a registry entry; preserving a field requires citing its `file:line` reader. Stripping container specs also enforces §6.1's security guarantee that literal secret env/arg values never sit in process memory.
 - **State the claim & prove the silence.** Every detection rule or causal attribution path must ship with both a breaching fixture and a healthy counterfactual fixture asserting zero findings. Every bug fix must ship with a regression test verified to **fail on the pre-fix code**.
-- **Distroless, static posture & no bare-flag secrets.** The container image ([`Dockerfile`](./Dockerfile)) runs on `gcr.io/distroless/static-debian12:nonroot` with `CGO_ENABLED=0` and `ENTRYPOINT ["/leeway", "watch"]`. Do not introduce `cgo`, runtime shell calls on the `watch` or `client-go` paths (`ShellMode` shells out to `kubectl` only when `CREDENTIAL_PROXY_URL` is set inside an external sandbox), or secret values on CLI flags (use `--sink-token-env` and `WATCHER_BROKER_TOKEN_FILE`).
+- **Distroless, static posture & no bare-flag secrets.** The container image ([`Dockerfile`](./Dockerfile)) runs on `gcr.io/distroless/static-debian12:nonroot` with `CGO_ENABLED=0` and `ENTRYPOINT ["/leeway", "watch"]`. Do not introduce `cgo`, runtime shell calls on the `watch`, `mcp`, or `client-go` paths (`ShellMode` shells out to `kubectl` only when `CREDENTIAL_PROXY_URL` runs inside a `kubectl`-wrapped external sandbox or with `LEEWAY_CREDENTIAL_PROXY_MODE=kubectl`), or secret values on CLI flags (use `--sink-token-env`, `WATCHER_BROKER_TOKEN_FILE`, and `CREDENTIAL_PROXY_TOKEN_FILE`).
 - **Wire & docs parity (`docs/site/`).** CLI flags, `leeway.report/v1alpha1` JSON (`snake_case` envelope, `camelCase` findings), webhook open/resolved payloads (`pkg/inject`), and Prometheus/OTLP metric series must match [`README.md`](./README.md) and the Astro Starlight site under [`docs/site/src/content/docs/`](./docs/site/src/content/docs/). Capture JSON examples from real runs or tests — never invent flag names or wire fields in prose.
 
 ## Layout
 
 ```
-cmd/leeway/          CLI entrypoint (`leeway watch`, `leeway report`, `leeway version`).
+cmd/leeway/          CLI entrypoint (`leeway watch`, `leeway report`, `leeway mcp`, `leeway version`).
 pkg/
   leeway/            Pure scoring engine: apportionment, intent tiers, cause attribution,
                      alert dwell/hysteresis, EWMA baselines, ComputeClass rank tracking,
@@ -48,7 +48,7 @@ pkg/
   report/            One-shot multi-cluster snapshot collector (`client-go` + `ShellMode`)
                      and `leeway.report/v1alpha1` assembler.
   clusters/          Target discovery & credential routing (kubeconfig, in-cluster, GKE API,
-                     Hermes profiles, watcher broker, `CREDENTIAL_PROXY_URL` `ShellMode`).
+                     injected Google auth, Hermes profiles, watcher broker, `CREDENTIAL_PROXY_URL`).
   kube/              Client construction, paged list helpers (`CollectPages`, `ListAllPages`),
                      shared object transform + field registry.
   engine/            Signal deduplication, fingerprinting, repeat suppression, recovery gate.
@@ -56,6 +56,7 @@ pkg/
   store/             Pure-Go SQLite (`modernc.org/sqlite`) persistence for alerts, baselines,
                      and bound incident sessions.
 internal/
+  mcpserver/         Stdio JSON-RPC 2.0 MCP server (`leeway mcp`, read-only `report` tool).
   telemetry/         Prometheus `/metrics` registry and OTLP cumulative exporter.
   version/           Build-time version/commit/date ldflags + `debug.ReadBuildInfo` fallback.
 deploy/              Kustomize manifests, `LeewayPolicy` CRDs (`deploy/crds/`), dashboards.
