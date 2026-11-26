@@ -55,7 +55,11 @@ sidebar:
 
 ## `leeway mcp` flags and tool schema
 
-`leeway mcp` accepts the shared cluster discovery flags above plus `--topology-keys`, `--topology-domain-unavailable-keys`, `--topology-cluster-defaults`, `--parallelism` (default `8`), and `--timeout` (default `60s`). It exposes a single read-only MCP tool named `report` (`readOnlyHint: true`, server name `leeway`) accepting `clusters`, `clusters_from`, `namespace`, `sources`, `topology_keys`, `topology_domain_unavailable_keys`, `topology_cluster_defaults`, `topology_tier_c_signals`, `compute_class_tier_c_signals`, `all`, and `min_drift`, and exits `0` cleanly on `SIGTERM` even while `stdin` remains open.
+`leeway mcp` accepts the shared cluster discovery flags above plus `--topology-keys`, `--topology-domain-unavailable-keys`, `--topology-cluster-defaults`, `--parallelism` (default `8`), and `--timeout` (default `60s`, bounding the entire `report` tool call including target discovery and cluster evaluation). It exposes a single read-only MCP tool named `report` (`readOnlyHint: true`, server name `leeway`) accepting `clusters` (comma-separated string or JSON array of strings), `clusters_from`, `namespace`, `sources`, `topology_keys`, `topology_domain_unavailable_keys`, `topology_cluster_defaults`, `topology_tier_c_signals`, `compute_class_tier_c_signals`, `all`, and `min_drift`.
+
+- **Asynchronous calls and cancellation:** `tools/call` runs asynchronously so `notifications/cancelled` cancels an in-flight call promptly (suppressing its response) without blocking `ping`, `tools/list`, or subsequent calls, and `leeway mcp` exits `0` cleanly on `SIGTERM` even while `stdin` remains open.
+- **Omitted target defaults and ambient multi-cluster guard:** omitting both `clusters` and `clusters_from` uses the server's explicitly configured default (`--clusters`, `--clusters-from`, `LEEWAY_CLUSTERS_FROM`, `--profiles-dir`, `--context`, or `--in-cluster`) when set. When no explicit default is configured, ambient `KUBECONFIG` / `--kubeconfig` or `GOOGLE_CLOUD_PROJECT` / `--project` auto-resolves a single cluster, but refuses a multi-cluster sweep with an error listing the discovered clusters and scope string so the caller can pass `clusters` or `clusters_from`.
+- **Self-correcting argument errors:** unknown JSON keys return an error suggesting the closest accepted property (for example, `cluster` → `did you mean "clusters"?`) and listing all accepted fields.
 
 ## `leeway watch` flags
 

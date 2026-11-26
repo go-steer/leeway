@@ -21,6 +21,8 @@ When an agent needs the current topology skew, zone availability census, and Com
 }
 ```
 
+In `leeway mcp`, `--timeout` bounds the entire `report` tool call (both target discovery and cluster evaluation), `notifications/cancelled` cancels in-flight calls promptly without blocking subsequent requests, and the `clusters` argument accepts either a comma-separated string or a JSON array of strings. Omitting both `clusters` and `clusters_from` uses any explicitly configured default (`--clusters`, `--clusters-from`, `LEEWAY_CLUSTERS_FROM`, or `--profiles-dir`), auto-resolves a single cluster from ambient `KUBECONFIG` or `GOOGLE_CLOUD_PROJECT`, and refuses unscoped multi-cluster ambient sweeps by returning the discovered cluster list and scope string.
+
 ```sh
 # Evaluate explicit targets: GKE resource paths, triples, gke_ contexts, name=endpoint pairs, or kubeconfig contexts
 leeway report --clusters=projects/my-project/locations/us-east1/clusters/prod-us-east1,prod-us-west1=https://10.0.0.2:6443

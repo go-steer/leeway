@@ -74,7 +74,7 @@ func newMCPFlagSet(o *mcpOptions, stderr io.Writer) *flag.FlagSet {
 	fs.StringVar(&o.topologyDomainKeys, "topology-domain-unavailable-keys", strings.Join(defaultDomainUnavailableKeys(), ","), "Comma-separated topology axes on which a domain with no usable node raises leeway.domain_unavailable (pass empty string to disable).")
 	fs.StringVar(&o.topologyDefaults, "topology-cluster-defaults", "", "Cluster kube-scheduler PodTopologySpread defaultConstraints as `key=maxSkew[:DoNotSchedule|ScheduleAnyway]` comma-separated, or `none`.")
 	fs.IntVar(&o.parallelism, "parallelism", report.DefaultParallelism, "Maximum number of clusters to evaluate concurrently.")
-	fs.DurationVar(&o.timeout, "timeout", report.DefaultClusterTimeout, "Per-cluster evaluation timeout.")
+	fs.DurationVar(&o.timeout, "timeout", report.DefaultClusterTimeout, "Maximum duration for each report tool call, including target discovery and cluster evaluation.")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "Usage: leeway mcp [flags]\n\n"+

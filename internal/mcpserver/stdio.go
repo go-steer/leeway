@@ -23,9 +23,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -68,12 +71,127 @@ type scanFrame struct {
 	err  error
 }
 
+type inflightRequest struct {
+	cancel    context.CancelFunc
+	cancelled atomic.Bool
+}
+
+type inflightTracker struct {
+	mu   sync.Mutex
+	byID map[string]*inflightRequest
+}
+
+func newInflightTracker() *inflightTracker {
+	return &inflightTracker{byID: make(map[string]*inflightRequest)}
+}
+
+func (t *inflightTracker) register(parent context.Context, idKey string) (context.Context, *inflightRequest, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, exists := t.byID[idKey]; exists {
+		return nil, nil, false
+	}
+	reqCtx, cancel := context.WithCancel(parent)
+	entry := &inflightRequest{cancel: cancel}
+	t.byID[idKey] = entry
+	return reqCtx, entry, true
+}
+
+func (t *inflightTracker) cancel(idKey string) {
+	t.mu.Lock()
+	entry, exists := t.byID[idKey]
+	if exists {
+		entry.cancelled.Store(true)
+		delete(t.byID, idKey)
+	}
+	t.mu.Unlock()
+	if exists {
+		entry.cancel()
+	}
+}
+
+// commitSend atomically verifies that entry has not been cancelled and removes
+// it from the in-flight map before its response is written to stdout, so a
+// client reusing the same request ID immediately after reading the response
+// cannot hit a spurious duplicate-ID rejection.
+func (t *inflightTracker) commitSend(idKey string, entry *inflightRequest) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if entry.cancelled.Load() {
+		return false
+	}
+	if t.byID[idKey] == entry {
+		delete(t.byID, idKey)
+	}
+	return true
+}
+
+func (t *inflightTracker) remove(idKey string, entry *inflightRequest) {
+	t.mu.Lock()
+	if t.byID[idKey] == entry {
+		delete(t.byID, idKey)
+	}
+	t.mu.Unlock()
+}
+
 // ServeStdio serves newline-delimited MCP JSON-RPC 2.0 requests from r to w.
-// It returns promptly when ctx is canceled (for example on SIGTERM from
-// core-agent while os.Stdin remains open) without blocking on a pending read.
+// Tool calls run asynchronously so incoming notifications/cancelled messages and
+// subsequent requests are never blocked behind an in-flight call. It returns
+// promptly when ctx is canceled (for example on SIGTERM from core-agent while
+// os.Stdin remains open) after canceling and waiting for in-flight tool calls.
 func ServeStdio(ctx context.Context, r io.Reader, w io.Writer, h Handler) error {
 	defer func() { _ = h.Close() }()
 
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+
+	sess := &stdioSession{
+		parentCtx:  ctx,
+		serveCtx:   serveCtx,
+		cancel:     cancelServe,
+		w:          w,
+		h:          h,
+		writeErrCh: make(chan error, 1),
+		tracker:    newInflightTracker(),
+	}
+	frames := startFrameScanner(serveCtx, r)
+
+	for {
+		if serveCtx.Err() != nil {
+			return sess.shutdown(nil)
+		}
+		select {
+		case <-serveCtx.Done():
+			return sess.shutdown(nil)
+		case frame, ok := <-frames:
+			if !ok {
+				return sess.shutdown(nil)
+			}
+			if frame.err != nil {
+				cancelServe()
+				return sess.shutdown(frame.err)
+			}
+			if err := sess.handleLine(frame.line); err != nil {
+				cancelServe()
+				return sess.shutdown(err)
+			}
+		}
+	}
+}
+
+type stdioSession struct {
+	parentCtx  context.Context
+	serveCtx   context.Context
+	cancel     context.CancelFunc
+	w          io.Writer
+	h          Handler
+	writeMu    sync.Mutex
+	wg         sync.WaitGroup
+	writeErrCh chan error
+	tracker    *inflightTracker
+}
+
+func startFrameScanner(ctx context.Context, r io.Reader) <-chan scanFrame {
 	frames := make(chan scanFrame, 1)
 	go func() {
 		defer close(frames)
@@ -97,58 +215,194 @@ func ServeStdio(ctx context.Context, r io.Reader, w io.Writer, h Handler) error 
 			}
 		}
 	}()
+	return frames
+}
 
-	var writeMu sync.Mutex
-	send := func(resp rpcResponse) error {
-		resp.JSONRPC = "2.0"
-		b, err := marshalNoEscape(resp)
-		if err != nil {
-			return err
-		}
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		_, err = w.Write(b)
+func (s *stdioSession) recordWriteErr(err error) {
+	select {
+	case s.writeErrCh <- err:
+	default:
+	}
+	s.cancel()
+}
+
+func (s *stdioSession) send(resp rpcResponse) error {
+	resp.JSONRPC = "2.0"
+	b, err := marshalNoEscape(resp)
+	if err != nil {
 		return err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.serveCtx.Err() != nil {
+		return nil
+	}
+	_, err = s.w.Write(b)
+	return err
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case frame, ok := <-frames:
-			if !ok {
-				return nil
-			}
-			if frame.err != nil {
-				return frame.err
-			}
-			var req rpcRequest
-			if err := json.Unmarshal(frame.line, &req); err != nil {
-				if werr := send(rpcResponse{
-					ID:    json.RawMessage("null"),
-					Error: &rpcError{Code: -32700, Message: "parse error: " + err.Error()},
-				}); werr != nil {
-					return werr
-				}
-				continue
-			}
-			if isNotification(req) {
-				continue
-			}
-			if strings.TrimSpace(req.Method) == "" {
-				if werr := send(rpcResponse{
-					ID:    req.ID,
-					Error: &rpcError{Code: -32600, Message: "invalid request: missing method"},
-				}); werr != nil {
-					return werr
-				}
-				continue
-			}
-			resp := dispatchRequest(ctx, h, req)
-			if err := send(resp); err != nil {
-				return err
-			}
+func (s *stdioSession) sendToolResponse(idKey string, entry *inflightRequest, resp rpcResponse) error {
+	resp.JSONRPC = "2.0"
+	b, err := marshalNoEscape(resp)
+	if err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.serveCtx.Err() != nil || !s.tracker.commitSend(idKey, entry) {
+		return nil
+	}
+	_, err = s.w.Write(b)
+	return err
+}
+
+func (s *stdioSession) shutdown(loopErr error) error {
+	s.wg.Wait()
+	if s.parentCtx.Err() != nil {
+		return nil
+	}
+	if loopErr != nil {
+		return loopErr
+	}
+	select {
+	case werr := <-s.writeErrCh:
+		return werr
+	default:
+		return nil
+	}
+}
+
+func (s *stdioSession) handleLine(line []byte) error {
+	var req rpcRequest
+	if err := json.Unmarshal(line, &req); err != nil {
+		return s.send(rpcResponse{
+			ID:    json.RawMessage("null"),
+			Error: &rpcError{Code: -32700, Message: "parse error: " + err.Error()},
+		})
+	}
+	if req.Method == "notifications/cancelled" {
+		handleCancelNotification(s.tracker, req.Params)
+		return nil
+	}
+	if isNotification(req) {
+		return nil
+	}
+	if strings.TrimSpace(req.Method) == "" {
+		return s.send(rpcResponse{
+			ID:    req.ID,
+			Error: &rpcError{Code: -32600, Message: "invalid request: missing method"},
+		})
+	}
+	if req.Method == "tools/call" {
+		return s.dispatchToolCall(req)
+	}
+	return s.send(dispatchSyncRequest(s.serveCtx, s.h, req))
+}
+
+func (s *stdioSession) dispatchToolCall(req rpcRequest) error {
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(req.Params, &p); err != nil || strings.TrimSpace(p.Name) == "" {
+		return s.send(rpcResponse{
+			ID:    req.ID,
+			Error: &rpcError{Code: -32602, Message: "invalid tools/call params"},
+		})
+	}
+	idKey, ok := requestIDKey(req.ID)
+	if !ok {
+		return s.send(rpcResponse{
+			ID:    req.ID,
+			Error: &rpcError{Code: -32600, Message: "invalid request: invalid id"},
+		})
+	}
+	reqCtx, entry, registered := s.tracker.register(s.serveCtx, idKey)
+	if !registered {
+		return s.send(rpcResponse{
+			ID:    req.ID,
+			Error: &rpcError{Code: -32600, Message: "invalid request: duplicate in-flight request id"},
+		})
+	}
+
+	id := slices.Clone(req.ID)
+	args := slices.Clone(p.Arguments)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			entry.cancel()
+			s.tracker.remove(idKey, entry)
+		}()
+		if entry.cancelled.Load() || reqCtx.Err() != nil {
+			return
 		}
+		res, err := s.h.CallTool(reqCtx, p.Name, args)
+		if entry.cancelled.Load() || s.serveCtx.Err() != nil {
+			return
+		}
+		var resp rpcResponse
+		if err != nil {
+			resp = rpcResponse{ID: id, Error: &rpcError{Code: -32603, Message: err.Error()}}
+		} else {
+			resp = rpcResponse{ID: id, Result: res}
+		}
+		if werr := s.sendToolResponse(idKey, entry, resp); werr != nil {
+			s.recordWriteErr(werr)
+		}
+	}()
+	return nil
+}
+
+func handleCancelNotification(tracker *inflightTracker, rawParams json.RawMessage) {
+	if len(rawParams) == 0 {
+		return
+	}
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal(rawParams, &p); err != nil {
+		return
+	}
+	if idKey, ok := requestIDKey(p.RequestID); ok {
+		tracker.cancel(idKey)
+	}
+}
+
+func requestIDKey(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", false
+	}
+	dec := json.NewDecoder(bytes.NewReader(trimmed))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return "", false
+	}
+	switch id := v.(type) {
+	case string:
+		return "s:" + id, true
+	case json.Number:
+		if i, err := strconv.ParseInt(id.String(), 10, 64); err == nil {
+			return "n:" + strconv.FormatInt(i, 10), true
+		}
+		if f, err := strconv.ParseFloat(id.String(), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			if f == 0 {
+				return "n:0", true
+			}
+			if f == math.Trunc(f) && f >= -9223372036854775808.0 && f < 9223372036854775808.0 {
+				return "n:" + strconv.FormatInt(int64(f), 10), true
+			}
+			return "n:" + strconv.FormatFloat(f, 'g', -1, 64), true
+		}
+		return "n:" + id.String(), true
+	default:
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, trimmed); err != nil {
+			return "", false
+		}
+		return "raw:" + compact.String(), true
 	}
 }
 
@@ -160,7 +414,7 @@ func isNotification(req rpcRequest) bool {
 	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
-func dispatchRequest(ctx context.Context, h Handler, req rpcRequest) rpcResponse {
+func dispatchSyncRequest(ctx context.Context, h Handler, req rpcRequest) rpcResponse {
 	switch req.Method {
 	case "initialize":
 		proto := DefaultProtocolVersion
@@ -190,19 +444,6 @@ func dispatchRequest(ctx context.Context, h Handler, req rpcRequest) rpcResponse
 		return rpcResponse{ID: req.ID, Result: map[string]any{"prompts": []any{}}}
 	case "tools/list":
 		res, err := h.ListTools(ctx)
-		if err != nil {
-			return rpcResponse{ID: req.ID, Error: &rpcError{Code: -32603, Message: err.Error()}}
-		}
-		return rpcResponse{ID: req.ID, Result: res}
-	case "tools/call":
-		var p struct {
-			Name      string          `json:"name"`
-			Arguments json.RawMessage `json:"arguments"`
-		}
-		if err := json.Unmarshal(req.Params, &p); err != nil || strings.TrimSpace(p.Name) == "" {
-			return rpcResponse{ID: req.ID, Error: &rpcError{Code: -32602, Message: "invalid tools/call params"}}
-		}
-		res, err := h.CallTool(ctx, p.Name, p.Arguments)
 		if err != nil {
 			return rpcResponse{ID: req.ID, Error: &rpcError{Code: -32603, Message: err.Error()}}
 		}

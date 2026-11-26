@@ -23,8 +23,11 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -80,7 +83,8 @@ type Config struct {
 
 // Server implements Handler for `leeway mcp`.
 type Server struct {
-	cfg Config
+	cfg      Config
+	stderrMu sync.Mutex
 }
 
 // New constructs a Server from cfg without touching the network or filesystem.
@@ -124,7 +128,7 @@ const toolsListJSON = `{
   "tools": [
     {
       "name": "report",
-      "description": "Evaluates live runtime zonal/regional pod placement skew (Hamilton apportionment and root-cause attribution) and GKE ComputeClass priority-rank fallback occupancy across one or more Kubernetes clusters, returning a leeway.report/v1alpha1 JSON document.",
+      "description": "Evaluates live runtime zonal/regional pod placement skew (Hamilton apportionment and root-cause attribution) and GKE ComputeClass priority-rank fallback occupancy across one or more Kubernetes clusters, returning a leeway.report/v1alpha1 JSON document. Omitting both clusters and clusters_from uses the server's configured default target/scope when set, auto-resolves a single cluster from ambient KUBECONFIG or GOOGLE_CLOUD_PROJECT, or returns an error listing discovered clusters if ambient discovery finds multiple clusters.",
       "annotations": {
         "readOnlyHint": true,
         "destructiveHint": false,
@@ -136,7 +140,7 @@ const toolsListJSON = `{
         "properties": {
           "clusters": {
             "type": "string",
-            "description": "Comma-separated target clusters: GKE resource paths (projects/<project>/locations/<location>/clusters/<cluster>), <project>/<location>/<cluster> triples, gke_<project>_<location>_<cluster> context names, name=https://endpoint pairs, or kubeconfig contexts (acts as a filter when clusters_from is set)."
+            "description": "Target clusters as a comma-separated string (a JSON array of strings is also accepted): GKE resource paths (projects/<project>/locations/<location>/clusters/<cluster>), <project>/<location>/<cluster> triples, gke_<project>_<location>_<cluster> context names, name=https://endpoint pairs, or kubeconfig contexts (acts as a filter when clusters_from is set)."
           },
           "clusters_from": {
             "type": "string",
@@ -253,12 +257,18 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 		clusterDefaults = parsed
 	}
 
-	targets, err := s.resolveTargets(ctx, in)
+	callCtx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+	defer cancel()
+
+	targets, err := s.resolveTargets(callCtx, in)
 	if err != nil {
 		return TextResult(fmt.Sprintf("leeway report: %v", err), true), nil
 	}
+	if err := callCtx.Err(); err != nil {
+		return TextResult(fmt.Sprintf("leeway report: %v", err), true), nil
+	}
 
-	rep, err := s.cfg.CollectReport(ctx, targets, report.Options{
+	rep, err := s.cfg.CollectReport(callCtx, targets, report.Options{
 		Parallelism:               s.cfg.Parallelism,
 		Timeout:                   s.cfg.Timeout,
 		Namespaces:                splitCSV(in.Namespace),
@@ -288,15 +298,15 @@ func (s *Server) resolveTargets(ctx context.Context, in ReportArgs) ([]clusters.
 		return nil, err
 	}
 
-	argFrom := strings.TrimSpace(in.ClustersFrom)
-	argClusters := s.expandConfiguredClusterNames(in.Clusters)
+	argFrom := strings.Join(splitCSV(in.ClustersFrom), ",")
+	argClusters := s.expandConfiguredClusterNames(strings.Join(splitCSV(in.Clusters), ","))
 	hasKC := strings.TrimSpace(baseOpts.Kubeconfig) != "" || strings.TrimSpace(s.cfg.Getenv("KUBECONFIG")) != ""
-	defaultCloudScope := firstNonEmpty(
-		s.cfg.ClustersFrom,
-		s.cfg.Getenv(EnvClustersFrom),
-		s.cfg.Project,
-		s.cfg.Getenv("GOOGLE_CLOUD_PROJECT"),
+	configuredFrom := firstNonEmpty(
+		strings.Join(splitCSV(s.cfg.ClustersFrom), ","),
+		strings.Join(splitCSV(s.cfg.Getenv(EnvClustersFrom)), ","),
 	)
+	ambientCloudScope := firstNonEmpty(s.cfg.Project, s.cfg.Getenv("GOOGLE_CLOUD_PROJECT"))
+	defaultCloudScope := firstNonEmpty(configuredFrom, ambientCloudScope)
 
 	switch {
 	case argFrom != "":
@@ -312,7 +322,7 @@ func (s *Server) resolveTargets(ctx context.Context, in ReportArgs) ([]clusters.
 			opts.Clusters = argClusters
 			return s.cfg.ResolveClusters(ctx, opts)
 		}
-		if hasKC || defaultCloudScope == "" {
+		if (hasKC && configuredFrom == "") || defaultCloudScope == "" {
 			opts := baseOpts
 			opts.Clusters = argClusters
 			return s.cfg.ResolveClusters(ctx, opts)
@@ -382,19 +392,56 @@ func (s *Server) resolveTargets(ctx context.Context, in ReportArgs) ([]clusters.
 
 	default:
 		opts := baseOpts
-		opts.ProfilesDir = s.cfg.ProfilesDir
-		opts.ClustersFrom = s.cfg.ClustersFrom
-		opts.Clusters = s.cfg.Clusters
-		if opts.ProfilesDir == "" && opts.ClustersFrom == "" && opts.Clusters == "" && !opts.InCluster && opts.Context == "" {
+		opts.ProfilesDir = strings.TrimSpace(s.cfg.ProfilesDir)
+		opts.ClustersFrom = configuredFrom
+		opts.Clusters = strings.TrimSpace(s.cfg.Clusters)
+		ambientScope := ""
+		if opts.ProfilesDir == "" && opts.ClustersFrom == "" && opts.Clusters == "" && !opts.InCluster && strings.TrimSpace(opts.Context) == "" {
 			switch {
 			case hasKC:
 				opts.ClustersFrom = "kubeconfig"
-			case defaultCloudScope != "":
-				opts.ClustersFrom = defaultCloudScope
+				ambientScope = "kubeconfig"
+			case ambientCloudScope != "":
+				opts.ClustersFrom = ambientCloudScope
+				ambientScope = ambientCloudScope
 			}
 		}
-		return s.cfg.ResolveClusters(ctx, opts)
+		targets, err := s.cfg.ResolveClusters(ctx, opts)
+		if err != nil {
+			return nil, err
+		}
+		if ambientScope != "" && len(targets) > 1 {
+			return nil, ambientMultiClusterError(ambientScope, targets)
+		}
+		return targets, nil
 	}
+}
+
+func ambientMultiClusterError(scope string, targets []clusters.Cluster) error {
+	names := make([]string, 0, len(targets))
+	for _, c := range targets {
+		names = append(names, formatClusterRef(c))
+	}
+	return fmt.Errorf(
+		"refusing unscoped multi-cluster sweep: ambient scope %q resolved %d clusters (%s); pass \"clusters\" to inspect specific cluster(s) or \"clusters_from\": %q to sweep the full scope",
+		scope, len(targets), strings.Join(names, ", "), scope,
+	)
+}
+
+func formatClusterRef(c clusters.Cluster) string {
+	if ctxName, ok := strings.CutPrefix(c.Profile, "kubeconfig:"); ok && strings.TrimSpace(ctxName) != "" {
+		return strings.TrimSpace(ctxName)
+	}
+	if strings.TrimSpace(c.Context) != "" {
+		return strings.TrimSpace(c.Context)
+	}
+	if c.Identity.Project != "" && c.Identity.Location != "" && c.Identity.Cluster != "" {
+		return c.Identity.String()
+	}
+	if name := strings.TrimSpace(c.Name()); name != "" {
+		return name
+	}
+	return strings.TrimSpace(c.Profile)
 }
 
 func (s *Server) baseClusterOptions() (clusters.Options, error) {
@@ -421,6 +468,8 @@ func (s *Server) baseClusterOptions() (clusters.Options, error) {
 		Broker:           broker,
 		KeepFailedScopes: true,
 		OnSkip: func(source string, skipErr error) {
+			s.stderrMu.Lock()
+			defer s.stderrMu.Unlock()
 			fmt.Fprintf(s.cfg.Stderr, "leeway mcp: skipping cluster %s: %v\n", source, skipErr)
 		},
 	}, nil
@@ -481,22 +530,233 @@ func partitionClusterSpecs(csv string) (bare, explicit []string) {
 	return bare, explicit
 }
 
+var acceptedReportFields = []string{
+	"clusters",
+	"clusters_from",
+	"namespace",
+	"sources",
+	"topology_keys",
+	"topology_domain_unavailable_keys",
+	"topology_cluster_defaults",
+	"topology_tier_c_signals",
+	"compute_class_tier_c_signals",
+	"all",
+	"min_drift",
+}
+
+type clustersField string
+
+func (c *clustersField) UnmarshalJSON(data []byte) error {
+	s, err := decodeClustersArg(data)
+	if err != nil {
+		return err
+	}
+	*c = clustersField(s)
+	return nil
+}
+
+func decodeClustersArg(raw json.RawMessage) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", nil
+	}
+	if trimmed[0] == '"' {
+		var s string
+		if err := json.Unmarshal(trimmed, &s); err != nil {
+			return "", fmt.Errorf("clusters: %w", err)
+		}
+		return s, nil
+	}
+	if trimmed[0] == '[' {
+		var rawItems []json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawItems); err != nil {
+			return "", fmt.Errorf("clusters: %w", err)
+		}
+		parts := make([]string, 0, len(rawItems))
+		for _, item := range rawItems {
+			t := bytes.TrimSpace(item)
+			if len(t) == 0 || t[0] != '"' {
+				return "", errors.New("clusters: expected a comma-separated string or array of strings")
+			}
+			var s string
+			if err := json.Unmarshal(t, &s); err != nil {
+				return "", fmt.Errorf("clusters: %w", err)
+			}
+			if s = strings.TrimSpace(s); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, ","), nil
+	}
+	return "", errors.New("clusters: expected a comma-separated string or array of strings")
+}
+
 func decodeReportArgs(raw json.RawMessage) (ReportArgs, error) {
 	var in ReportArgs
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return in, nil
 	}
+	var rawMap map[string]json.RawMessage
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&in); err != nil {
+	if err := dec.Decode(&rawMap); err != nil {
 		return ReportArgs{}, err
 	}
 	var extra json.RawMessage
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return ReportArgs{}, errors.New("unexpected trailing JSON")
 	}
-	return in, nil
+
+	var unknown []string
+	for k := range rawMap {
+		if !slices.Contains(acceptedReportFields, k) {
+			unknown = append(unknown, k)
+		}
+	}
+	if len(unknown) > 0 {
+		slices.Sort(unknown)
+		return ReportArgs{}, unknownFieldsError(unknown)
+	}
+
+	var wire struct {
+		Clusters                      clustersField `json:"clusters"`
+		ClustersFrom                  string        `json:"clusters_from"`
+		Namespace                     string        `json:"namespace"`
+		Sources                       *string       `json:"sources"`
+		TopologyKeys                  *string       `json:"topology_keys"`
+		TopologyDomainUnavailableKeys *string       `json:"topology_domain_unavailable_keys"`
+		TopologyClusterDefaults       *string       `json:"topology_cluster_defaults"`
+		TopologyTierCSignals          bool          `json:"topology_tier_c_signals"`
+		ComputeClassTierCSignals      bool          `json:"compute_class_tier_c_signals"`
+		All                           bool          `json:"all"`
+		MinDrift                      *float64      `json:"min_drift"`
+	}
+	wdec := json.NewDecoder(bytes.NewReader(trimmed))
+	wdec.DisallowUnknownFields()
+	if err := wdec.Decode(&wire); err != nil {
+		return ReportArgs{}, err
+	}
+	return ReportArgs{
+		Clusters:                      string(wire.Clusters),
+		ClustersFrom:                  wire.ClustersFrom,
+		Namespace:                     wire.Namespace,
+		Sources:                       wire.Sources,
+		TopologyKeys:                  wire.TopologyKeys,
+		TopologyDomainUnavailableKeys: wire.TopologyDomainUnavailableKeys,
+		TopologyClusterDefaults:       wire.TopologyClusterDefaults,
+		TopologyTierCSignals:          wire.TopologyTierCSignals,
+		ComputeClassTierCSignals:      wire.ComputeClassTierCSignals,
+		All:                           wire.All,
+		MinDrift:                      wire.MinDrift,
+	}, nil
+}
+
+func unknownFieldsError(unknown []string) error {
+	parts := make([]string, 0, len(unknown))
+	for _, k := range unknown {
+		if hint := suggestReportField(k); hint != "" {
+			parts = append(parts, fmt.Sprintf("%q (did you mean %q?)", k, hint))
+		} else {
+			parts = append(parts, fmt.Sprintf("%q", k))
+		}
+	}
+	label := "unknown field"
+	if len(parts) > 1 {
+		label = "unknown fields"
+	}
+	return fmt.Errorf("%s %s; accepted fields: %s", label, strings.Join(parts, ", "), strings.Join(acceptedReportFields, ", "))
+}
+
+func suggestReportField(unknown string) string {
+	norm := normalizeFieldKey(unknown)
+	if norm == "" {
+		return ""
+	}
+	for _, field := range acceptedReportFields {
+		if norm == field {
+			return field
+		}
+	}
+	bestField := ""
+	bestDist := math.MaxInt
+	for _, field := range acceptedReportFields {
+		d := levenshtein(norm, field)
+		limit := 1
+		switch {
+		case len(norm) > 6:
+			limit = max(2, min(len(norm), len(field))/3)
+		case len(norm) > 3:
+			limit = 2
+		}
+		if d <= limit && (d < bestDist || (d == bestDist && len(field) < len(bestField))) {
+			bestDist = d
+			bestField = field
+		}
+	}
+	if bestField != "" {
+		return bestField
+	}
+	if len(norm) >= 5 {
+		for _, field := range acceptedReportFields {
+			if strings.HasPrefix(field, norm) || (len(field) >= 5 && strings.HasPrefix(norm, field)) {
+				if bestField == "" || len(field) < len(bestField) {
+					bestField = field
+				}
+			}
+		}
+	}
+	return bestField
+}
+
+func normalizeFieldKey(s string) string {
+	var b strings.Builder
+	runes := []rune(strings.TrimSpace(s))
+	for i, r := range runes {
+		if r == '-' || r == ' ' {
+			b.WriteByte('_')
+			continue
+		}
+		if unicode.IsUpper(r) {
+			if i > 0 && runes[i-1] != '_' && runes[i-1] != '-' && runes[i-1] != ' ' {
+				prevLower := unicode.IsLower(runes[i-1]) || unicode.IsDigit(runes[i-1])
+				nextLower := i+1 < len(runes) && unicode.IsLower(runes[i+1])
+				if prevLower || nextLower {
+					b.WriteByte('_')
+				}
+			}
+			b.WriteRune(unicode.ToLower(r))
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func levenshtein(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) == 0 {
+		return len(rb)
+	}
+	if len(rb) == 0 {
+		return len(ra)
+	}
+	prev := make([]int, len(rb)+1)
+	curr := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i, ca := range ra {
+		curr[0] = i + 1
+		for j, cb := range rb {
+			cost := 0
+			if ca != cb {
+				cost = 1
+			}
+			curr[j+1] = min(prev[j+1]+1, curr[j]+1, prev[j]+cost)
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(rb)]
 }
 
 func parseSourcesCSV(raw string) ([]string, error) {
